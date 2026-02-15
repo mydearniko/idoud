@@ -14,7 +14,7 @@ This project is intentionally isolated under `cli/` so it can be moved into a se
   - sends `PUT` requests with `Content-Range`
   - uses `X-Upload-Key` across all chunks
   - retries retryable chunk failures (409/429/5xx/network)
-  - waits for finalization via `/v1/files/{id}` polling
+  - waits for finalization via `/v1/files/{id}` readiness checks (with short server-side wait hints when supported)
 - Optional upload password and download limit headers.
 
 ## Build
@@ -28,7 +28,7 @@ go build -o idoud .
 
 ```bash
 idoud [flags] <file>
-idoud --stdin [--name <filename>] [flags]
+idoud --stdin [--name <filename> | <filename>] [flags]
 ```
 
 ### Examples
@@ -36,6 +36,7 @@ idoud --stdin [--name <filename>] [flags]
 ```bash
 idoud archive.zip
 cat archive.zip | idoud --stdin --name archive.zip
+cat archive.zip | idoud --stdin archive.zip
 idoud --server https://idoud.cc --chunk-size 8MiB --parallel 16 archive.zip
 idoud --password "secret" --download-limit 3 archive.zip
 ```
@@ -50,8 +51,8 @@ idoud --password "secret" --download-limit 3 archive.zip
 - `--parallel` parallel non-final chunk uploads (default `12`)
 - `--retries` retries per chunk (default `6`)
 - `--debug` print live chunk concurrency, retries, throughput, and 7-sample moving average speed to stderr
-- `--request-timeout` timeout for non-final chunk requests (default `45s`)
-- `--final-request-timeout` timeout for final chunk request (default `95s`)
+- `--request-timeout` timeout for non-final chunk requests (default `95s`)
+- `--final-request-timeout` timeout for final chunk request (default `35s`)
 - `--finalize-timeout` max wait for server finalization (default `20m`)
 - `--password` sets `X-Upload-Password`
 - `--download-limit` sets `X-Upload-Download-Limit`

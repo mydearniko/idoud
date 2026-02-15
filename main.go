@@ -28,11 +28,12 @@ const (
 	defaultChunkSize            = int64(3 * 1024 * 1024)
 	defaultParallel             = 12
 	defaultRetries              = 6
-	defaultChunkTimeout         = 45 * time.Second
-	defaultFinalChunkTimeout    = 95 * time.Second
-	defaultFinalizeRecover      = 95 * time.Second
+	defaultChunkTimeout         = 95 * time.Second
+	defaultFinalChunkTimeout    = 35 * time.Second
+	defaultFinalizeRecover      = 5 * time.Second
 	defaultFinalizeTimeout      = 20 * time.Minute
-	defaultFinalizePollInterval = 1200 * time.Millisecond
+	defaultFinalizePollInterval = 100 * time.Millisecond
+	defaultMetadataWaitMax      = 700 * time.Millisecond
 	defaultBackoffBase          = 120 * time.Millisecond
 	defaultBackoffMax           = 1200 * time.Millisecond
 	maxResponseBodyBytes        = 1 << 20
@@ -161,16 +162,77 @@ type uploadDebugStats struct {
 	retries       int64
 	readBytes     int64
 	uploadBytes   int64
+	stdinTracked  bool
+	stdinLastRead int64
+	stdinClosed   int32
+	stdinEOF      int32
 }
 
 func newUploadDebugStats(label, name string) *uploadDebugStats {
-	return &uploadDebugStats{
+	now := time.Now()
+	d := &uploadDebugStats{
 		label:  label,
 		name:   name,
-		start:  time.Now(),
+		start:  now,
 		stopCh: make(chan struct{}),
 		doneCh: make(chan struct{}),
 	}
+	if strings.HasPrefix(label, "stdin") {
+		d.stdinTracked = true
+		d.stdinLastRead = now.UnixNano()
+	}
+	return d
+}
+
+func (d *uploadDebugStats) markRead(now time.Time) {
+	if !d.stdinTracked {
+		return
+	}
+	atomic.StoreInt64(&d.stdinLastRead, now.UnixNano())
+}
+
+func (d *uploadDebugStats) markStdinClosed(eof bool) {
+	if !d.stdinTracked {
+		return
+	}
+	atomic.StoreInt32(&d.stdinClosed, 1)
+	if eof {
+		atomic.StoreInt32(&d.stdinEOF, 1)
+	}
+}
+
+func (d *uploadDebugStats) stdinState(now time.Time) (string, string) {
+	if !d.stdinTracked {
+		return "n/a", "n/a"
+	}
+
+	lastReadUnix := atomic.LoadInt64(&d.stdinLastRead)
+	if lastReadUnix <= 0 {
+		if atomic.LoadInt32(&d.stdinEOF) == 1 {
+			return "eof", "0s"
+		}
+		if atomic.LoadInt32(&d.stdinClosed) == 1 {
+			return "drained", "0s"
+		}
+		return "unknown", "n/a"
+	}
+
+	idle := now.Sub(time.Unix(0, lastReadUnix))
+	if idle < 0 {
+		idle = 0
+	}
+	idleText := roundDuration(idle).String()
+
+	if atomic.LoadInt32(&d.stdinEOF) == 1 {
+		return "eof", idleText
+	}
+	if atomic.LoadInt32(&d.stdinClosed) == 1 {
+		return "drained", idleText
+	}
+	if idle <= 1500*time.Millisecond {
+		return "active", idleText
+	}
+	return "waiting", idleText
 }
 
 func (d *uploadDebugStats) startLoop() {
@@ -248,10 +310,11 @@ func (d *uploadDebugStats) printLine(prefix string, elapsed time.Duration, delta
 	uploadedRate := formatByteRate(deltaUploaded, interval)
 	readRateAvg7 := formatRateFromPerSecond(avgReadRate)
 	uploadedRateAvg7 := formatRateFromPerSecond(avgUploadedRate)
+	stdinState, stdinIdle := d.stdinState(time.Now())
 
 	fmt.Fprintf(
 		os.Stderr,
-		"%s mode=%s name=%q t=%s inflight=%d max=%d started=%d done=%d failed=%d retries=%d final_started=%d final_done=%d final_failed=%d read=%s uploaded=%s read_rate=%s upload_rate=%s read_rate_avg7=%s upload_rate_avg7=%s\n",
+		"%s mode=%s name=%q t=%s inflight=%d max=%d started=%d done=%d failed=%d retries=%d final_started=%d final_done=%d final_failed=%d read=%s uploaded=%s read_rate=%s upload_rate=%s read_rate_avg7=%s upload_rate_avg7=%s stdin_state=%s stdin_idle=%s\n",
 		prefix,
 		d.label,
 		d.name,
@@ -271,6 +334,8 @@ func (d *uploadDebugStats) printLine(prefix string, elapsed time.Duration, delta
 		uploadedRate,
 		readRateAvg7,
 		uploadedRateAvg7,
+		stdinState,
+		stdinIdle,
 	)
 }
 
@@ -397,10 +462,18 @@ func parseFlags(args []string) (options, string, error) {
 	}
 
 	if opts.stdin {
-		if fs.NArg() != 0 {
-			return options{}, "", errors.New("do not pass a file path with --stdin")
+		switch fs.NArg() {
+		case 0:
+			return opts, "", nil
+		case 1:
+			if strings.TrimSpace(opts.nameOverride) != "" {
+				return options{}, "", errors.New("do not pass a stdin filename argument together with --name")
+			}
+			opts.nameOverride = fs.Arg(0)
+			return opts, "", nil
+		default:
+			return options{}, "", errors.New("expected at most one stdin filename argument with --stdin")
 		}
-		return opts, "", nil
 	}
 
 	if opts.stdinSize > 0 {
@@ -419,11 +492,12 @@ idoud CLI uploader
 
 Usage:
   idoud [flags] <file>
-  idoud --stdin [--name <filename>] [flags]
+  idoud --stdin [--name <filename> | <filename>] [flags]
 
 Examples:
   idoud archive.zip
   cat archive.zip | idoud --stdin --name archive.zip
+  cat archive.zip | idoud --stdin archive.zip
 
 Core flags:
   --server        idoud server origin (default: https://idoud.cc)
@@ -613,6 +687,13 @@ func (u *uploader) debugAddRead(n int64) {
 	}
 	if dbg := u.dbg; dbg != nil {
 		atomic.AddInt64(&dbg.readBytes, n)
+		dbg.markRead(time.Now())
+	}
+}
+
+func (u *uploader) debugMarkStdinClosed(eof bool) {
+	if dbg := u.dbg; dbg != nil {
+		dbg.markStdinClosed(eof)
 	}
 }
 
@@ -849,6 +930,7 @@ readLoop:
 	if finalTask == nil {
 		return "", errors.New("final chunk is missing")
 	}
+	u.debugMarkStdinClosed(false)
 
 	finalErr := u.uploadPreparedChunkWithRetry(ctx, src, *finalTask, true, urls)
 	select {
@@ -877,6 +959,7 @@ func (u *uploader) uploadPreparedChunkWithRetry(ctx context.Context, src *source
 	defer func() { u.debugChunkDone(chunkSize, finalChunk, success) }()
 
 	var lastErr error
+	lastStatus := 0
 
 	for attempt := 0; attempt <= u.opts.retries; attempt++ {
 		body, status, err := u.uploadPreparedChunkOnce(ctx, src, chunk, finalChunk)
@@ -886,14 +969,18 @@ func (u *uploader) uploadPreparedChunkWithRetry(ctx context.Context, src *source
 			return nil
 		}
 		lastErr = err
+		lastStatus = status
 
-		if finalChunk && (status == 0 || status == 409 || status == 429 || status == 504) {
-			if ready, waitErr := u.waitForReadyAttempt(ctx, urls.get(), u.opts.finalizeRecover); waitErr == nil && ready {
+		if finalChunk {
+			recoverWait := finalAttemptRecoverWait(u.opts.finalizeRecover)
+			if ready, waitErr := u.tryRecoverFinalization(ctx, urls, status, recoverWait); waitErr == nil && ready {
 				success = true
 				return nil
+			} else if waitErr != nil && isContextErr(waitErr) {
+				return waitErr
 			}
 		}
-		if status == 524 {
+		if status == 524 && !finalChunk {
 			break
 		}
 
@@ -906,6 +993,15 @@ func (u *uploader) uploadPreparedChunkWithRetry(ctx context.Context, src *source
 		u.logf("chunk(stream) retry idx=%d final=%t attempt=%d/%d status=%d delay=%s err=%v", chunk.index, finalChunk, attempt+1, u.opts.retries, status, delay, err)
 		if err := sleepContext(ctx, delay); err != nil {
 			return err
+		}
+	}
+
+	if finalChunk {
+		if ready, waitErr := u.tryRecoverFinalization(ctx, urls, lastStatus, u.opts.finalizeTimeout); waitErr == nil && ready {
+			success = true
+			return nil
+		} else if waitErr != nil && isContextErr(waitErr) {
+			return waitErr
 		}
 	}
 
@@ -965,6 +1061,7 @@ func (u *uploader) uploadPreparedChunkUnknownWithRetry(ctx context.Context, src 
 	defer func() { u.debugChunkDone(chunkSize, finalChunk, success) }()
 
 	var lastErr error
+	lastStatus := 0
 
 	for attempt := 0; attempt <= u.opts.retries; attempt++ {
 		body, status, err := u.uploadPreparedChunkUnknownOnce(ctx, src, chunk, finalChunk)
@@ -974,14 +1071,18 @@ func (u *uploader) uploadPreparedChunkUnknownWithRetry(ctx context.Context, src 
 			return nil
 		}
 		lastErr = err
+		lastStatus = status
 
-		if finalChunk && (status == 0 || status == 409 || status == 429 || status == 504) {
-			if ready, waitErr := u.waitForReadyAttempt(ctx, urls.get(), u.opts.finalizeRecover); waitErr == nil && ready {
+		if finalChunk {
+			recoverWait := finalAttemptRecoverWait(u.opts.finalizeRecover)
+			if ready, waitErr := u.tryRecoverFinalization(ctx, urls, status, recoverWait); waitErr == nil && ready {
 				success = true
 				return nil
+			} else if waitErr != nil && isContextErr(waitErr) {
+				return waitErr
 			}
 		}
-		if status == 524 {
+		if status == 524 && !finalChunk {
 			break
 		}
 
@@ -994,6 +1095,15 @@ func (u *uploader) uploadPreparedChunkUnknownWithRetry(ctx context.Context, src 
 		u.logf("chunk(stream-unknown) retry idx=%d final=%t attempt=%d/%d status=%d delay=%s err=%v", chunk.index, finalChunk, attempt+1, u.opts.retries, status, delay, err)
 		if err := sleepContext(ctx, delay); err != nil {
 			return err
+		}
+	}
+
+	if finalChunk {
+		if ready, waitErr := u.tryRecoverFinalization(ctx, urls, lastStatus, u.opts.finalizeTimeout); waitErr == nil && ready {
+			success = true
+			return nil
+		} else if waitErr != nil && isContextErr(waitErr) {
+			return waitErr
 		}
 	}
 
@@ -1140,6 +1250,7 @@ func (u *uploader) uploadUnknownSizeStreamChunked(ctx context.Context, src *sour
 	n, final, err := readChunk(currBuf)
 	if err != nil {
 		if errors.Is(err, io.EOF) {
+			u.debugMarkStdinClosed(true)
 			putBuf(currBuf)
 			close(jobs)
 			wg.Wait()
@@ -1161,6 +1272,9 @@ func (u *uploader) uploadUnknownSizeStreamChunked(ctx context.Context, src *sour
 		return "", err
 	}
 	u.debugAddRead(int64(n))
+	if final {
+		u.debugMarkStdinClosed(true)
+	}
 
 	currSize := n
 	currFinal := final
@@ -1184,6 +1298,9 @@ readLoop:
 		if nextN > 0 {
 			u.debugAddRead(int64(nextN))
 		}
+		if nextFinal {
+			u.debugMarkStdinClosed(true)
+		}
 		if nextErr != nil && !errors.Is(nextErr, io.EOF) {
 			putBuf(nextBuf)
 			readErr = nextErr
@@ -1191,6 +1308,7 @@ readLoop:
 			break readLoop
 		}
 		if errors.Is(nextErr, io.EOF) && nextN == 0 {
+			u.debugMarkStdinClosed(true)
 			putBuf(nextBuf)
 			currFinal = true
 			break
@@ -1214,31 +1332,19 @@ readLoop:
 	}
 
 	close(jobs)
-
-	if readErr == nil {
-		finalTask := preparedChunk{
-			index: chunkIndex,
-			start: offset,
-			size:  currSize,
-			buf:   currBuf,
-		}
-		finalErr := u.uploadPreparedChunkUnknownWithRetry(ctx, src, finalTask, true, urls)
+	finalURL := ""
+	if readErr != nil {
 		putBuf(currBuf)
-		if finalErr != nil {
-			select {
-			case errCh <- finalErr:
-			default:
-			}
-			cancel()
-		}
-	} else {
-		putBuf(currBuf)
+		cancel()
 	}
 
 	wg.Wait()
 
 	select {
 	case err := <-errCh:
+		if readErr == nil {
+			putBuf(currBuf)
+		}
 		return "", err
 	default:
 	}
@@ -1246,10 +1352,23 @@ readLoop:
 		return "", readErr
 	}
 	if ctx.Err() != nil {
+		putBuf(currBuf)
 		return "", ctx.Err()
 	}
 
-	finalURL := urls.get()
+	finalTask := preparedChunk{
+		index: chunkIndex,
+		start: offset,
+		size:  currSize,
+		buf:   currBuf,
+	}
+	finalErr := u.uploadPreparedChunkUnknownWithRetry(ctx, src, finalTask, true, urls)
+	putBuf(currBuf)
+	if finalErr != nil {
+		return "", finalErr
+	}
+
+	finalURL = urls.get()
 	if finalURL == "" {
 		return "", errors.New("server returned empty upload URL")
 	}
@@ -1502,12 +1621,22 @@ func (u *uploader) waitForReadyAttempt(ctx context.Context, publicURL string, ti
 	defer cancel()
 
 	fileID := extractShortIDFromURL(publicURL)
-	ticker := time.NewTicker(u.opts.finalizePollInterval)
-	defer ticker.Stop()
 
 	for {
+		remaining := timeout
+		if deadline, ok := waitCtx.Deadline(); ok {
+			remaining = time.Until(deadline)
+		}
+		if remaining <= 0 {
+			return false, nil
+		}
+
 		if fileID != "" {
-			ready, failed, err := u.probeMetadata(waitCtx, fileID)
+			metadataWait := remaining
+			if metadataWait > defaultMetadataWaitMax {
+				metadataWait = defaultMetadataWaitMax
+			}
+			ready, failed, err := u.probeMetadata(waitCtx, fileID, metadataWait)
 			if err != nil {
 				return false, err
 			}
@@ -1530,19 +1659,28 @@ func (u *uploader) waitForReadyAttempt(ctx context.Context, publicURL string, ti
 			}
 		}
 
+		sleep := u.opts.finalizePollInterval
+		if sleep <= 0 {
+			sleep = 100 * time.Millisecond
+		}
+		if sleep > remaining {
+			sleep = remaining
+		}
+		timer := time.NewTimer(sleep)
 		select {
 		case <-waitCtx.Done():
+			timer.Stop()
 			if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
 				return false, nil
 			}
 			return false, waitCtx.Err()
-		case <-ticker.C:
+		case <-timer.C:
 		}
 	}
 }
 
-func (u *uploader) probeMetadata(ctx context.Context, fileID string) (ready bool, failed bool, err error) {
-	endpoint := buildMetadataURL(u.opts.serverBase, fileID)
+func (u *uploader) probeMetadata(ctx context.Context, fileID string, wait time.Duration) (ready bool, failed bool, err error) {
+	endpoint := buildMetadataURLWithWait(u.opts.serverBase, fileID, wait)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -1630,12 +1768,20 @@ func buildUploadURL(base *url.URL, filename string) string {
 	return u.String()
 }
 
-func buildMetadataURL(base *url.URL, fileID string) string {
+func buildMetadataURLWithWait(base *url.URL, fileID string, wait time.Duration) string {
 	u := *base
 	u.RawQuery = ""
 	u.Fragment = ""
 	path := strings.TrimSuffix(u.Path, "/")
 	u.Path = path + "/v1/files/" + url.PathEscape(fileID)
+	if wait > 0 {
+		waitMS := wait / time.Millisecond
+		if waitMS > 0 {
+			q := u.Query()
+			q.Set("wait_ready_ms", strconv.FormatInt(int64(waitMS), 10))
+			u.RawQuery = q.Encode()
+		}
+	}
 	u.RawPath = ""
 	return u.String()
 }
@@ -1845,7 +1991,7 @@ func isRetryableStatus(status int, err error) bool {
 		}
 	}
 	switch status {
-	case 0, 408, 409, 425, 429, 500, 502, 503, 504, 520, 522, 524:
+	case 0, 408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524:
 		return true
 	default:
 		return false
@@ -1859,6 +2005,35 @@ func statusMayStillFinalize(status int) bool {
 	default:
 		return status >= 500
 	}
+}
+
+func finalizationUncertainStatus(status int) bool {
+	if status == 0 {
+		return true
+	}
+	return statusMayStillFinalize(status)
+}
+
+func finalAttemptRecoverWait(configured time.Duration) time.Duration {
+	if configured <= 0 {
+		return 0
+	}
+	const perAttemptMax = 5 * time.Second
+	if configured > perAttemptMax {
+		return perAttemptMax
+	}
+	return configured
+}
+
+func (u *uploader) tryRecoverFinalization(ctx context.Context, urls *urlCapture, status int, wait time.Duration) (bool, error) {
+	if !finalizationUncertainStatus(status) || wait <= 0 || urls == nil {
+		return false, nil
+	}
+	publicURL := urls.get()
+	if strings.TrimSpace(publicURL) == "" {
+		return false, nil
+	}
+	return u.waitForReadyAttempt(ctx, publicURL, wait)
 }
 
 func retryBackoff(attempt int) time.Duration {
