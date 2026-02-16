@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -139,7 +140,9 @@ type uploader struct {
 }
 
 type fileMetadataPayload struct {
-	Status int `json:"Status"`
+	Status        int   `json:"Status"`
+	UploadedBytes int64 `json:"UploadedBytes,omitempty"`
+	TotalBytes    int64 `json:"TotalBytes,omitempty"`
 }
 
 type uploadDebugStats struct {
@@ -166,6 +169,9 @@ type uploadDebugStats struct {
 	stdinLastRead int64
 	stdinClosed   int32
 	stdinEOF      int32
+	// serverWaitStartUnix is set (atomically) when the client starts polling
+	// the server for readiness. Zero means not waiting yet.
+	serverWaitStartUnix int64
 }
 
 func newUploadDebugStats(label, name string) *uploadDebugStats {
@@ -312,9 +318,14 @@ func (d *uploadDebugStats) printLine(prefix string, elapsed time.Duration, delta
 	uploadedRateAvg7 := formatRateFromPerSecond(avgUploadedRate)
 	stdinState, stdinIdle := d.stdinState(time.Now())
 
+	serverWaitStr := ""
+	if swStart := atomic.LoadInt64(&d.serverWaitStartUnix); swStart > 0 {
+		serverWaitStr = fmt.Sprintf(" server_wait=%s", roundDuration(time.Since(time.Unix(0, swStart))))
+	}
+
 	fmt.Fprintf(
 		os.Stderr,
-		"%s mode=%s name=%q t=%s inflight=%d max=%d started=%d done=%d failed=%d retries=%d final_started=%d final_done=%d final_failed=%d read=%s uploaded=%s read_rate=%s upload_rate=%s read_rate_avg7=%s upload_rate_avg7=%s stdin_state=%s stdin_idle=%s\n",
+		"%s mode=%s name=%q t=%s inflight=%d max=%d started=%d done=%d failed=%d retries=%d final_started=%d final_done=%d final_failed=%d read=%s uploaded=%s read_rate=%s upload_rate=%s read_rate_avg7=%s upload_rate_avg7=%s stdin_state=%s stdin_idle=%s%s\n",
 		prefix,
 		d.label,
 		d.name,
@@ -336,6 +347,7 @@ func (d *uploadDebugStats) printLine(prefix string, elapsed time.Duration, delta
 		uploadedRateAvg7,
 		stdinState,
 		stdinIdle,
+		serverWaitStr,
 	)
 }
 
@@ -354,7 +366,7 @@ func main() {
 	defer cleanup()
 
 	client := &http.Client{
-		Transport: buildTransport(opts.insecureTLS),
+		Transport: buildTransport(opts.insecureTLS, opts.parallel),
 	}
 
 	u := &uploader{
@@ -605,6 +617,8 @@ func (u *uploader) upload(ctx context.Context, src *sourceFile) (string, error) 
 
 	stopDebug := u.startDebug(src)
 	defer stopDebug()
+
+	u.warmConnections(ctx, u.opts.parallel)
 
 	if !src.knownSize {
 		return u.uploadUnknownSizeStreamChunked(ctx, src)
@@ -1601,6 +1615,9 @@ func (u *uploader) uploadEmptyOnce(ctx context.Context, src *sourceFile) (string
 }
 
 func (u *uploader) waitForReady(ctx context.Context, publicURL string, timeout time.Duration) error {
+	if u.dbg != nil {
+		atomic.StoreInt64(&u.dbg.serverWaitStartUnix, time.Now().UnixNano())
+	}
 	ready, err := u.waitForReadyAttempt(ctx, publicURL, timeout)
 	if err != nil {
 		return err
@@ -1621,6 +1638,8 @@ func (u *uploader) waitForReadyAttempt(ctx context.Context, publicURL string, ti
 	defer cancel()
 
 	fileID := extractShortIDFromURL(publicURL)
+	pollStart := time.Now()
+	polls := 0
 
 	for {
 		remaining := timeout
@@ -1631,6 +1650,7 @@ func (u *uploader) waitForReadyAttempt(ctx context.Context, publicURL string, ti
 			return false, nil
 		}
 
+		polls++
 		if fileID != "" {
 			metadataWait := remaining
 			if metadataWait > defaultMetadataWaitMax {
@@ -1641,10 +1661,16 @@ func (u *uploader) waitForReadyAttempt(ctx context.Context, publicURL string, ti
 				return false, err
 			}
 			if ready {
+				if u.opts.verbose || u.opts.debug {
+					fmt.Fprintf(os.Stderr, "finalize_ready file=%s polls=%d elapsed=%s\n", fileID, polls, time.Since(pollStart))
+				}
 				return true, nil
 			}
 			if failed {
 				return false, errors.New("server marked upload as failed")
+			}
+			if u.opts.debug && polls%5 == 0 {
+				fmt.Fprintf(os.Stderr, "finalize_poll file=%s polls=%d elapsed=%s waiting_for=server_drain\n", fileID, polls, time.Since(pollStart))
 			}
 		} else {
 			ready, failed, err := u.probeHead(waitCtx, publicURL)
@@ -1712,6 +1738,11 @@ func (u *uploader) probeMetadata(ctx context.Context, fileID string, wait time.D
 		case 2:
 			return false, true, nil
 		default:
+			if u.opts.debug && payload.TotalBytes > 0 {
+				pct := float64(payload.UploadedBytes) / float64(payload.TotalBytes) * 100
+				fmt.Fprintf(os.Stderr, "finalize_progress file=%s stored=%s/%s (%.1f%%)\n",
+					fileID, formatByteSize(payload.UploadedBytes), formatByteSize(payload.TotalBytes), pct)
+			}
 			return false, false, nil
 		}
 	case statusMayStillFinalize(resp.StatusCode):
@@ -1750,12 +1781,64 @@ func (u *uploader) probeHead(ctx context.Context, publicURL string) (ready bool,
 	}
 }
 
-func buildTransport(insecure bool) *http.Transport {
-	base := http.DefaultTransport.(*http.Transport).Clone()
-	if insecure {
-		base.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+func buildTransport(insecure bool, parallel int) *http.Transport {
+	conns := parallel
+	if conns < 16 {
+		conns = 16
 	}
-	return base
+	dialer := &net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	t := &http.Transport{
+		DialContext:           dialer.DialContext,
+		MaxIdleConns:          conns * 2,
+		MaxIdleConnsPerHost:   conns,
+		MaxConnsPerHost:       0,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		DisableCompression:    true,
+		ForceAttemptHTTP2:     false,
+		ResponseHeaderTimeout: 60 * time.Second,
+		WriteBufferSize:       64 * 1024,
+		ReadBufferSize:        16 * 1024,
+	}
+	if insecure {
+		t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+	return t
+}
+
+const warmupTimeout = 3 * time.Second
+
+func (u *uploader) warmConnections(ctx context.Context, count int) {
+	if count <= 0 || u.opts.serverBase == nil {
+		return
+	}
+	if count > 64 {
+		count = 64
+	}
+	warmURL := strings.TrimSuffix(u.opts.serverBase.String(), "/") + "/v1/health"
+	var wg sync.WaitGroup
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			reqCtx, cancel := context.WithTimeout(ctx, warmupTimeout)
+			defer cancel()
+			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, warmURL, nil)
+			if err != nil {
+				return
+			}
+			resp, err := u.client.Do(req)
+			if err != nil {
+				return
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}()
+	}
+	wg.Wait()
 }
 
 func buildUploadURL(base *url.URL, filename string) string {
