@@ -47,8 +47,8 @@ idoud --password "secret" --download-limit 3 archive.zip
 - `--stdin` read payload from stdin instead of a path argument
 - `--stdin-size` known stdin size hint for stdin uploads
 - `--name` upload filename override (recommended with `--stdin`)
-- `--chunk-size` chunk size for `Content-Range` uploads (default `3MiB`)
-- `--parallel` parallel non-final chunk uploads (default `12`)
+- `--chunk-size` chunk size for `Content-Range` uploads (default `10485689` bytes)
+- `--parallel` parallel non-final chunk uploads (default `80`)
 - `--retries` retries per chunk (default `6`)
 - `--debug` print live chunk concurrency, retries, throughput, and 7-sample moving average speed to stderr
 - `--request-timeout` timeout for non-final chunk requests (default `95s`)

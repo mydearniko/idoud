@@ -26,8 +26,8 @@ import (
 
 const (
 	defaultServerURL            = "https://idoud.cc"
-	defaultChunkSize            = int64(3 * 1024 * 1024)
-	defaultParallel             = 12
+	defaultChunkSize            = int64(10*1024*1024 - 71)
+	defaultParallel             = 80
 	defaultRetries              = 6
 	defaultChunkTimeout         = 95 * time.Second
 	defaultFinalChunkTimeout    = 35 * time.Second
@@ -389,14 +389,14 @@ func parseFlags(args []string) (options, string, error) {
 	fs := flag.NewFlagSet("idoud", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 
-	chunkSizeRaw := "3MiB"
+	chunkSizeRaw := strconv.FormatInt(defaultChunkSize, 10)
 	stdinSizeRaw := ""
 
 	fs.StringVar(&opts.serverURL, "server", defaultServerURL, "idoud server origin")
 	fs.BoolVar(&opts.stdin, "stdin", false, "read file data from stdin")
 	fs.StringVar(&stdinSizeRaw, "stdin-size", "", "stdin size hint for stdin uploads")
 	fs.StringVar(&opts.nameOverride, "name", "", "upload file name override")
-	fs.StringVar(&chunkSizeRaw, "chunk-size", "3MiB", "chunk size for Content-Range uploads")
+	fs.StringVar(&chunkSizeRaw, "chunk-size", strconv.FormatInt(defaultChunkSize, 10), "chunk size for Content-Range uploads")
 	fs.IntVar(&opts.parallel, "parallel", defaultParallel, "parallel chunk uploads (non-final chunks)")
 	fs.IntVar(&opts.retries, "retries", defaultRetries, "retry count per chunk")
 	fs.DurationVar(&opts.requestTimeout, "request-timeout", defaultChunkTimeout, "timeout per non-final chunk request")
@@ -516,8 +516,8 @@ Core flags:
   --stdin         read file data from stdin
   --stdin-size    known stdin size hint for stdin uploads
   --name          override upload file name
-  --chunk-size    chunk size for range uploads (default: 3MiB)
-  --parallel      parallel non-final chunk uploads (default: 12)
+  --chunk-size    chunk size for range uploads (default: 10485689 bytes)
+  --parallel      parallel non-final chunk uploads (default: 80)
   --retries       retries per chunk (default: 6)
   --debug         print live chunk concurrency and throughput stats to stderr
 `)
@@ -1794,14 +1794,14 @@ func buildTransport(insecure bool, parallel int) *http.Transport {
 		DialContext:           dialer.DialContext,
 		MaxIdleConns:          conns * 2,
 		MaxIdleConnsPerHost:   conns,
-		MaxConnsPerHost:       0,
+		MaxConnsPerHost:       conns * 2,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
 		DisableCompression:    true,
 		ForceAttemptHTTP2:     false,
 		ResponseHeaderTimeout: 60 * time.Second,
-		WriteBufferSize:       64 * 1024,
-		ReadBufferSize:        16 * 1024,
+		WriteBufferSize:       256 * 1024,
+		ReadBufferSize:        64 * 1024,
 	}
 	if insecure {
 		t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
@@ -1815,8 +1815,8 @@ func (u *uploader) warmConnections(ctx context.Context, count int) {
 	if count <= 0 || u.opts.serverBase == nil {
 		return
 	}
-	if count > 64 {
-		count = 64
+	if count > 128 {
+		count = 128
 	}
 	warmURL := strings.TrimSuffix(u.opts.serverBase.String(), "/") + "/v1/health"
 	var wg sync.WaitGroup
