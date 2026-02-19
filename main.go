@@ -1040,6 +1040,22 @@ readLoop:
 }
 
 func (u *uploader) uploadPreparedChunkWithRetry(ctx context.Context, src *sourceFile, chunk preparedChunk, finalChunk bool, urls *urlCapture) error {
+	return u.uploadPreparedChunkWithRetryMode(ctx, src, chunk, finalChunk, urls, "stream", u.uploadPreparedChunkOnce)
+}
+
+func (u *uploader) uploadPreparedChunkUnknownWithRetry(ctx context.Context, src *sourceFile, chunk preparedChunk, finalChunk bool, urls *urlCapture) error {
+	return u.uploadPreparedChunkWithRetryMode(ctx, src, chunk, finalChunk, urls, "stream-unknown", u.uploadPreparedChunkUnknownOnce)
+}
+
+func (u *uploader) uploadPreparedChunkWithRetryMode(
+	ctx context.Context,
+	src *sourceFile,
+	chunk preparedChunk,
+	finalChunk bool,
+	urls *urlCapture,
+	mode string,
+	once func(context.Context, *sourceFile, preparedChunk, bool) (string, int, error),
+) error {
 	chunkSize := int64(chunk.size)
 	u.debugChunkStart(chunkSize, finalChunk)
 	success := false
@@ -1050,7 +1066,7 @@ func (u *uploader) uploadPreparedChunkWithRetry(ctx context.Context, src *source
 
 	for attempt := 0; attempt <= u.opts.retries; attempt++ {
 		body, status, err := u.doChunkAttempt(ctx, chunk.index, finalChunk, func(reqCtx context.Context) (string, int, error) {
-			return u.uploadPreparedChunkOnce(reqCtx, src, chunk, finalChunk)
+			return once(reqCtx, src, chunk, finalChunk)
 		})
 		if err == nil {
 			urls.set(body)
@@ -1079,7 +1095,7 @@ func (u *uploader) uploadPreparedChunkWithRetry(ctx context.Context, src *source
 
 		delay := retryBackoff(attempt + 1)
 		u.debugRetry()
-		u.logf("chunk(stream) retry idx=%d final=%t attempt=%d/%d status=%d delay=%s err=%v", chunk.index, finalChunk, attempt+1, u.opts.retries, status, delay, err)
+		u.logf("chunk(%s) retry idx=%d final=%t attempt=%d/%d status=%d delay=%s err=%v", mode, chunk.index, finalChunk, attempt+1, u.opts.retries, status, delay, err)
 		if err := sleepContext(ctx, delay); err != nil {
 			return err
 		}
@@ -1102,103 +1118,8 @@ func (u *uploader) uploadPreparedChunkOnce(ctx context.Context, src *sourceFile,
 	if chunk.size <= 0 || endExclusive > src.size {
 		return "", 0, errors.New("invalid prepared chunk bounds")
 	}
-
-	timeout := u.opts.requestTimeout
-	if finalChunk {
-		timeout = u.opts.finalChunkTimeout
-	}
-	reqCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	reader := bytes.NewReader(chunk.buf[:chunk.size])
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPut, src.uploadURL, reader)
-	if err != nil {
-		return "", 0, err
-	}
-	req.ContentLength = int64(chunk.size)
-	req.Header.Set(headerContentType, contentTypeOctetStream)
-	req.Header.Set(headerUploadKey, u.opts.uploadKey)
-	req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", chunk.start, endExclusive-1, src.size))
-	if u.opts.password != "" {
-		req.Header.Set(headerUploadPassword, u.opts.password)
-	}
-	if u.opts.downloadLimit > 0 {
-		req.Header.Set(headerUploadDownloadLimit, strconv.FormatInt(u.opts.downloadLimit, 10))
-	}
-
-	resp, err := u.client.Do(req)
-	if err != nil {
-		return "", 0, &requestError{cause: err}
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
-	body := strings.TrimSpace(string(bodyBytes))
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return body, resp.StatusCode, nil
-	}
-	return "", resp.StatusCode, &requestError{
-		status: resp.StatusCode,
-		body:   body,
-	}
-}
-
-func (u *uploader) uploadPreparedChunkUnknownWithRetry(ctx context.Context, src *sourceFile, chunk preparedChunk, finalChunk bool, urls *urlCapture) error {
-	chunkSize := int64(chunk.size)
-	u.debugChunkStart(chunkSize, finalChunk)
-	success := false
-	defer func() { u.debugChunkDone(chunkSize, finalChunk, success) }()
-
-	var lastErr error
-	lastStatus := 0
-
-	for attempt := 0; attempt <= u.opts.retries; attempt++ {
-		body, status, err := u.doChunkAttempt(ctx, chunk.index, finalChunk, func(reqCtx context.Context) (string, int, error) {
-			return u.uploadPreparedChunkUnknownOnce(reqCtx, src, chunk, finalChunk)
-		})
-		if err == nil {
-			urls.set(body)
-			success = true
-			return nil
-		}
-		lastErr = err
-		lastStatus = status
-
-		if finalChunk {
-			recoverWait := finalAttemptRecoverWait(u.opts.finalizeRecover)
-			if ready, waitErr := u.tryRecoverFinalization(ctx, urls, status, recoverWait); waitErr == nil && ready {
-				success = true
-				return nil
-			} else if waitErr != nil && isContextErr(waitErr) {
-				return waitErr
-			}
-		}
-		if status == 524 && !finalChunk {
-			break
-		}
-
-		if !isRetryableStatus(status, err) || attempt >= u.opts.retries {
-			break
-		}
-
-		delay := retryBackoff(attempt + 1)
-		u.debugRetry()
-		u.logf("chunk(stream-unknown) retry idx=%d final=%t attempt=%d/%d status=%d delay=%s err=%v", chunk.index, finalChunk, attempt+1, u.opts.retries, status, delay, err)
-		if err := sleepContext(ctx, delay); err != nil {
-			return err
-		}
-	}
-
-	if finalChunk {
-		if ready, waitErr := u.tryRecoverFinalization(ctx, urls, lastStatus, u.opts.finalizeTimeout); waitErr == nil && ready {
-			success = true
-			return nil
-		} else if waitErr != nil && isContextErr(waitErr) {
-			return waitErr
-		}
-	}
-
-	return fmt.Errorf("chunk %d upload failed: %w", chunk.index, lastErr)
+	contentRange := fmt.Sprintf("bytes %d-%d/%d", chunk.start, endExclusive-1, src.size)
+	return u.uploadPreparedChunkOnceWithContentRange(ctx, src, chunk, finalChunk, contentRange, false)
 }
 
 func (u *uploader) uploadPreparedChunkUnknownOnce(ctx context.Context, src *sourceFile, chunk preparedChunk, finalChunk bool) (string, int, error) {
@@ -1206,7 +1127,18 @@ func (u *uploader) uploadPreparedChunkUnknownOnce(ctx context.Context, src *sour
 		return "", 0, errors.New("invalid prepared chunk size")
 	}
 	endExclusive := chunk.start + int64(chunk.size)
+	contentRange := fmt.Sprintf("bytes %d-%d/*", chunk.start, endExclusive-1)
+	return u.uploadPreparedChunkOnceWithContentRange(ctx, src, chunk, finalChunk, contentRange, true)
+}
 
+func (u *uploader) uploadPreparedChunkOnceWithContentRange(
+	ctx context.Context,
+	src *sourceFile,
+	chunk preparedChunk,
+	finalChunk bool,
+	contentRange string,
+	setFinalChunkHeader bool,
+) (string, int, error) {
 	timeout := u.opts.requestTimeout
 	if finalChunk {
 		timeout = u.opts.finalChunkTimeout
@@ -1222,8 +1154,8 @@ func (u *uploader) uploadPreparedChunkUnknownOnce(ctx context.Context, src *sour
 	req.ContentLength = int64(chunk.size)
 	req.Header.Set(headerContentType, contentTypeOctetStream)
 	req.Header.Set(headerUploadKey, u.opts.uploadKey)
-	req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/*", chunk.start, endExclusive-1))
-	if finalChunk {
+	req.Header.Set("Content-Range", contentRange)
+	if setFinalChunkHeader && finalChunk {
 		req.Header.Set(headerUploadFinalChunk, "1")
 	}
 	if u.opts.password != "" {
