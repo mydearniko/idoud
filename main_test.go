@@ -31,3 +31,10 @@ func TestParseFlagsStdinTooManyPositionalArgs(t *testing.T) {
 		t.Fatal("expected error for too many positional args in stdin mode")
 	}
 }
+
+func TestBuildTransportResponseHeaderTimeoutDisabled(t *testing.T) {
+	tr := buildTransport(false, 8)
+	if tr.ResponseHeaderTimeout != 0 {
+		t.Fatalf("ResponseHeaderTimeout = %s, want 0", tr.ResponseHeaderTimeout)
+	}
+}

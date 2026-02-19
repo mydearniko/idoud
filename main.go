@@ -1907,15 +1907,18 @@ func buildTransport(insecure bool, parallel int) *http.Transport {
 		KeepAlive: 15 * time.Second,
 	}
 	t := &http.Transport{
-		DialContext:           dialer.DialContext,
-		MaxIdleConns:          conns * 3,
-		MaxIdleConnsPerHost:   conns * 2,
-		MaxConnsPerHost:       conns * 3,
-		IdleConnTimeout:       15 * time.Second,
-		TLSHandshakeTimeout:   5 * time.Second,
-		DisableCompression:    true,
-		ForceAttemptHTTP2:     false,
-		ResponseHeaderTimeout: 20 * time.Second,
+		DialContext:         dialer.DialContext,
+		MaxIdleConns:        conns * 3,
+		MaxIdleConnsPerHost: conns * 2,
+		MaxConnsPerHost:     conns * 3,
+		IdleConnTimeout:     15 * time.Second,
+		TLSHandshakeTimeout: 5 * time.Second,
+		DisableCompression:  true,
+		ForceAttemptHTTP2:   false,
+		// Request-scoped context deadlines (--request-timeout / --final-request-timeout)
+		// own timeout enforcement. Keep this disabled to avoid premature ~20s
+		// aborts on slower links.
+		ResponseHeaderTimeout: 0,
 		WriteBufferSize:       1024 * 1024,
 		ReadBufferSize:        64 * 1024,
 	}
