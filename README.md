@@ -50,6 +50,7 @@ idoud --password "secret" --download-limit 3 archive.zip
 - `--chunk-size` chunk size for `Content-Range` uploads (default `10485689` bytes)
 - `--parallel` parallel non-final chunk uploads (default `80`)
 - `--retries` retries per chunk (default `6`)
+- `--hedge-delay` speculative duplicate delay for slow non-final chunks (default `0s`, disabled)
 - `--debug` print live chunk concurrency, retries, throughput, and 7-sample moving average speed to stderr
 - `--request-timeout` timeout for non-final chunk requests (default `95s`)
 - `--final-request-timeout` timeout for final chunk request (default `35s`)

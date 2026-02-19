@@ -29,14 +29,15 @@ const (
 	defaultChunkSize            = int64(10*1024*1024 - 71)
 	defaultParallel             = 80
 	defaultRetries              = 6
-	defaultChunkTimeout         = 95 * time.Second
+	defaultHedgeDelay           = 0 * time.Second
+	defaultChunkTimeout         = 20 * time.Second
 	defaultFinalChunkTimeout    = 35 * time.Second
 	defaultFinalizeRecover      = 5 * time.Second
 	defaultFinalizeTimeout      = 20 * time.Minute
 	defaultFinalizePollInterval = 100 * time.Millisecond
 	defaultMetadataWaitMax      = 700 * time.Millisecond
-	defaultBackoffBase          = 120 * time.Millisecond
-	defaultBackoffMax           = 1200 * time.Millisecond
+	defaultBackoffBase          = 50 * time.Millisecond
+	defaultBackoffMax           = 400 * time.Millisecond
 	maxResponseBodyBytes        = 1 << 20
 )
 
@@ -63,6 +64,7 @@ type options struct {
 	chunkSize            int64
 	parallel             int
 	retries              int
+	hedgeDelay           time.Duration
 	requestTimeout       time.Duration
 	finalChunkTimeout    time.Duration
 	finalizeRecover      time.Duration
@@ -117,6 +119,12 @@ type requestError struct {
 	cause  error
 }
 
+type chunkAttemptResult struct {
+	body   string
+	status int
+	err    error
+}
+
 func (e *requestError) Error() string {
 	if e == nil {
 		return "request failed"
@@ -159,10 +167,15 @@ type uploadDebugStats struct {
 	chunksStarted int64
 	chunksDone    int64
 	chunksFailed  int64
+	chunkAttempts int64
 	finalStarted  int64
 	finalDone     int64
 	finalFailed   int64
 	retries       int64
+	hedges        int64
+	timeouts      int64
+	status429     int64
+	status5xx     int64
 	readBytes     int64
 	uploadBytes   int64
 	stdinTracked  bool
@@ -307,7 +320,12 @@ func (d *uploadDebugStats) printLine(prefix string, elapsed time.Duration, delta
 	started := atomic.LoadInt64(&d.chunksStarted)
 	done := atomic.LoadInt64(&d.chunksDone)
 	failed := atomic.LoadInt64(&d.chunksFailed)
+	attempts := atomic.LoadInt64(&d.chunkAttempts)
 	retries := atomic.LoadInt64(&d.retries)
+	hedges := atomic.LoadInt64(&d.hedges)
+	timeouts := atomic.LoadInt64(&d.timeouts)
+	status429 := atomic.LoadInt64(&d.status429)
+	status5xx := atomic.LoadInt64(&d.status5xx)
 	finalStarted := atomic.LoadInt64(&d.finalStarted)
 	finalDone := atomic.LoadInt64(&d.finalDone)
 	finalFailed := atomic.LoadInt64(&d.finalFailed)
@@ -325,7 +343,7 @@ func (d *uploadDebugStats) printLine(prefix string, elapsed time.Duration, delta
 
 	fmt.Fprintf(
 		os.Stderr,
-		"%s mode=%s name=%q t=%s inflight=%d max=%d started=%d done=%d failed=%d retries=%d final_started=%d final_done=%d final_failed=%d read=%s uploaded=%s read_rate=%s upload_rate=%s read_rate_avg7=%s upload_rate_avg7=%s stdin_state=%s stdin_idle=%s%s\n",
+		"%s mode=%s name=%q t=%s inflight=%d max=%d started=%d done=%d failed=%d attempts=%d retries=%d hedges=%d timeouts=%d status_429=%d status_5xx=%d final_started=%d final_done=%d final_failed=%d read=%s uploaded=%s read_rate=%s upload_rate=%s read_rate_avg7=%s upload_rate_avg7=%s stdin_state=%s stdin_idle=%s%s\n",
 		prefix,
 		d.label,
 		d.name,
@@ -335,7 +353,12 @@ func (d *uploadDebugStats) printLine(prefix string, elapsed time.Duration, delta
 		started,
 		done,
 		failed,
+		attempts,
 		retries,
+		hedges,
+		timeouts,
+		status429,
+		status5xx,
 		finalStarted,
 		finalDone,
 		finalFailed,
@@ -399,6 +422,7 @@ func parseFlags(args []string) (options, string, error) {
 	fs.StringVar(&chunkSizeRaw, "chunk-size", strconv.FormatInt(defaultChunkSize, 10), "chunk size for Content-Range uploads")
 	fs.IntVar(&opts.parallel, "parallel", defaultParallel, "parallel chunk uploads (non-final chunks)")
 	fs.IntVar(&opts.retries, "retries", defaultRetries, "retry count per chunk")
+	fs.DurationVar(&opts.hedgeDelay, "hedge-delay", defaultHedgeDelay, "delay before speculative duplicate upload for slow non-final chunks (0 disables)")
 	fs.DurationVar(&opts.requestTimeout, "request-timeout", defaultChunkTimeout, "timeout per non-final chunk request")
 	fs.DurationVar(&opts.finalChunkTimeout, "final-request-timeout", defaultFinalChunkTimeout, "timeout for final chunk request")
 	fs.DurationVar(&opts.finalizeRecover, "finalize-recovery-timeout", defaultFinalizeRecover, "readiness wait after uncertain final chunk result")
@@ -446,6 +470,9 @@ func parseFlags(args []string) (options, string, error) {
 	}
 	if opts.retries < 0 {
 		return options{}, "", errors.New("--retries must be >= 0")
+	}
+	if opts.hedgeDelay < 0 {
+		return options{}, "", errors.New("--hedge-delay must be >= 0")
 	}
 	if opts.requestTimeout <= 0 {
 		return options{}, "", errors.New("--request-timeout must be > 0")
@@ -519,6 +546,7 @@ Core flags:
   --chunk-size    chunk size for range uploads (default: 10485689 bytes)
   --parallel      parallel non-final chunk uploads (default: 80)
   --retries       retries per chunk (default: 6)
+  --hedge-delay   delay before speculative duplicate upload for slow non-final chunks (default: 0s, disabled)
   --debug         print live chunk concurrency and throughput stats to stderr
 `)
 }
@@ -763,6 +791,28 @@ func (u *uploader) debugRetry() {
 	}
 }
 
+func (u *uploader) debugHedge() {
+	if dbg := u.dbg; dbg != nil {
+		atomic.AddInt64(&dbg.hedges, 1)
+	}
+}
+
+func (u *uploader) debugChunkAttempt(status int, err error) {
+	dbg := u.dbg
+	if dbg == nil {
+		return
+	}
+	atomic.AddInt64(&dbg.chunkAttempts, 1)
+	if status == http.StatusTooManyRequests {
+		atomic.AddInt64(&dbg.status429, 1)
+	} else if status >= http.StatusInternalServerError {
+		atomic.AddInt64(&dbg.status5xx, 1)
+	}
+	if isTimeoutLikeErr(err) {
+		atomic.AddInt64(&dbg.timeouts, 1)
+	}
+}
+
 type preparedChunk struct {
 	index int64
 	start int64
@@ -818,6 +868,12 @@ func (u *uploader) uploadKnownSizeStreamChunked(ctx context.Context, src *source
 		pool <- make([]byte, int(u.opts.chunkSize))
 	}
 
+	// Separate pool for upload copies — decouples stdin reading from upload latency.
+	uploadPool := make(chan []byte, workers)
+	for i := 0; i < workers; i++ {
+		uploadPool <- make([]byte, int(u.opts.chunkSize))
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -828,10 +884,27 @@ func (u *uploader) uploadKnownSizeStreamChunked(ctx context.Context, src *source
 	worker := func() {
 		defer wg.Done()
 		for task := range jobs {
-			err := u.uploadPreparedChunkWithRetry(ctx, src, task, false, urls)
+			// Copy chunk data and return read buffer immediately.
+			var upBuf []byte
+			select {
+			case upBuf = <-uploadPool:
+			case <-ctx.Done():
+				select {
+				case pool <- task.buf:
+				case <-ctx.Done():
+				}
+				return
+			}
+			copy(upBuf[:task.size], task.buf[:task.size])
 			select {
 			case pool <- task.buf:
 			case <-ctx.Done():
+			}
+			task.buf = upBuf
+			err := u.uploadPreparedChunkWithRetry(ctx, src, task, false, urls)
+			select {
+			case uploadPool <- upBuf:
+			default:
 			}
 			if err != nil {
 				select {
@@ -976,7 +1049,9 @@ func (u *uploader) uploadPreparedChunkWithRetry(ctx context.Context, src *source
 	lastStatus := 0
 
 	for attempt := 0; attempt <= u.opts.retries; attempt++ {
-		body, status, err := u.uploadPreparedChunkOnce(ctx, src, chunk, finalChunk)
+		body, status, err := u.doChunkAttempt(ctx, chunk.index, finalChunk, func(reqCtx context.Context) (string, int, error) {
+			return u.uploadPreparedChunkOnce(reqCtx, src, chunk, finalChunk)
+		})
 		if err == nil {
 			urls.set(body)
 			success = true
@@ -1078,7 +1153,9 @@ func (u *uploader) uploadPreparedChunkUnknownWithRetry(ctx context.Context, src 
 	lastStatus := 0
 
 	for attempt := 0; attempt <= u.opts.retries; attempt++ {
-		body, status, err := u.uploadPreparedChunkUnknownOnce(ctx, src, chunk, finalChunk)
+		body, status, err := u.doChunkAttempt(ctx, chunk.index, finalChunk, func(reqCtx context.Context) (string, int, error) {
+			return u.uploadPreparedChunkUnknownOnce(reqCtx, src, chunk, finalChunk)
+		})
 		if err == nil {
 			urls.set(body)
 			success = true
@@ -1228,14 +1305,36 @@ func (u *uploader) uploadUnknownSizeStreamChunked(ctx context.Context, src *sour
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Separate pool for upload copies — decouples stdin reading from upload
+	// latency so the read loop never stalls waiting for slow HTTP responses.
+	uploadPool := make(chan []byte, workers)
+	for i := 0; i < workers; i++ {
+		uploadPool <- make([]byte, chunkCap)
+	}
+
 	jobs := make(chan preparedChunk, workers*2)
 	errCh := make(chan error, 1)
 	var wg sync.WaitGroup
 	workerFn := func() {
 		defer wg.Done()
 		for task := range jobs {
+			// Copy chunk data into an upload-specific buffer and return the
+			// read buffer immediately so the read loop can continue.
+			var upBuf []byte
+			select {
+			case upBuf = <-uploadPool:
+			case <-ctx.Done():
+				putBuf(task.buf)
+				return
+			}
+			copy(upBuf[:task.size], task.buf[:task.size])
+			putBuf(task.buf) // return read buffer now
+			task.buf = upBuf
 			err := u.uploadPreparedChunkUnknownWithRetry(ctx, src, task, false, urls)
-			putBuf(task.buf)
+			select {
+			case uploadPool <- upBuf:
+			default:
+			}
 			if err != nil {
 				select {
 				case errCh <- err:
@@ -1470,7 +1569,9 @@ func (u *uploader) uploadChunkWithRetry(ctx context.Context, src *sourceFile, ch
 	var lastErr error
 
 	for attempt := 0; attempt <= u.opts.retries; attempt++ {
-		body, status, err := u.uploadChunkOnce(ctx, src, chunkIndex, finalChunk)
+		body, status, err := u.doChunkAttempt(ctx, chunkIndex, finalChunk, func(reqCtx context.Context) (string, int, error) {
+			return u.uploadChunkOnce(reqCtx, src, chunkIndex, finalChunk)
+		})
 		if err == nil {
 			urls.set(body)
 			success = true
@@ -1524,6 +1625,89 @@ func (u *uploader) uploadEmptyWithRetry(ctx context.Context, src *sourceFile, ur
 		}
 	}
 	return fmt.Errorf("empty upload failed: %w", lastErr)
+}
+
+func (u *uploader) doChunkAttempt(
+	ctx context.Context,
+	chunkIndex int64,
+	finalChunk bool,
+	fn func(context.Context) (string, int, error),
+) (string, int, error) {
+	if fn == nil {
+		return "", 0, errors.New("missing chunk upload function")
+	}
+	hedgeDelay := u.opts.hedgeDelay
+	if finalChunk || hedgeDelay <= 0 {
+		start := time.Now()
+		body, status, err := fn(ctx)
+		u.debugChunkAttempt(status, err)
+		if u.opts.debug && (err != nil || time.Since(start) > 4*time.Second) {
+			fmt.Fprintf(os.Stderr, "chunk_attempt idx=%d final=%t status=%d dur=%s err=%v\n",
+				chunkIndex, finalChunk, status, roundDuration(time.Since(start)), err)
+		}
+		return body, status, err
+	}
+
+	primaryCtx, cancelPrimary := context.WithCancel(ctx)
+	defer cancelPrimary()
+
+	results := make(chan chunkAttemptResult, 2)
+	go func() {
+		body, status, err := fn(primaryCtx)
+		results <- chunkAttemptResult{body: body, status: status, err: err}
+	}()
+
+	timer := time.NewTimer(hedgeDelay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return "", 0, &requestError{cause: ctx.Err()}
+	case res := <-results:
+		u.debugChunkAttempt(res.status, res.err)
+		return res.body, res.status, res.err
+	case <-timer.C:
+	}
+
+	hedgeCtx, cancelHedge := context.WithCancel(ctx)
+	defer cancelHedge()
+	go func() {
+		body, status, err := fn(hedgeCtx)
+		results <- chunkAttemptResult{body: body, status: status, err: err}
+	}()
+	u.debugHedge()
+	u.logf("chunk hedge idx=%d delay=%s", chunkIndex, hedgeDelay)
+
+	wait := func() (chunkAttemptResult, bool) {
+		select {
+		case <-ctx.Done():
+			return chunkAttemptResult{}, false
+		case res := <-results:
+			return res, true
+		}
+	}
+
+	first, ok := wait()
+	if !ok {
+		return "", 0, &requestError{cause: ctx.Err()}
+	}
+	u.debugChunkAttempt(first.status, first.err)
+	if first.err == nil {
+		return first.body, first.status, nil
+	}
+
+	second, ok := wait()
+	if !ok {
+		return first.body, first.status, first.err
+	}
+	u.debugChunkAttempt(second.status, second.err)
+	if second.err == nil {
+		return second.body, second.status, nil
+	}
+	if second.status != 0 {
+		return second.body, second.status, second.err
+	}
+	return first.body, first.status, first.err
 }
 
 func (u *uploader) uploadChunkOnce(ctx context.Context, src *sourceFile, chunkIndex int64, finalChunk bool) (string, int, error) {
@@ -1788,19 +1972,19 @@ func buildTransport(insecure bool, parallel int) *http.Transport {
 	}
 	dialer := &net.Dialer{
 		Timeout:   5 * time.Second,
-		KeepAlive: 30 * time.Second,
+		KeepAlive: 15 * time.Second,
 	}
 	t := &http.Transport{
 		DialContext:           dialer.DialContext,
-		MaxIdleConns:          conns * 2,
-		MaxIdleConnsPerHost:   conns,
-		MaxConnsPerHost:       conns * 2,
-		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConns:          conns * 3,
+		MaxIdleConnsPerHost:   conns * 2,
+		MaxConnsPerHost:       conns * 3,
+		IdleConnTimeout:       15 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
 		DisableCompression:    true,
 		ForceAttemptHTTP2:     false,
-		ResponseHeaderTimeout: 60 * time.Second,
-		WriteBufferSize:       256 * 1024,
+		ResponseHeaderTimeout: 20 * time.Second,
+		WriteBufferSize:       1024 * 1024,
 		ReadBufferSize:        64 * 1024,
 	}
 	if insecure {
@@ -2146,6 +2330,21 @@ func sleepContext(ctx context.Context, d time.Duration) error {
 
 func isContextErr(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func isTimeoutLikeErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var reqErr *requestError
+	if errors.As(err, &reqErr) && reqErr != nil && reqErr.cause != nil {
+		err = reqErr.cause
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func isFinitePositive(v float64) bool {
