@@ -305,15 +305,6 @@ func (u *uploader) uploadPreparedChunkWithRetryMode(
 	return fmt.Errorf("chunk %d upload failed: %w", chunk.index, lastErr)
 }
 
-func (u *uploader) uploadPreparedChunkOnce(ctx context.Context, src *sourceFile, chunk preparedChunk, finalChunk bool) (string, int, error) {
-	if chunk.size <= 0 {
-		return "", 0, errors.New("invalid prepared chunk size")
-	}
-	endExclusive := chunk.start + int64(chunk.size)
-	contentRange := fmt.Sprintf("bytes %d-%d/*", chunk.start, endExclusive-1)
-	return u.uploadPreparedChunkOnceWithContentRange(ctx, src, chunk, finalChunk, contentRange, true)
-}
-
 func (u *uploader) uploadPreparedChunkUnknownOnce(ctx context.Context, src *sourceFile, chunk preparedChunk, finalChunk bool) (string, int, error) {
 	if chunk.size <= 0 {
 		return "", 0, errors.New("invalid prepared chunk size")
