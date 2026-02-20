@@ -26,8 +26,11 @@ import (
 
 const (
 	defaultServerURL            = "https://idoud.cc"
-	defaultChunkSize            = int64(10*1024*1024 - 71)
+	defaultParallelChunkSize    = int64(3 * 1024 * 1024)
+	defaultChunkSize            = defaultParallelChunkSize
 	defaultParallel             = 80
+	defaultStdinChunkSize       = defaultParallelChunkSize
+	defaultStdinParallel        = 256
 	defaultRetries              = 6
 	defaultHedgeDelay           = 0 * time.Second
 	defaultChunkTimeout         = 20 * time.Second
@@ -139,6 +142,13 @@ func (e *requestError) Error() string {
 		return fmt.Sprintf("http status %d: %s", e.status, e.body)
 	}
 	return "request failed"
+}
+
+func (e *requestError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
 }
 
 type uploader struct {
@@ -408,6 +418,8 @@ func main() {
 
 func parseFlags(args []string) (options, string, error) {
 	opts := options{}
+	chunkSizeExplicit := flagProvided(args, "--chunk-size")
+	parallelExplicit := flagProvided(args, "--parallel")
 
 	fs := flag.NewFlagSet("idoud", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -453,9 +465,6 @@ func parseFlags(args []string) (options, string, error) {
 		return options{}, "", errors.New("--chunk-size must be > 0")
 	}
 	opts.chunkSize = chunkSize
-	if opts.chunkSize > int64(int(^uint(0)>>1)) {
-		return options{}, "", errors.New("--chunk-size is too large for this platform")
-	}
 
 	if strings.TrimSpace(stdinSizeRaw) != "" {
 		stdinSize, parseErr := parseByteSize(stdinSizeRaw)
@@ -465,8 +474,25 @@ func parseFlags(args []string) (options, string, error) {
 		opts.stdinSize = stdinSize
 	}
 
+	if opts.stdin {
+		// For streaming stdin uploads, smaller requests and deeper concurrency
+		// typically avoid long-tail per-request stalls and timeout retries.
+		if !chunkSizeExplicit {
+			opts.chunkSize = defaultStdinChunkSize
+		}
+		if !parallelExplicit {
+			opts.parallel = defaultStdinParallel
+		}
+	}
+
+	if opts.chunkSize > int64(int(^uint(0)>>1)) {
+		return options{}, "", errors.New("--chunk-size is too large for this platform")
+	}
 	if opts.parallel < 1 {
 		return options{}, "", errors.New("--parallel must be >= 1")
+	}
+	if opts.parallel > 1 && opts.chunkSize != defaultParallelChunkSize {
+		return options{}, "", fmt.Errorf("--chunk-size must be exactly %d bytes (3MiB) when --parallel > 1", defaultParallelChunkSize)
 	}
 	if opts.retries < 0 {
 		return options{}, "", errors.New("--retries must be >= 0")
@@ -541,14 +567,25 @@ Examples:
 Core flags:
   --server        idoud server origin (default: https://idoud.cc)
   --stdin         read file data from stdin
+                 stdin mode auto-defaults: --chunk-size 3MiB, --parallel 256
   --stdin-size    known stdin size hint for stdin uploads
   --name          override upload file name
-  --chunk-size    chunk size for range uploads (default: 10485689 bytes)
+  --chunk-size    chunk size for range uploads (default: 3145728 bytes)
+                 parallel uploads require exactly 3MiB chunks
   --parallel      parallel non-final chunk uploads (default: 80)
   --retries       retries per chunk (default: 6)
   --hedge-delay   delay before speculative duplicate upload for slow non-final chunks (default: 0s, disabled)
   --debug         print live chunk concurrency and throughput stats to stderr
 `)
+}
+
+func flagProvided(args []string, name string) bool {
+	for _, arg := range args {
+		if arg == name || strings.HasPrefix(arg, name+"=") {
+			return true
+		}
+	}
+	return false
 }
 
 func openSource(filePath string, opts options) (*sourceFile, func(), error) {
@@ -1040,7 +1077,7 @@ readLoop:
 }
 
 func (u *uploader) uploadPreparedChunkWithRetry(ctx context.Context, src *sourceFile, chunk preparedChunk, finalChunk bool, urls *urlCapture) error {
-	return u.uploadPreparedChunkWithRetryMode(ctx, src, chunk, finalChunk, urls, "stream", u.uploadPreparedChunkOnce)
+	return u.uploadPreparedChunkWithRetryMode(ctx, src, chunk, finalChunk, urls, "stream", u.uploadPreparedChunkUnknownOnce)
 }
 
 func (u *uploader) uploadPreparedChunkUnknownWithRetry(ctx context.Context, src *sourceFile, chunk preparedChunk, finalChunk bool, urls *urlCapture) error {
@@ -1114,12 +1151,12 @@ func (u *uploader) uploadPreparedChunkWithRetryMode(
 }
 
 func (u *uploader) uploadPreparedChunkOnce(ctx context.Context, src *sourceFile, chunk preparedChunk, finalChunk bool) (string, int, error) {
-	endExclusive := chunk.start + int64(chunk.size)
-	if chunk.size <= 0 || endExclusive > src.size {
-		return "", 0, errors.New("invalid prepared chunk bounds")
+	if chunk.size <= 0 {
+		return "", 0, errors.New("invalid prepared chunk size")
 	}
-	contentRange := fmt.Sprintf("bytes %d-%d/%d", chunk.start, endExclusive-1, src.size)
-	return u.uploadPreparedChunkOnceWithContentRange(ctx, src, chunk, finalChunk, contentRange, false)
+	endExclusive := chunk.start + int64(chunk.size)
+	contentRange := fmt.Sprintf("bytes %d-%d/*", chunk.start, endExclusive-1)
+	return u.uploadPreparedChunkOnceWithContentRange(ctx, src, chunk, finalChunk, contentRange, true)
 }
 
 func (u *uploader) uploadPreparedChunkUnknownOnce(ctx context.Context, src *sourceFile, chunk preparedChunk, finalChunk bool) (string, int, error) {
@@ -1671,7 +1708,10 @@ func (u *uploader) uploadChunkOnce(ctx context.Context, src *sourceFile, chunkIn
 	req.ContentLength = length
 	req.Header.Set(headerContentType, contentTypeOctetStream)
 	req.Header.Set(headerUploadKey, u.opts.uploadKey)
-	req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, endExclusive-1, src.size))
+	req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/*", start, endExclusive-1))
+	if finalChunk {
+		req.Header.Set(headerUploadFinalChunk, "1")
+	}
 	if u.opts.password != "" {
 		req.Header.Set(headerUploadPassword, u.opts.password)
 	}
