@@ -4,6 +4,14 @@ Standalone Go CLI uploader for idoud.
 
 This project is intentionally isolated under `cli/` so it can be moved into a separate public repository.
 
+## Project layout
+
+- `main.go`: CLI entrypoint.
+- `types.go`: shared constants/types and HTTP error wrappers.
+- `flags.go`: argument parsing and validation.
+- `source.go`: file/stdin source opening logic.
+- `upload.go`: upload engine, retries, finalization checks, transport tuning, and helpers.
+
 ## Features
 
 - Upload a single file:
@@ -47,12 +55,12 @@ idoud --password "secret" --download-limit 3 archive.zip
 - `--stdin` read payload from stdin instead of a path argument
 - `--stdin-size` known stdin size hint for stdin uploads
 - `--name` upload filename override (recommended with `--stdin`)
-- `--chunk-size` chunk size for `Content-Range` uploads (default `10485689` bytes)
+- `--chunk-size` chunk size for `Content-Range` uploads (default `3145728` bytes)
 - `--parallel` parallel non-final chunk uploads (default `80`)
 - `--retries` retries per chunk (default `6`)
 - `--hedge-delay` speculative duplicate delay for slow non-final chunks (default `0s`, disabled)
 - `--debug` print live chunk concurrency, retries, throughput, and 7-sample moving average speed to stderr
-- `--request-timeout` timeout for non-final chunk requests (default `95s`)
+- `--request-timeout` timeout for non-final chunk requests (default `20s`)
 - `--final-request-timeout` timeout for final chunk request (default `35s`)
 - `--finalize-timeout` max wait for server finalization (default `20m`)
 - `--password` sets `X-Upload-Password`
