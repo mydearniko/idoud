@@ -36,7 +36,10 @@ func buildTransport(insecure bool, parallel int) *http.Transport {
 		IdleConnTimeout:     15 * time.Second,
 		TLSHandshakeTimeout: 5 * time.Second,
 		DisableCompression:  true,
-		ForceAttemptHTTP2:   false,
+		// AGENTS.md requires each parallel upload to use a separate TCP
+		// connection. Disable keep-alives so requests never reuse sockets.
+		DisableKeepAlives: true,
+		ForceAttemptHTTP2: false,
 		// Request-scoped context deadlines (--request-timeout / --final-request-timeout)
 		// own timeout enforcement. Keep this disabled to avoid premature ~20s
 		// aborts on slower links.

@@ -40,6 +40,9 @@ func TestBuildTransportResponseHeaderTimeoutDisabled(t *testing.T) {
 	if tr.ResponseHeaderTimeout != 0 {
 		t.Fatalf("ResponseHeaderTimeout = %s, want 0", tr.ResponseHeaderTimeout)
 	}
+	if !tr.DisableKeepAlives {
+		t.Fatal("DisableKeepAlives = false, want true")
+	}
 }
 
 func TestParseFlagsStdinAutoTuneDefaults(t *testing.T) {
