@@ -21,24 +21,26 @@ import (
 
 func buildTransport(insecure bool, parallel int) *http.Transport {
 	conns := parallel
-	if conns < 16 {
-		conns = 16
+	if conns < 8 {
+		conns = 8
 	}
 	dialer := &net.Dialer{
 		Timeout:   5 * time.Second,
-		KeepAlive: 15 * time.Second,
+		KeepAlive: 30 * time.Second,
 	}
 	t := &http.Transport{
 		DialContext:         dialer.DialContext,
-		MaxIdleConns:        conns * 3,
-		MaxIdleConnsPerHost: conns * 2,
-		MaxConnsPerHost:     conns * 3,
-		IdleConnTimeout:     15 * time.Second,
-		TLSHandshakeTimeout: 5 * time.Second,
+		MaxIdleConns:        conns * 2,
+		MaxIdleConnsPerHost: conns,
+		// Keep exactly one socket budgeted per parallel slot so concurrent
+		// uploads still run on separate TCP connections.
+		MaxConnsPerHost:     conns,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 12 * time.Second,
 		DisableCompression:  true,
-		// AGENTS.md requires each parallel upload to use a separate TCP
-		// connection. Disable keep-alives so requests never reuse sockets.
-		DisableKeepAlives: true,
+		// Preserve dedicated per-slot TCP concurrency while avoiding repeated
+		// handshakes on every chunk upload.
+		DisableKeepAlives: false,
 		ForceAttemptHTTP2: false,
 		// Request-scoped context deadlines (--request-timeout / --final-request-timeout)
 		// own timeout enforcement. Keep this disabled to avoid premature ~20s
@@ -55,6 +57,81 @@ func buildTransport(insecure bool, parallel int) *http.Transport {
 
 const warmupTimeout = 3 * time.Second
 
+type uploadSubdomainPool struct {
+	mu         sync.Mutex
+	allowedMax int
+	nextProbe  int
+}
+
+func newUploadSubdomainPool(maxParallel int) *uploadSubdomainPool {
+	if maxParallel < 1 {
+		maxParallel = 1
+	}
+	return &uploadSubdomainPool{
+		allowedMax: maxParallel,
+		nextProbe:  1,
+	}
+}
+
+func (p *uploadSubdomainPool) acquire() int {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.allowedMax < 1 {
+		p.allowedMax = 1
+	}
+	if p.nextProbe < 1 || p.nextProbe > p.allowedMax {
+		p.nextProbe = 1
+	}
+	selected := p.nextProbe
+	if selected >= p.allowedMax {
+		p.nextProbe = 1
+	} else {
+		p.nextProbe = selected + 1
+	}
+	return selected
+}
+
+func shouldUseBrowserSubdomains(base *url.URL, disabled bool) bool {
+	if disabled || base == nil {
+		return false
+	}
+	host := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(base.Hostname())), ".")
+	if host == "" {
+		return false
+	}
+	if host == browserUploadDomain {
+		return true
+	}
+	return strings.HasSuffix(host, "."+browserUploadDomain)
+}
+
+func buildSubdomainUploadURL(rawURL string, index int) string {
+	if index <= 0 {
+		return rawURL
+	}
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed == nil || parsed.Host == "" {
+		return rawURL
+	}
+	host := fmt.Sprintf("%d.%s", index, browserUploadDomain)
+	if port := parsed.Port(); port != "" {
+		parsed.Host = host + ":" + port
+	} else {
+		parsed.Host = host
+	}
+	return parsed.String()
+}
+
+func (u *uploader) routeUploadURL(rawURL string) string {
+	if u == nil || u.subdomains == nil {
+		return rawURL
+	}
+	return buildSubdomainUploadURL(rawURL, u.subdomains.acquire())
+}
+
 func (u *uploader) warmConnections(ctx context.Context, count int) {
 	if count <= 0 || u.opts.serverBase == nil {
 		return
@@ -70,7 +147,8 @@ func (u *uploader) warmConnections(ctx context.Context, count int) {
 			defer wg.Done()
 			reqCtx, cancel := context.WithTimeout(ctx, warmupTimeout)
 			defer cancel()
-			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, warmURL, nil)
+			reqURL := u.routeUploadURL(warmURL)
+			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, reqURL, nil)
 			if err != nil {
 				return
 			}
@@ -91,6 +169,16 @@ func buildUploadURL(base *url.URL, filename string) string {
 	u.Fragment = ""
 	path := strings.TrimSuffix(u.Path, "/")
 	u.Path = path + "/" + url.PathEscape(filename)
+	u.RawPath = ""
+	return u.String()
+}
+
+func buildSpeedtestUploadURL(base *url.URL, filename string) string {
+	u := *base
+	u.RawQuery = ""
+	u.Fragment = ""
+	path := strings.TrimSuffix(u.Path, "/")
+	u.Path = path + "/v1/speedtest/" + url.PathEscape(filename)
 	u.RawPath = ""
 	return u.String()
 }
@@ -318,7 +406,7 @@ func isRetryableStatus(status int, err error) bool {
 		}
 	}
 	switch status {
-	case 0, 408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524:
+	case 0, 408, 409, 425, 429, 500, 502, 503, 504, 520, 522, 524:
 		return true
 	default:
 		return false
@@ -335,20 +423,15 @@ func statusMayStillFinalize(status int) bool {
 }
 
 func finalizationUncertainStatus(status int) bool {
-	if status == 0 {
+	switch status {
+	case 0, 409, 429, 504:
 		return true
+	default:
+		return false
 	}
-	return statusMayStillFinalize(status)
 }
 
 func finalAttemptRecoverWait(configured time.Duration) time.Duration {
-	if configured <= 0 {
-		return 0
-	}
-	const perAttemptMax = 5 * time.Second
-	if configured > perAttemptMax {
-		return perAttemptMax
-	}
 	return configured
 }
 

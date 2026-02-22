@@ -25,10 +25,7 @@ func (u *uploader) uploadKnownSizeStreamChunked(ctx context.Context, src *source
 			return "", err
 		}
 		finalURL := urls.get()
-		if finalURL == "" {
-			return "", errors.New("server returned empty upload URL")
-		}
-		if err := u.waitForReady(ctx, finalURL, u.opts.finalizeTimeout); err != nil {
+		if err := u.finalizeIfNeeded(ctx, finalURL); err != nil {
 			return "", err
 		}
 		return finalURL, nil
@@ -221,10 +218,7 @@ readLoop:
 	}
 
 	finalURL := urls.get()
-	if finalURL == "" {
-		return "", errors.New("server returned empty upload URL")
-	}
-	if err := u.waitForReady(ctx, finalURL, u.opts.finalizeTimeout); err != nil {
+	if err := u.finalizeIfNeeded(ctx, finalURL); err != nil {
 		return "", err
 	}
 	u.logf("upload(stream) complete url=%s", finalURL)
@@ -277,10 +271,6 @@ func (u *uploader) uploadPreparedChunkWithRetryMode(
 				return waitErr
 			}
 		}
-		if status == 524 && !finalChunk {
-			break
-		}
-
 		if !isRetryableStatus(status, err) || attempt >= u.opts.retries {
 			break
 		}
@@ -330,7 +320,7 @@ func (u *uploader) uploadPreparedChunkOnceWithContentRange(
 	defer cancel()
 
 	reader := bytes.NewReader(chunk.buf[:chunk.size])
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPut, src.uploadURL, reader)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPut, u.routeUploadURL(src.uploadURL), reader)
 	if err != nil {
 		return "", 0, err
 	}
@@ -340,6 +330,9 @@ func (u *uploader) uploadPreparedChunkOnceWithContentRange(
 	req.Header.Set("Content-Range", contentRange)
 	if setFinalChunkHeader && finalChunk {
 		req.Header.Set(headerUploadFinalChunk, "1")
+	}
+	if u.opts.speedtest {
+		req.Header.Set(headerUploadSpeedtest, "1")
 	}
 	if u.opts.password != "" {
 		req.Header.Set(headerUploadPassword, u.opts.password)
@@ -486,10 +479,7 @@ func (u *uploader) uploadUnknownSizeStreamChunked(ctx context.Context, src *sour
 				return "", emptyErr
 			}
 			finalURL := urls.get()
-			if finalURL == "" {
-				return "", errors.New("server returned empty upload URL")
-			}
-			if waitErr := u.waitForReady(ctx, finalURL, u.opts.finalizeTimeout); waitErr != nil {
+			if waitErr := u.finalizeIfNeeded(ctx, finalURL); waitErr != nil {
 				return "", waitErr
 			}
 			return finalURL, nil
@@ -597,10 +587,7 @@ readLoop:
 	}
 
 	finalURL = urls.get()
-	if finalURL == "" {
-		return "", errors.New("server returned empty upload URL")
-	}
-	if err := u.waitForReady(ctx, finalURL, u.opts.finalizeTimeout); err != nil {
+	if err := u.finalizeIfNeeded(ctx, finalURL); err != nil {
 		return "", err
 	}
 	u.logf("upload(stream-unknown) complete url=%s", finalURL)

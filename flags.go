@@ -11,8 +11,6 @@ import (
 
 func parseFlags(args []string) (options, string, error) {
 	opts := options{}
-	chunkSizeExplicit := flagProvided(args, "--chunk-size")
-	parallelExplicit := flagProvided(args, "--parallel")
 
 	fs := flag.NewFlagSet("idoud", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -37,6 +35,9 @@ func parseFlags(args []string) (options, string, error) {
 	fs.Int64Var(&opts.downloadLimit, "download-limit", 0, "download limit (sets X-Upload-Download-Limit)")
 	fs.StringVar(&opts.uploadKey, "upload-key", "", "explicit upload key (default: random)")
 	fs.BoolVar(&opts.insecureTLS, "insecure", false, "skip TLS certificate verification")
+	fs.BoolVar(&opts.noSubdomains, "no-subdomains", false, "disable numbered subdomain upload routing")
+	fs.BoolVar(&opts.noSubdomains, "nosub", false, "alias for --no-subdomains")
+	fs.BoolVar(&opts.speedtest, "speedtest", false, "use server-side sink mode to benchmark ingest without backend storage writes")
 	fs.BoolVar(&opts.verbose, "verbose", false, "print retry and finalization logs")
 	fs.BoolVar(&opts.debug, "debug", false, "enable verbose live upload debug stats")
 
@@ -67,25 +68,14 @@ func parseFlags(args []string) (options, string, error) {
 		opts.stdinSize = stdinSize
 	}
 
-	if opts.stdin {
-		// For streaming stdin uploads, smaller requests and deeper concurrency
-		// typically avoid long-tail per-request stalls and timeout retries.
-		if !chunkSizeExplicit {
-			opts.chunkSize = defaultStdinChunkSize
-		}
-		if !parallelExplicit {
-			opts.parallel = defaultStdinParallel
-		}
-	}
-
 	if opts.chunkSize > int64(int(^uint(0)>>1)) {
 		return options{}, "", errors.New("--chunk-size is too large for this platform")
 	}
+	if opts.chunkSize != defaultParallelChunkSize {
+		return options{}, "", fmt.Errorf("--chunk-size must be exactly %d bytes (3MiB)", defaultParallelChunkSize)
+	}
 	if opts.parallel < 1 {
 		return options{}, "", errors.New("--parallel must be >= 1")
-	}
-	if opts.parallel > 1 && opts.chunkSize != defaultParallelChunkSize {
-		return options{}, "", fmt.Errorf("--chunk-size must be exactly %d bytes (3MiB) when --parallel > 1", defaultParallelChunkSize)
 	}
 	if opts.retries < 0 {
 		return options{}, "", errors.New("--retries must be >= 0")
@@ -160,23 +150,14 @@ Examples:
 Core flags:
   --server        idoud server origin (default: https://idoud.cc)
   --stdin         read file data from stdin
-                 stdin mode auto-defaults: --chunk-size 3MiB, --parallel 256
   --stdin-size    known stdin size hint for stdin uploads
   --name          override upload file name
-  --chunk-size    chunk size for range uploads (default: 3145728 bytes)
-                 parallel uploads require exactly 3MiB chunks
-  --parallel      parallel non-final chunk uploads (default: 80)
+  --chunk-size    chunk size for range uploads (must be 3145728 bytes / 3MiB)
+  --parallel      parallel non-final chunk uploads (default: 12)
+  --no-subdomains disable numbered subdomain upload routing (alias: --nosub)
+  --speedtest     benchmark ingest path using server-side sink mode
   --retries       retries per chunk (default: 6)
   --hedge-delay   delay before speculative duplicate upload for slow non-final chunks (default: 0s, disabled)
   --debug         print live chunk concurrency and throughput stats to stderr
 `)
-}
-
-func flagProvided(args []string, name string) bool {
-	for _, arg := range args {
-		if arg == name || strings.HasPrefix(arg, name+"=") {
-			return true
-		}
-	}
-	return false
 }

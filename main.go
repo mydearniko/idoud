@@ -29,6 +29,9 @@ func main() {
 		opts:   opts,
 		client: client,
 	}
+	if shouldUseBrowserSubdomains(opts.serverBase, opts.noSubdomains) {
+		u.subdomains = newUploadSubdomainPool(opts.parallel)
+	}
 
 	finalURL, err := u.upload(context.Background(), src)
 	if err != nil {

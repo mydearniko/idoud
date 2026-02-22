@@ -12,22 +12,38 @@ import (
 )
 
 const (
+	// Keep these values aligned with web/js/upload.js chunked upload policy.
+	browserChunkSize                = int64(3 * 1024 * 1024)
+	browserDefaultChunkParallel     = 12
+	browserChunkRetryLimit          = 6
+	browserChunkRetryBaseDelay      = 120 * time.Millisecond
+	browserChunkRetryMaxDelay       = 1200 * time.Millisecond
+	browserChunkRequestTimeout      = 45 * time.Second
+	browserFinalChunkRequestTimeout = 95 * time.Second
+	browserFinalizeRecoveryTimeout  = 95 * time.Second
+	browserFinalizePollInterval     = 1200 * time.Millisecond
+	browserFinalizeMetadataWait     = 30 * time.Second
+	browserFinalizeTimeout          = 20 * time.Minute
+	browserUploadDomain             = "idoud.cc"
+)
+
+const (
 	defaultServerURL            = "https://idoud.cc"
-	defaultParallelChunkSize    = int64(3 * 1024 * 1024)
+	defaultParallelChunkSize    = browserChunkSize
 	defaultChunkSize            = defaultParallelChunkSize
-	defaultParallel             = 80
+	defaultParallel             = browserDefaultChunkParallel
 	defaultStdinChunkSize       = defaultParallelChunkSize
-	defaultStdinParallel        = 256
-	defaultRetries              = 6
+	defaultStdinParallel        = browserDefaultChunkParallel
+	defaultRetries              = browserChunkRetryLimit
 	defaultHedgeDelay           = 0 * time.Second
-	defaultChunkTimeout         = 20 * time.Second
-	defaultFinalChunkTimeout    = 35 * time.Second
-	defaultFinalizeRecover      = 5 * time.Second
-	defaultFinalizeTimeout      = 20 * time.Minute
-	defaultFinalizePollInterval = 100 * time.Millisecond
-	defaultMetadataWaitMax      = 700 * time.Millisecond
-	defaultBackoffBase          = 50 * time.Millisecond
-	defaultBackoffMax           = 400 * time.Millisecond
+	defaultChunkTimeout         = browserChunkRequestTimeout
+	defaultFinalChunkTimeout    = browserFinalChunkRequestTimeout
+	defaultFinalizeRecover      = browserFinalizeRecoveryTimeout
+	defaultFinalizeTimeout      = browserFinalizeTimeout
+	defaultFinalizePollInterval = browserFinalizePollInterval
+	defaultMetadataWaitMax      = browserFinalizeMetadataWait
+	defaultBackoffBase          = browserChunkRetryBaseDelay
+	defaultBackoffMax           = browserChunkRetryMaxDelay
 	maxResponseBodyBytes        = 1 << 20
 )
 
@@ -36,6 +52,7 @@ const (
 	headerUploadFinalChunk     = "X-Upload-Final"
 	headerUploadPassword       = "X-Upload-Password"
 	headerUploadDownloadLimit  = "X-Upload-Download-Limit"
+	headerUploadSpeedtest      = "X-Upload-Speedtest"
 	headerDownloadPassword     = "X-Download-Password"
 	headerContentType          = "Content-Type"
 	headerCacheControl         = "Cache-Control"
@@ -64,6 +81,8 @@ type options struct {
 	downloadLimit        int64
 	uploadKey            string
 	insecureTLS          bool
+	noSubdomains         bool
+	speedtest            bool
 	verbose              bool
 	debug                bool
 }
@@ -139,9 +158,10 @@ func (e *requestError) Unwrap() error {
 }
 
 type uploader struct {
-	opts   options
-	client *http.Client
-	dbg    *uploadDebugStats
+	opts       options
+	client     *http.Client
+	dbg        *uploadDebugStats
+	subdomains *uploadSubdomainPool
 }
 
 type fileMetadataPayload struct {

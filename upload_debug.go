@@ -265,10 +265,7 @@ func (u *uploader) upload(ctx context.Context, src *sourceFile) (string, error) 
 			return "", err
 		}
 		finalURL := urls.get()
-		if finalURL == "" {
-			return "", errors.New("server returned empty upload URL")
-		}
-		if err := u.waitForReady(ctx, finalURL, u.opts.finalizeTimeout); err != nil {
+		if err := u.finalizeIfNeeded(ctx, finalURL); err != nil {
 			return "", err
 		}
 		return finalURL, nil
@@ -291,11 +288,7 @@ func (u *uploader) upload(ctx context.Context, src *sourceFile) (string, error) 
 	}
 
 	finalURL := urls.get()
-	if finalURL == "" {
-		return "", errors.New("server returned empty upload URL")
-	}
-
-	if err := u.waitForReady(ctx, finalURL, u.opts.finalizeTimeout); err != nil {
+	if err := u.finalizeIfNeeded(ctx, finalURL); err != nil {
 		return "", err
 	}
 	u.logf("upload complete url=%s", finalURL)

@@ -25,6 +25,9 @@ func openSource(filePath string, opts options) (*sourceFile, func(), error) {
 		name = sanitizeFilename(name)
 
 		uploadURL := buildUploadURL(opts.serverBase, name)
+		if opts.speedtest {
+			uploadURL = buildSpeedtestUploadURL(opts.serverBase, name)
+		}
 		src := &sourceFile{
 			stream:      os.Stdin,
 			size:        -1,
@@ -71,6 +74,9 @@ func openSource(filePath string, opts options) (*sourceFile, func(), error) {
 	}
 	name = sanitizeFilename(name)
 	uploadURL := buildUploadURL(opts.serverBase, name)
+	if opts.speedtest {
+		uploadURL = buildSpeedtestUploadURL(opts.serverBase, name)
+	}
 
 	src := &sourceFile{
 		readerAt:    file,

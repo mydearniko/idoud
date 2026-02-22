@@ -20,12 +20,24 @@ func (u *uploader) uploadNonFinalChunks(ctx context.Context, src *sourceFile, la
 		return nil
 	}
 
+	// Mirror browser warmup behavior: complete the first non-final chunk before
+	// ramping up to the configured parallelism.
+	startChunk := int64(0)
+	if err := u.uploadChunkWithRetry(ctx, src, 0, false, urls); err != nil {
+		return err
+	}
+	startChunk = 1
+	if startChunk >= lastChunk {
+		return nil
+	}
+
 	workers := u.opts.parallel
 	if workers < 1 {
 		workers = 1
 	}
-	if int64(workers) > lastChunk {
-		workers = int(lastChunk)
+	remaining := lastChunk - startChunk
+	if int64(workers) > remaining {
+		workers = int(remaining)
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -55,7 +67,7 @@ func (u *uploader) uploadNonFinalChunks(ctx context.Context, src *sourceFile, la
 	}
 
 sendLoop:
-	for idx := int64(0); idx < lastChunk; idx++ {
+	for idx := startChunk; idx < lastChunk; idx++ {
 		select {
 		case <-ctx.Done():
 			break sendLoop
@@ -90,6 +102,7 @@ func (u *uploader) uploadChunkWithRetry(ctx context.Context, src *sourceFile, ch
 	defer func() { u.debugChunkDone(chunkSize, finalChunk, success) }()
 
 	var lastErr error
+	lastStatus := 0
 
 	for attempt := 0; attempt <= u.opts.retries; attempt++ {
 		body, status, err := u.doChunkAttempt(ctx, chunkIndex, finalChunk, func(reqCtx context.Context) (string, int, error) {
@@ -101,15 +114,16 @@ func (u *uploader) uploadChunkWithRetry(ctx context.Context, src *sourceFile, ch
 			return nil
 		}
 		lastErr = err
+		lastStatus = status
 
-		if finalChunk && (status == 0 || status == 409 || status == 429 || status == 504) {
-			if ready, waitErr := u.waitForReadyAttempt(ctx, urls.get(), u.opts.finalizeRecover); waitErr == nil && ready {
+		if finalChunk {
+			recoverWait := finalAttemptRecoverWait(u.opts.finalizeRecover)
+			if ready, waitErr := u.tryRecoverFinalization(ctx, urls, status, recoverWait); waitErr == nil && ready {
 				success = true
 				return nil
+			} else if waitErr != nil && isContextErr(waitErr) {
+				return waitErr
 			}
-		}
-		if status == 524 {
-			break
 		}
 
 		if !isRetryableStatus(status, err) || attempt >= u.opts.retries {
@@ -121,6 +135,15 @@ func (u *uploader) uploadChunkWithRetry(ctx context.Context, src *sourceFile, ch
 		u.logf("chunk retry idx=%d final=%t attempt=%d/%d status=%d delay=%s err=%v", chunkIndex, finalChunk, attempt+1, u.opts.retries, status, delay, err)
 		if err := sleepContext(ctx, delay); err != nil {
 			return err
+		}
+	}
+
+	if finalChunk {
+		if ready, waitErr := u.tryRecoverFinalization(ctx, urls, lastStatus, u.opts.finalizeTimeout); waitErr == nil && ready {
+			success = true
+			return nil
+		} else if waitErr != nil && isContextErr(waitErr) {
+			return waitErr
 		}
 	}
 
@@ -255,7 +278,7 @@ func (u *uploader) uploadChunkOnce(ctx context.Context, src *sourceFile, chunkIn
 	defer cancel()
 
 	reader := io.NewSectionReader(src.readerAt, start, length)
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPut, src.uploadURL, reader)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPut, u.routeUploadURL(src.uploadURL), reader)
 	if err != nil {
 		return "", 0, err
 	}
@@ -265,6 +288,9 @@ func (u *uploader) uploadChunkOnce(ctx context.Context, src *sourceFile, chunkIn
 	req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/*", start, endExclusive-1))
 	if finalChunk {
 		req.Header.Set(headerUploadFinalChunk, "1")
+	}
+	if u.opts.speedtest {
+		req.Header.Set(headerUploadSpeedtest, "1")
 	}
 	if u.opts.password != "" {
 		req.Header.Set(headerUploadPassword, u.opts.password)
@@ -294,12 +320,15 @@ func (u *uploader) uploadEmptyOnce(ctx context.Context, src *sourceFile) (string
 	reqCtx, cancel := context.WithTimeout(ctx, u.opts.finalChunkTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPut, src.uploadURL, http.NoBody)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPut, u.routeUploadURL(src.uploadURL), http.NoBody)
 	if err != nil {
 		return "", 0, err
 	}
 	req.Header.Set(headerContentType, contentTypeOctetStream)
 	req.Header.Set(headerUploadKey, u.opts.uploadKey)
+	if u.opts.speedtest {
+		req.Header.Set(headerUploadSpeedtest, "1")
+	}
 	if u.opts.password != "" {
 		req.Header.Set(headerUploadPassword, u.opts.password)
 	}
@@ -322,6 +351,17 @@ func (u *uploader) uploadEmptyOnce(ctx context.Context, src *sourceFile) (string
 		status: resp.StatusCode,
 		body:   body,
 	}
+}
+
+func (u *uploader) finalizeIfNeeded(ctx context.Context, finalURL string) error {
+	finalURL = strings.TrimSpace(finalURL)
+	if finalURL == "" {
+		return errors.New("server returned empty upload URL")
+	}
+	if u != nil && u.opts.speedtest {
+		return nil
+	}
+	return u.waitForReady(ctx, finalURL, u.opts.finalizeTimeout)
 }
 
 func (u *uploader) waitForReady(ctx context.Context, publicURL string, timeout time.Duration) error {
