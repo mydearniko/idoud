@@ -431,10 +431,6 @@ func finalizationUncertainStatus(status int) bool {
 	}
 }
 
-func finalAttemptRecoverWait(configured time.Duration) time.Duration {
-	return configured
-}
-
 func (u *uploader) tryRecoverFinalization(ctx context.Context, urls *urlCapture, status int, wait time.Duration) (bool, error) {
 	if !finalizationUncertainStatus(status) || wait <= 0 || urls == nil {
 		return false, nil
