@@ -152,7 +152,7 @@ Core flags:
   --stdin-size    known stdin size hint for stdin uploads
   --name          override upload file name
   --chunk-size    chunk size for range uploads (must be 3145728 bytes / 3MiB)
-  --parallel      parallel non-final chunk uploads (default: 12)
+  --parallel      parallel non-final chunk uploads (default: 192)
   --no-subdomains disable numbered subdomain upload routing (alias: --nosub)
   --speedtest     benchmark ingest path using server-side sink mode
   --retries       retries per chunk (default: 6)

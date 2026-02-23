@@ -31,9 +31,11 @@ const (
 	defaultServerURL            = "https://idoud.cc"
 	defaultParallelChunkSize    = browserChunkSize
 	defaultChunkSize            = defaultParallelChunkSize
-	defaultParallel             = browserDefaultChunkParallel
+	// CLI uses much higher parallelism than browsers to compensate for
+	// per-chunk latency through Cloudflare and saturate high-bandwidth links.
+	defaultParallel             = 192
 	defaultStdinChunkSize       = defaultParallelChunkSize
-	defaultStdinParallel        = browserDefaultChunkParallel
+	defaultStdinParallel        = 192
 	defaultRetries              = browserChunkRetryLimit
 	defaultHedgeDelay           = 0 * time.Second
 	defaultChunkTimeout         = browserChunkRequestTimeout

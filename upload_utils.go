@@ -29,25 +29,41 @@ func buildTransport(insecure bool, parallel int) *http.Transport {
 		KeepAlive: 30 * time.Second,
 	}
 	t := &http.Transport{
-		DialContext:         dialer.DialContext,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := dialer.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			if tc, ok := conn.(*net.TCPConn); ok {
+				// Do NOT call SetWriteBuffer — explicit setsockopt disables
+				// TCP auto-tuning and is capped by wmem_max. Let the kernel
+				// auto-tune the send buffer (tcp_wmem max, typically 4-16 MiB).
+				_ = tc.SetNoDelay(true)
+			}
+			return conn, nil
+		},
 		MaxIdleConns:        conns * 2,
 		MaxIdleConnsPerHost: conns,
 		// Keep exactly one socket budgeted per parallel slot so concurrent
 		// uploads still run on separate TCP connections.
 		MaxConnsPerHost:     conns,
-		IdleConnTimeout:     90 * time.Second,
+		IdleConnTimeout:     120 * time.Second,
 		TLSHandshakeTimeout: 12 * time.Second,
 		DisableCompression:  true,
 		// Preserve dedicated per-slot TCP concurrency while avoiding repeated
 		// handshakes on every chunk upload.
 		DisableKeepAlives: false,
 		ForceAttemptHTTP2: false,
+		// Force HTTP/1.1 — each parallel upload MUST use a separate TCP
+		// connection with its own congestion window. HTTP/2 multiplexes all
+		// streams on one connection, capping throughput to one TCP pipe.
+		TLSNextProto: make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
 		// Request-scoped context deadlines (--request-timeout / --final-request-timeout)
 		// own timeout enforcement. Keep this disabled to avoid premature ~20s
 		// aborts on slower links.
 		ResponseHeaderTimeout: 0,
-		WriteBufferSize:       1024 * 1024,
-		ReadBufferSize:        64 * 1024,
+		WriteBufferSize:       4 << 20, // 4 MiB
+		ReadBufferSize:        64 << 10,
 	}
 	if insecure {
 		t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}

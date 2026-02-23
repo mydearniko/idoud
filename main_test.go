@@ -43,6 +43,14 @@ func TestBuildTransportResponseHeaderTimeoutDisabled(t *testing.T) {
 	if tr.DisableKeepAlives {
 		t.Fatal("DisableKeepAlives = true, want false")
 	}
+	// HTTP/2 must be disabled so each parallel upload uses a separate TCP
+	// connection with its own congestion window.
+	if tr.TLSNextProto == nil {
+		t.Fatal("TLSNextProto is nil, want non-nil empty map to disable HTTP/2")
+	}
+	if len(tr.TLSNextProto) != 0 {
+		t.Fatalf("TLSNextProto has %d entries, want 0", len(tr.TLSNextProto))
+	}
 }
 
 func TestParseFlagsStdinAutoTuneDefaults(t *testing.T) {

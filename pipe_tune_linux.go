@@ -7,7 +7,7 @@ import (
 	"syscall"
 )
 
-const targetStdinPipeSize = 8 * 1024 * 1024
+const targetStdinPipeSize = 64 * 1024 * 1024
 
 func tuneStdinPipeBuffer(file *os.File) (before int, after int, changed bool) {
 	if file == nil {
