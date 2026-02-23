@@ -190,10 +190,10 @@ func buildMetadataURLWithWait(base *url.URL, fileID string, wait time.Duration) 
 	path := strings.TrimSuffix(u.Path, "/")
 	u.Path = path + "/v1/files/" + url.PathEscape(fileID)
 	if wait > 0 {
-		waitMS := wait / time.Millisecond
-		if waitMS > 0 {
+		waitValue := wait / time.Millisecond
+		if waitValue > 0 {
 			q := u.Query()
-			q.Set("wait_ready_ms", strconv.FormatInt(int64(waitMS), 10))
+			q.Set("wait_ready_ms", strconv.FormatInt(int64(waitValue), 10))
 			u.RawQuery = q.Encode()
 		}
 	}
