@@ -101,7 +101,6 @@ func parseFlags(args []string) (options, string, error) {
 	if opts.downloadLimit < 0 {
 		return options{}, "", errors.New("--download-limit must be >= 0")
 	}
-
 	if opts.uploadKey == "" {
 		opts.uploadKey = randomUploadKey()
 	}

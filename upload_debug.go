@@ -44,6 +44,34 @@ type uploadDebugStats struct {
 	// serverWaitStartUnix is set (atomically) when the client starts polling
 	// the server for readiness. Zero means not waiting yet.
 	serverWaitStartUnix int64
+
+	poolWaitNanos    int64
+	poolWaitCount    int64
+	poolWaitMaxNanos int64
+
+	queueWaitNanos    int64
+	queueWaitCount    int64
+	queueWaitMaxNanos int64
+
+	readNanos    int64
+	readCount    int64
+	readMaxNanos int64
+
+	reqBuildNanos    int64
+	reqBuildCount    int64
+	reqBuildMaxNanos int64
+
+	httpNanos    int64
+	httpCount    int64
+	httpMaxNanos int64
+
+	respReadNanos    int64
+	respReadCount    int64
+	respReadMaxNanos int64
+
+	retrySleepNanos    int64
+	retrySleepCount    int64
+	retrySleepMaxNanos int64
 }
 
 func newUploadDebugStats(label, name string) *uploadDebugStats {
@@ -122,20 +150,26 @@ func (d *uploadDebugStats) startLoop() {
 		lastTick := time.Now()
 		lastRead := int64(0)
 		lastUploaded := int64(0)
+		lastAttempts := int64(0)
+		lastDone := int64(0)
 		readRateWindow := make([]float64, 0, 7)
 		uploadRateWindow := make([]float64, 0, 7)
 
 		for {
 			select {
 			case <-d.stopCh:
-				d.printLine("debug summary", time.Since(d.start), 0, 0, 0, avgFloat64(readRateWindow), avgFloat64(uploadRateWindow))
+				d.printLine("debug summary", time.Since(d.start), 0, 0, 0, 0, 0, avgFloat64(readRateWindow), avgFloat64(uploadRateWindow))
 				return
 			case now := <-ticker.C:
 				readNow := atomic.LoadInt64(&d.readBytes)
 				uploadedNow := atomic.LoadInt64(&d.uploadBytes)
+				attemptsNow := atomic.LoadInt64(&d.chunkAttempts)
+				doneNow := atomic.LoadInt64(&d.chunksDone)
 
 				deltaRead := readNow - lastRead
 				deltaUploaded := uploadedNow - lastUploaded
+				deltaAttempts := attemptsNow - lastAttempts
+				deltaDone := doneNow - lastDone
 				interval := now.Sub(lastTick)
 				if interval <= 0 {
 					interval = time.Second
@@ -151,6 +185,8 @@ func (d *uploadDebugStats) startLoop() {
 					now.Sub(d.start),
 					deltaRead,
 					deltaUploaded,
+					deltaAttempts,
+					deltaDone,
 					interval,
 					avgFloat64(readRateWindow),
 					avgFloat64(uploadRateWindow),
@@ -159,6 +195,8 @@ func (d *uploadDebugStats) startLoop() {
 				lastTick = now
 				lastRead = readNow
 				lastUploaded = uploadedNow
+				lastAttempts = attemptsNow
+				lastDone = doneNow
 			}
 		}
 	}()
@@ -171,7 +209,17 @@ func (d *uploadDebugStats) stop() {
 	})
 }
 
-func (d *uploadDebugStats) printLine(prefix string, elapsed time.Duration, deltaRead int64, deltaUploaded int64, interval time.Duration, avgReadRate float64, avgUploadedRate float64) {
+func (d *uploadDebugStats) printLine(
+	prefix string,
+	elapsed time.Duration,
+	deltaRead int64,
+	deltaUploaded int64,
+	deltaAttempts int64,
+	deltaDone int64,
+	interval time.Duration,
+	avgReadRate float64,
+	avgUploadedRate float64,
+) {
 	readTotal := atomic.LoadInt64(&d.readBytes)
 	uploadedTotal := atomic.LoadInt64(&d.uploadBytes)
 	inFlight := atomic.LoadInt64(&d.inFlight)
@@ -193,7 +241,31 @@ func (d *uploadDebugStats) printLine(prefix string, elapsed time.Duration, delta
 	uploadedRate := formatByteRate(deltaUploaded, interval)
 	readRateAvg7 := formatRateFromPerSecond(avgReadRate)
 	uploadedRateAvg7 := formatRateFromPerSecond(avgUploadedRate)
+	attemptRate := formatCountRate(deltaAttempts, interval)
+	doneRate := formatCountRate(deltaDone, interval)
 	stdinState, stdinIdle := d.stdinState(time.Now())
+
+	poolWaitNanos := atomic.LoadInt64(&d.poolWaitNanos)
+	poolWaitCount := atomic.LoadInt64(&d.poolWaitCount)
+	poolWaitMaxNanos := atomic.LoadInt64(&d.poolWaitMaxNanos)
+	queueWaitNanos := atomic.LoadInt64(&d.queueWaitNanos)
+	queueWaitCount := atomic.LoadInt64(&d.queueWaitCount)
+	queueWaitMaxNanos := atomic.LoadInt64(&d.queueWaitMaxNanos)
+	readNanos := atomic.LoadInt64(&d.readNanos)
+	readCount := atomic.LoadInt64(&d.readCount)
+	readMaxNanos := atomic.LoadInt64(&d.readMaxNanos)
+	reqBuildNanos := atomic.LoadInt64(&d.reqBuildNanos)
+	reqBuildCount := atomic.LoadInt64(&d.reqBuildCount)
+	reqBuildMaxNanos := atomic.LoadInt64(&d.reqBuildMaxNanos)
+	httpNanos := atomic.LoadInt64(&d.httpNanos)
+	httpCount := atomic.LoadInt64(&d.httpCount)
+	httpMaxNanos := atomic.LoadInt64(&d.httpMaxNanos)
+	respReadNanos := atomic.LoadInt64(&d.respReadNanos)
+	respReadCount := atomic.LoadInt64(&d.respReadCount)
+	respReadMaxNanos := atomic.LoadInt64(&d.respReadMaxNanos)
+	retrySleepNanos := atomic.LoadInt64(&d.retrySleepNanos)
+	retrySleepCount := atomic.LoadInt64(&d.retrySleepCount)
+	retrySleepMaxNanos := atomic.LoadInt64(&d.retrySleepMaxNanos)
 
 	serverWaitStr := ""
 	if swStart := atomic.LoadInt64(&d.serverWaitStartUnix); swStart > 0 {
@@ -202,7 +274,7 @@ func (d *uploadDebugStats) printLine(prefix string, elapsed time.Duration, delta
 
 	fmt.Fprintf(
 		os.Stderr,
-		"%s mode=%s name=%q t=%s inflight=%d max=%d started=%d done=%d failed=%d attempts=%d retries=%d hedges=%d timeouts=%d status_429=%d status_5xx=%d final_started=%d final_done=%d final_failed=%d read=%s uploaded=%s read_rate=%s upload_rate=%s read_rate_avg7=%s upload_rate_avg7=%s stdin_state=%s stdin_idle=%s%s\n",
+		"%s mode=%s name=%q t=%s inflight=%d max=%d started=%d done=%d failed=%d attempts=%d retries=%d hedges=%d timeouts=%d status_429=%d status_5xx=%d final_started=%d final_done=%d final_failed=%d read=%s uploaded=%s read_rate=%s upload_rate=%s read_rate_avg7=%s upload_rate_avg7=%s attempt_rate=%s done_rate=%s stage_pool_wait_avg=%s stage_pool_wait_max=%s stage_pool_wait_n=%d stage_queue_wait_avg=%s stage_queue_wait_max=%s stage_queue_wait_n=%d stage_read_avg=%s stage_read_max=%s stage_read_n=%d stage_req_build_avg=%s stage_req_build_max=%s stage_req_build_n=%d stage_http_avg=%s stage_http_max=%s stage_http_n=%d stage_resp_read_avg=%s stage_resp_read_max=%s stage_resp_read_n=%d stage_retry_sleep_avg=%s stage_retry_sleep_max=%s stage_retry_sleep_total=%s stage_retry_sleep_n=%d stdin_state=%s stdin_idle=%s%s\n",
 		prefix,
 		d.label,
 		d.name,
@@ -227,6 +299,30 @@ func (d *uploadDebugStats) printLine(prefix string, elapsed time.Duration, delta
 		uploadedRate,
 		readRateAvg7,
 		uploadedRateAvg7,
+		attemptRate,
+		doneRate,
+		roundStageDuration(avgDurationNanos(poolWaitNanos, poolWaitCount)),
+		roundStageDuration(time.Duration(poolWaitMaxNanos)),
+		poolWaitCount,
+		roundStageDuration(avgDurationNanos(queueWaitNanos, queueWaitCount)),
+		roundStageDuration(time.Duration(queueWaitMaxNanos)),
+		queueWaitCount,
+		roundStageDuration(avgDurationNanos(readNanos, readCount)),
+		roundStageDuration(time.Duration(readMaxNanos)),
+		readCount,
+		roundStageDuration(avgDurationNanos(reqBuildNanos, reqBuildCount)),
+		roundStageDuration(time.Duration(reqBuildMaxNanos)),
+		reqBuildCount,
+		roundStageDuration(avgDurationNanos(httpNanos, httpCount)),
+		roundStageDuration(time.Duration(httpMaxNanos)),
+		httpCount,
+		roundStageDuration(avgDurationNanos(respReadNanos, respReadCount)),
+		roundStageDuration(time.Duration(respReadMaxNanos)),
+		respReadCount,
+		roundStageDuration(avgDurationNanos(retrySleepNanos, retrySleepCount)),
+		roundStageDuration(time.Duration(retrySleepMaxNanos)),
+		roundDuration(time.Duration(retrySleepNanos)),
+		retrySleepCount,
 		stdinState,
 		stdinIdle,
 		serverWaitStr,
@@ -247,7 +343,9 @@ func (u *uploader) upload(ctx context.Context, src *sourceFile) (string, error) 
 	stopDebug := u.startDebug(src)
 	defer stopDebug()
 
-	u.warmConnections(ctx, u.opts.parallel)
+	if !isLoopbackServer(u.opts.serverBase) {
+		u.warmConnections(ctx, u.opts.parallel)
+	}
 
 	if !src.knownSize {
 		return u.uploadUnknownSizeStreamChunked(ctx, src)
@@ -404,6 +502,91 @@ func (u *uploader) debugChunkAttempt(status int, err error) {
 	}
 	if isTimeoutLikeErr(err) {
 		atomic.AddInt64(&dbg.timeouts, 1)
+	}
+}
+
+func avgDurationNanos(totalNanos, count int64) time.Duration {
+	if totalNanos <= 0 || count <= 0 {
+		return 0
+	}
+	return time.Duration(totalNanos / count)
+}
+
+func roundStageDuration(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	switch {
+	case d < time.Millisecond:
+		return d.Round(10 * time.Microsecond)
+	case d < time.Second:
+		return d.Round(100 * time.Microsecond)
+	default:
+		return roundDuration(d)
+	}
+}
+
+func formatCountRate(delta int64, interval time.Duration) string {
+	if delta <= 0 || interval <= 0 {
+		return "0/s"
+	}
+	return fmt.Sprintf("%.1f/s", float64(delta)/interval.Seconds())
+}
+
+func debugRecordDuration(total *int64, count *int64, max *int64, d time.Duration) {
+	if d <= 0 || total == nil || count == nil || max == nil {
+		return
+	}
+	nanos := d.Nanoseconds()
+	atomic.AddInt64(total, nanos)
+	atomic.AddInt64(count, 1)
+	for {
+		currentMax := atomic.LoadInt64(max)
+		if nanos <= currentMax || atomic.CompareAndSwapInt64(max, currentMax, nanos) {
+			return
+		}
+	}
+}
+
+func (u *uploader) debugPoolWait(d time.Duration) {
+	if dbg := u.dbg; dbg != nil {
+		debugRecordDuration(&dbg.poolWaitNanos, &dbg.poolWaitCount, &dbg.poolWaitMaxNanos, d)
+	}
+}
+
+func (u *uploader) debugQueueWait(d time.Duration) {
+	if dbg := u.dbg; dbg != nil {
+		debugRecordDuration(&dbg.queueWaitNanos, &dbg.queueWaitCount, &dbg.queueWaitMaxNanos, d)
+	}
+}
+
+func (u *uploader) debugReadWait(d time.Duration) {
+	if dbg := u.dbg; dbg != nil {
+		debugRecordDuration(&dbg.readNanos, &dbg.readCount, &dbg.readMaxNanos, d)
+	}
+}
+
+func (u *uploader) debugRequestBuild(d time.Duration) {
+	if dbg := u.dbg; dbg != nil {
+		debugRecordDuration(&dbg.reqBuildNanos, &dbg.reqBuildCount, &dbg.reqBuildMaxNanos, d)
+	}
+}
+
+func (u *uploader) debugHTTPRoundTrip(d time.Duration) {
+	if dbg := u.dbg; dbg != nil {
+		debugRecordDuration(&dbg.httpNanos, &dbg.httpCount, &dbg.httpMaxNanos, d)
+	}
+}
+
+func (u *uploader) debugResponseRead(d time.Duration) {
+	if dbg := u.dbg; dbg != nil {
+		debugRecordDuration(&dbg.respReadNanos, &dbg.respReadCount, &dbg.respReadMaxNanos, d)
+	}
+}
+
+func (u *uploader) debugRetrySleep(d time.Duration) {
+	if dbg := u.dbg; dbg != nil {
+		debugRecordDuration(&dbg.retrySleepNanos, &dbg.retrySleepCount, &dbg.retrySleepMaxNanos, d)
 	}
 }
 

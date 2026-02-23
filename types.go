@@ -21,7 +21,7 @@ const (
 	browserChunkRequestTimeout      = 45 * time.Second
 	browserFinalChunkRequestTimeout = 95 * time.Second
 	browserFinalizeRecoveryTimeout  = 95 * time.Second
-	browserFinalizePollInterval     = 1200 * time.Millisecond
+	browserFinalizePollInterval     = 200 * time.Millisecond
 	browserFinalizeMetadataWait     = 30 * time.Second
 	browserFinalizeTimeout          = 20 * time.Minute
 	browserUploadDomain             = "idoud.cc"
@@ -88,15 +88,16 @@ type options struct {
 }
 
 type sourceFile struct {
-	readerAt    io.ReaderAt
-	stream      io.Reader
-	closer      io.Closer
-	size        int64
-	knownSize   bool
-	uploadName  string
-	uploadURL   string
-	displayName string
-	fromStdin   bool
+	readerAt        io.ReaderAt
+	stream          io.Reader
+	closer          io.Closer
+	size            int64
+	knownSize       bool
+	uploadName      string
+	uploadURL       string
+	uploadURLParsed *url.URL
+	displayName     string
+	fromStdin       bool
 }
 
 type urlCapture struct {

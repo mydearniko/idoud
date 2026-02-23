@@ -258,8 +258,11 @@ func (u *uploader) retryChunkUpload(
 		delay := retryBackoff(attempt + 1)
 		u.debugRetry()
 		u.logf("chunk(%s) retry idx=%d final=%t attempt=%d/%d status=%d delay=%s err=%v", mode, chunkIndex, finalChunk, attempt+1, u.opts.retries, status, delay, err)
-		if err := sleepContext(ctx, delay); err != nil {
-			return err
+		sleepStarted := time.Now()
+		sleepErr := sleepContext(ctx, delay)
+		u.debugRetrySleep(time.Since(sleepStarted))
+		if sleepErr != nil {
+			return sleepErr
 		}
 	}
 
@@ -287,8 +290,10 @@ func (u *uploader) uploadPUT(
 	if src == nil {
 		return "", 0, errors.New("missing upload source")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u.routeUploadURL(src.uploadURL), body)
+	buildStarted := time.Now()
+	req, err := u.newUploadPUTRequest(ctx, src, body)
 	if err != nil {
+		u.debugRequestBuild(time.Since(buildStarted))
 		return "", 0, err
 	}
 	req.ContentLength = contentLength
@@ -309,22 +314,57 @@ func (u *uploader) uploadPUT(
 	if u.opts.downloadLimit > 0 {
 		req.Header.Set(headerUploadDownloadLimit, strconv.FormatInt(u.opts.downloadLimit, 10))
 	}
+	u.debugRequestBuild(time.Since(buildStarted))
 
+	httpStarted := time.Now()
 	resp, err := u.client.Do(req)
+	u.debugHTTPRoundTrip(time.Since(httpStarted))
 	if err != nil {
 		return "", 0, &requestError{cause: err}
 	}
 	defer resp.Body.Close()
-
-	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
-	respBody := strings.TrimSpace(string(bodyBytes))
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return respBody, resp.StatusCode, nil
+		// Most non-final chunk responses are empty; skip body allocation on that
+		// hot path while preserving connection reuse.
+		if resp.ContentLength == 0 {
+			return "", resp.StatusCode, nil
+		}
+		respReadStarted := time.Now()
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
+		u.debugResponseRead(time.Since(respReadStarted))
+		if len(bodyBytes) == 0 {
+			return "", resp.StatusCode, nil
+		}
+		return strings.TrimSpace(string(bodyBytes)), resp.StatusCode, nil
 	}
+
+	respReadStarted := time.Now()
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
+	u.debugResponseRead(time.Since(respReadStarted))
+	respBody := strings.TrimSpace(string(bodyBytes))
 	return "", resp.StatusCode, &requestError{
 		status: resp.StatusCode,
 		body:   respBody,
 	}
+}
+
+func (u *uploader) newUploadPUTRequest(ctx context.Context, src *sourceFile, body io.Reader) (*http.Request, error) {
+	if src == nil {
+		return nil, errors.New("missing upload source")
+	}
+	if body == nil {
+		body = http.NoBody
+	}
+	if u != nil && u.subdomains == nil && src.uploadURLParsed != nil {
+		req := &http.Request{
+			Method: http.MethodPut,
+			URL:    cloneURL(src.uploadURLParsed),
+			Header: make(http.Header, 8),
+			Body:   io.NopCloser(body),
+		}
+		return req.WithContext(ctx), nil
+	}
+	return http.NewRequestWithContext(ctx, http.MethodPut, u.routeUploadURL(src.uploadURL), body)
 }
 
 func (u *uploader) uploadChunkOnce(ctx context.Context, src *sourceFile, chunkIndex int64, finalChunk bool) (string, int, error) {
@@ -349,7 +389,7 @@ func (u *uploader) uploadChunkOnce(ctx context.Context, src *sourceFile, chunkIn
 	defer cancel()
 
 	reader := io.NewSectionReader(src.readerAt, start, length)
-	contentRange := fmt.Sprintf("bytes %d-%d/*", start, endExclusive-1)
+	contentRange := buildContentRange(start, endExclusive)
 	return u.uploadPUT(reqCtx, src, reader, length, contentRange, finalChunk, true)
 }
 
@@ -358,6 +398,20 @@ func (u *uploader) uploadEmptyOnce(ctx context.Context, src *sourceFile) (string
 	defer cancel()
 
 	return u.uploadPUT(reqCtx, src, http.NoBody, 0, "", false, false)
+}
+
+func buildContentRange(start, endExclusive int64) string {
+	if endExclusive <= start {
+		endExclusive = start + 1
+	}
+	// "bytes " + start + "-" + (endExclusive-1) + "/*"
+	buf := make([]byte, 0, 48)
+	buf = append(buf, "bytes "...)
+	buf = strconv.AppendInt(buf, start, 10)
+	buf = append(buf, '-')
+	buf = strconv.AppendInt(buf, endExclusive-1, 10)
+	buf = append(buf, '/', '*')
+	return string(buf)
 }
 
 func (u *uploader) finalizeIfNeeded(ctx context.Context, finalURL string) error {

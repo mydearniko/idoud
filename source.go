@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,9 @@ func openSource(filePath string, opts options) (*sourceFile, func(), error) {
 		if stat.Mode()&os.ModeCharDevice != 0 {
 			return nil, nil, errors.New("stdin is a TTY; pipe data or pass a file path")
 		}
+		if before, after, changed := tuneStdinPipeBuffer(os.Stdin); changed && opts.debug {
+			fmt.Fprintf(os.Stderr, "debug stdin_pipe_size before=%d after=%d\n", before, after)
+		}
 
 		name := opts.nameOverride
 		if strings.TrimSpace(name) == "" {
@@ -28,14 +32,19 @@ func openSource(filePath string, opts options) (*sourceFile, func(), error) {
 		if opts.speedtest {
 			uploadURL = buildSpeedtestUploadURL(opts.serverBase, name)
 		}
+		parsedUploadURL, parseErr := url.Parse(uploadURL)
+		if parseErr != nil {
+			return nil, nil, fmt.Errorf("invalid upload URL: %w", parseErr)
+		}
 		src := &sourceFile{
-			stream:      os.Stdin,
-			size:        -1,
-			knownSize:   false,
-			uploadName:  name,
-			uploadURL:   uploadURL,
-			displayName: "stdin",
-			fromStdin:   true,
+			stream:          os.Stdin,
+			size:            -1,
+			knownSize:       false,
+			uploadName:      name,
+			uploadURL:       uploadURL,
+			uploadURLParsed: parsedUploadURL,
+			displayName:     "stdin",
+			fromStdin:       true,
 		}
 
 		if opts.stdinSize > 0 {
@@ -77,15 +86,21 @@ func openSource(filePath string, opts options) (*sourceFile, func(), error) {
 	if opts.speedtest {
 		uploadURL = buildSpeedtestUploadURL(opts.serverBase, name)
 	}
+	parsedUploadURL, parseErr := url.Parse(uploadURL)
+	if parseErr != nil {
+		_ = file.Close()
+		return nil, nil, fmt.Errorf("invalid upload URL: %w", parseErr)
+	}
 
 	src := &sourceFile{
-		readerAt:    file,
-		closer:      file,
-		size:        stat.Size(),
-		knownSize:   true,
-		uploadName:  name,
-		uploadURL:   uploadURL,
-		displayName: filePath,
+		readerAt:        file,
+		closer:          file,
+		size:            stat.Size(),
+		knownSize:       true,
+		uploadName:      name,
+		uploadURL:       uploadURL,
+		uploadURLParsed: parsedUploadURL,
+		displayName:     filePath,
 	}
 	cleanup := func() {
 		if src.closer != nil {

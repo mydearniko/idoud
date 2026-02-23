@@ -173,6 +173,14 @@ func buildUploadURL(base *url.URL, filename string) string {
 	return u.String()
 }
 
+func cloneURL(in *url.URL) *url.URL {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
+}
+
 func buildSpeedtestUploadURL(base *url.URL, filename string) string {
 	u := *base
 	u.RawQuery = ""
@@ -217,6 +225,21 @@ func normalizeServerURL(raw string) (*url.URL, error) {
 		return nil, errors.New("scheme and host are required")
 	}
 	return parsed, nil
+}
+
+func isLoopbackServer(base *url.URL) bool {
+	if base == nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(base.Hostname()))
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func sanitizeFilename(name string) string {
