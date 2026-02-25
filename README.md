@@ -4,7 +4,7 @@ Standalone Go CLI accelerated uploader for idoud.
 
 ## Install / Update
 
-### Linux / macOS / FreeBSD / OpenBSD
+### Linux / macOS
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mydearniko/idoud/main/install.sh | sh
@@ -14,6 +14,14 @@ curl -fsSL https://raw.githubusercontent.com/mydearniko/idoud/main/install.sh | 
 
 ```powershell
 irm https://raw.githubusercontent.com/mydearniko/idoud/main/install.ps1 | iex
+```
+
+### Other systems
+
+Build from source:
+
+```bash
+go build -o idoud .
 ```
 
 ## Features
@@ -35,6 +43,21 @@ irm https://raw.githubusercontent.com/mydearniko/idoud/main/install.ps1 | iex
 cd cli
 go build -o idoud .
 ```
+
+## Automated Releases
+
+Push a semver tag (`v*`) to publish binaries automatically through GitHub Actions + GoReleaser:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+Current release matrix (optimized for speed / 99.9% coverage):
+
+- Linux: `amd64`, `arm64`, `arm`
+- macOS: `amd64`, `arm64`
+- Windows: `amd64`, `arm64`
 
 ## Usage
 

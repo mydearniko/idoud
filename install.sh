@@ -18,8 +18,6 @@ detect_os() {
   case "$(uname -s)" in
     Linux) echo "linux" ;;
     Darwin) echo "darwin" ;;
-    FreeBSD) echo "freebsd" ;;
-    OpenBSD) echo "openbsd" ;;
     *) fail "unsupported OS: $(uname -s)" ;;
   esac
 }
