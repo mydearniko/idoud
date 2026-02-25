@@ -151,13 +151,24 @@ func (d *uploadDebugStats) startLoop() {
 		lastUploaded := int64(0)
 		lastAttempts := int64(0)
 		lastDone := int64(0)
-		readRateWindow := make([]float64, 0, 7)
-		uploadRateWindow := make([]float64, 0, 7)
+		const rateAvgWindow = 7
+		readRateWindow := make([]float64, 0, rateAvgWindow)
+		uploadRateWindow := make([]float64, 0, rateAvgWindow)
 
 		for {
 			select {
 			case <-d.stopCh:
-				d.printLine("debug summary", time.Since(d.start), 0, 0, 0, 0, 0, avgFloat64(readRateWindow), avgFloat64(uploadRateWindow))
+				d.printLine(
+					"debug summary",
+					time.Since(d.start),
+					0,
+					0,
+					0,
+					0,
+					0,
+					avgRateWindow(readRateWindow, rateAvgWindow),
+					avgRateWindow(uploadRateWindow, rateAvgWindow),
+				)
 				return
 			case now := <-ticker.C:
 				readNow := atomic.LoadInt64(&d.readBytes)
@@ -176,8 +187,8 @@ func (d *uploadDebugStats) startLoop() {
 
 				instReadRate := float64(deltaRead) / interval.Seconds()
 				instUploadRate := float64(deltaUploaded) / interval.Seconds()
-				readRateWindow = pushRate(readRateWindow, instReadRate, 7)
-				uploadRateWindow = pushRate(uploadRateWindow, instUploadRate, 7)
+				readRateWindow = pushRate(readRateWindow, instReadRate, rateAvgWindow)
+				uploadRateWindow = pushRate(uploadRateWindow, instUploadRate, rateAvgWindow)
 
 				d.printLine(
 					"debug",
@@ -187,8 +198,8 @@ func (d *uploadDebugStats) startLoop() {
 					deltaAttempts,
 					deltaDone,
 					interval,
-					avgFloat64(readRateWindow),
-					avgFloat64(uploadRateWindow),
+					avgRateWindow(readRateWindow, rateAvgWindow),
+					avgRateWindow(uploadRateWindow, rateAvgWindow),
 				)
 
 				lastTick = now

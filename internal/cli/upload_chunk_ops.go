@@ -476,11 +476,11 @@ func (u *uploader) waitForReadyAttempt(ctx context.Context, publicURL string, ti
 
 		polls++
 		if fileID != "" {
-			metadataWait := remaining
-			if metadataWait > defaultMetadataWaitMax {
-				metadataWait = defaultMetadataWaitMax
+			finalizeWait := remaining
+			if finalizeWait > defaultMetadataWaitMax {
+				finalizeWait = defaultMetadataWaitMax
 			}
-			ready, failed, err := u.probeMetadata(waitCtx, fileID, metadataWait)
+			ready, failed, _, err := u.requestFinalizeUpload(waitCtx, fileID, finalizeWait)
 			if err != nil {
 				return false, err
 			}
@@ -494,7 +494,7 @@ func (u *uploader) waitForReadyAttempt(ctx context.Context, publicURL string, ti
 				return false, errors.New("server marked upload as failed")
 			}
 			if u.opts.debug && polls%5 == 0 {
-				stderrLogf("finalize_poll file=%s polls=%d elapsed=%s waiting_for=server_drain", fileID, polls, time.Since(pollStart))
+				stderrLogf("finalize_poll file=%s polls=%d elapsed=%s waiting_for=finalize_api", fileID, polls, time.Since(pollStart))
 			}
 		} else {
 			ready, failed, err := u.probeHead(waitCtx, publicURL)
@@ -526,6 +526,42 @@ func (u *uploader) waitForReadyAttempt(ctx context.Context, publicURL string, ti
 			return false, waitCtx.Err()
 		case <-timer.C:
 		}
+	}
+}
+
+func (u *uploader) requestFinalizeUpload(ctx context.Context, fileID string, wait time.Duration) (ready bool, failed bool, finalURL string, err error) {
+	if strings.TrimSpace(fileID) == "" {
+		return false, false, "", nil
+	}
+	endpoint := buildFinalizeURLWithWait(u.opts.serverBase, fileID, wait)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+	if err != nil {
+		return false, false, "", err
+	}
+	req.Header.Set(headerCacheControl, cacheControlNoStoreNoCache)
+	if u.opts.uploadKey != "" {
+		req.Header.Set(headerUploadKey, u.opts.uploadKey)
+	}
+
+	resp, err := u.client.Do(req)
+	if err != nil {
+		if isContextErr(err) {
+			return false, false, "", err
+		}
+		// Network/API blips can happen while finalization is still in progress.
+		return false, false, "", nil
+	}
+	defer resp.Body.Close()
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
+	bodyText := strings.TrimSpace(string(bodyBytes))
+
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		return true, false, bodyText, nil
+	case statusMayStillFinalize(resp.StatusCode):
+		return false, false, "", nil
+	default:
+		return false, true, "", nil
 	}
 }
 
