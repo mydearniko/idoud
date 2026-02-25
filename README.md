@@ -32,6 +32,15 @@ cd cli
 go build -o idoud .
 ```
 
+## Release Builds (GoReleaser)
+
+```bash
+cd cli
+goreleaser release --snapshot --clean
+```
+
+Configuration file: `.goreleaser.yml`
+
 ## Usage
 
 ```bash
@@ -60,7 +69,7 @@ dd if=/dev/zero bs=1M count=6000 | idoud --stdin --name bench.bin --parallel 60 
 - `--stdin-size` known stdin size hint for stdin uploads
 - `--name` upload filename override (recommended with `--stdin`)
 - `--chunk-size` chunk size for `Content-Range` uploads (must be exactly `3145728` bytes / 3 MiB)
-- `--parallel` parallel non-final chunk uploads (default `12`)
+- `--parallel` parallel non-final chunk uploads (default `32`)
 - `--subdomains` force numbered upload subdomains `0..N-1` on `idoud.cc` origin
 - `--ips` force chunk upload destination IPs (comma-separated), round-robin by chunk index
 - `--no-ipv6` disable IPv6 and force IPv4-only connections

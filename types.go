@@ -33,9 +33,9 @@ const (
 	defaultChunkSize         = defaultParallelChunkSize
 	// CLI uses much higher parallelism than browsers to compensate for
 	// per-chunk latency through Cloudflare and saturate high-bandwidth links.
-	defaultParallel             = 192
+	defaultParallel             = 32
 	defaultStdinChunkSize       = defaultParallelChunkSize
-	defaultStdinParallel        = 192
+	defaultStdinParallel        = 32
 	defaultRetries              = browserChunkRetryLimit
 	defaultHedgeDelay           = 0 * time.Second
 	defaultChunkTimeout         = browserChunkRequestTimeout

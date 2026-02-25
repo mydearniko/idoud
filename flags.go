@@ -278,7 +278,7 @@ UPLOAD TUNING
   --chunk-size <size>
       Must be exactly 3145728 bytes (3 MiB).
   --parallel <n>
-      Parallel non-final chunk uploads (default: 192).
+      Parallel non-final chunk uploads (default: 32).
   --retries <n>
       Retries per failed chunk (default: 6).
   --hedge-delay <dur>

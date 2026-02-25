@@ -1,0 +1,74 @@
+version: 2
+
+project_name: idoud
+
+before:
+  hooks:
+    - go mod download
+    - go generate ./...
+
+builds:
+  - id: cli
+    main: .
+    binary: idoud
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - windows
+      - darwin
+      - openbsd
+      - freebsd
+    goarch:
+      - amd64
+      - arm
+      - arm64
+      - "386"
+      - s390x
+      - ppc64
+      - ppc64le
+      - riscv64
+      - mips
+      - mips64
+      - mipsle
+      - mips64le
+      - loong64
+    goamd64:
+      - v2
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - formats: ["binary"]
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- tolower .Os }}_
+      {{- $arch := .Arch -}}
+      {{- $arch = replace $arch "_v1" "" -}}
+      {{- $arch = replace $arch "_v8.0" "" -}}
+      {{- $arch = replace $arch "_sse2" "" -}}
+      {{- $arch = replace $arch "_6" "" -}}
+      {{- $arch = replace $arch "_power8" "" -}}
+      {{- $arch = replace $arch "_rva20u64" "" -}}
+      {{- $arch = replace $arch "_hardfloat" "" -}}
+      {{- if eq $arch "amd64" }}amd64
+      {{- else if eq $arch "386" }}i386
+      {{- else if eq $arch "arm" }}arm
+      {{- else if eq $arch "arm64" }}arm64
+      {{- else if eq $arch "ppc64le" }}ppc64le
+      {{- else if eq $arch "ppc64" }}ppc64
+      {{- else if eq $arch "riscv64" }}riscv64
+      {{- else if eq $arch "mips64le" }}mips64le
+      {{- else if eq $arch "mips64" }}mips64
+      {{- else if eq $arch "mipsle" }}mipsle
+      {{- else if eq $arch "mips" }}mips
+      {{- else if eq $arch "loong64" }}loong64
+      {{- else }}{{ $arch }}
+      {{- end -}}
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
