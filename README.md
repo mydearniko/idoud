@@ -2,7 +2,7 @@
 
 Standalone Go CLI accelerated uploader for idoud.
 
-## Install (Copy/Paste)
+## Install / Update
 
 ### Linux / macOS / FreeBSD / OpenBSD
 
