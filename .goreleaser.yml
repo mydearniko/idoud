@@ -38,6 +38,9 @@ builds:
     ldflags:
       - -s -w -X main.version={{.Version}}
 
+checksum:
+  name_template: checksums.txt
+
 archives:
   - formats: ["binary"]
     name_template: >-
@@ -45,6 +48,7 @@ archives:
       {{- tolower .Os }}_
       {{- $arch := .Arch -}}
       {{- $arch = replace $arch "_v1" "" -}}
+      {{- $arch = replace $arch "_v2" "" -}}
       {{- $arch = replace $arch "_v8.0" "" -}}
       {{- $arch = replace $arch "_sse2" "" -}}
       {{- $arch = replace $arch "_6" "" -}}

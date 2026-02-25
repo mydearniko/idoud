@@ -32,14 +32,49 @@ cd cli
 go build -o idoud .
 ```
 
-## Release Builds (GoReleaser)
+## Install (Copy/Paste)
+
+### Linux / macOS / FreeBSD / OpenBSD
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mydearniko/idoud/main/install.sh | sh
+```
+
+### Windows (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/mydearniko/idoud/main/install.ps1 | iex
+```
+
+### Manual Download
+
+Use prebuilt binaries from:
+
+- https://github.com/mydearniko/idoud/releases/latest
+
+## Automated Releases (GitHub Actions + GoReleaser)
+
+Release assets are built and published automatically when you push a version tag (`v*`).
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+Workflow file:
+
+- `.github/workflows/release.yml`
+
+## Local Release Builds (GoReleaser)
 
 ```bash
 cd cli
 goreleaser release --snapshot --clean
 ```
 
-Configuration file: `.goreleaser.yml`
+Configuration file:
+
+- `.goreleaser.yml`
 
 ## Usage
 
