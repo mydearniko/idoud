@@ -1,16 +1,20 @@
 # idoud CLI
 
-Standalone Go CLI uploader for idoud.
+Standalone Go CLI accelerated uploader for idoud.
 
-This project is intentionally isolated under `cli/` so it can be moved into a separate public repository.
+## Install (Copy/Paste)
 
-## Project layout
+### Linux / macOS / FreeBSD / OpenBSD
 
-- `main.go`: CLI entrypoint.
-- `types.go`: shared constants/types and HTTP error wrappers.
-- `flags.go`: argument parsing and validation.
-- `source.go`: file/stdin source opening logic.
-- `upload.go`: upload engine, retries, finalization checks, transport tuning, and helpers.
+```bash
+curl -fsSL https://raw.githubusercontent.com/mydearniko/idoud/main/install.sh | sh
+```
+
+### Windows (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/mydearniko/idoud/main/install.ps1 | iex
+```
 
 ## Features
 
@@ -32,50 +36,6 @@ cd cli
 go build -o idoud .
 ```
 
-## Install (Copy/Paste)
-
-### Linux / macOS / FreeBSD / OpenBSD
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/mydearniko/idoud/main/install.sh | sh
-```
-
-### Windows (PowerShell)
-
-```powershell
-irm https://raw.githubusercontent.com/mydearniko/idoud/main/install.ps1 | iex
-```
-
-### Manual Download
-
-Use prebuilt binaries from:
-
-- https://github.com/mydearniko/idoud/releases/latest
-
-## Automated Releases (GitHub Actions + GoReleaser)
-
-Release assets are built and published automatically when you push a version tag (`v*`).
-
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-Workflow file:
-
-- `.github/workflows/release.yml`
-
-## Local Release Builds (GoReleaser)
-
-```bash
-cd cli
-goreleaser release --snapshot --clean
-```
-
-Configuration file:
-
-- `.goreleaser.yml`
-
 ## Usage
 
 ```bash
@@ -87,14 +47,9 @@ idoud --stdin [--name <filename> | <filename>] [flags]
 
 ```bash
 idoud archive.zip
-cat archive.zip | idoud --stdin --name archive.zip
 cat archive.zip | idoud --stdin archive.zip
 idoud --server https://idoud.cc --parallel 16 archive.zip
-idoud --server https://s1.example,https://s2.example archive.zip
-idoud --server https://idoud.cc --subdomains 2 archive.zip
-idoud --ips 104.16.230.132,104.16.230.133 --server https://s1.example,https://s2.example archive.zip
 idoud --password "secret" --download-limit 3 archive.zip
-dd if=/dev/zero bs=1M count=6000 | idoud --stdin --name bench.bin --parallel 60 --speedtest --debug
 ```
 
 ## Important flags
