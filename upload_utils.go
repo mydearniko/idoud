@@ -12,14 +12,13 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-func buildTransport(insecure bool, parallel int) *http.Transport {
+func buildTransport(insecure bool, disableIPv6 bool, parallel int, forcedIP string) *http.Transport {
 	conns := parallel
 	if conns < 8 {
 		conns = 8
@@ -30,7 +29,25 @@ func buildTransport(insecure bool, parallel int) *http.Transport {
 	}
 	t := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			conn, err := dialer.DialContext(ctx, network, addr)
+			dialNetwork := network
+			if dialNetwork == "" {
+				dialNetwork = "tcp"
+			}
+			if disableIPv6 {
+				switch network {
+				case "", "tcp", "tcp4", "tcp6":
+					dialNetwork = "tcp4"
+				}
+			}
+			dialAddr := addr
+			if forcedIP != "" {
+				_, portPart, splitErr := net.SplitHostPort(addr)
+				if splitErr != nil {
+					portPart = "443"
+				}
+				dialAddr = net.JoinHostPort(forcedIP, portPart)
+			}
+			conn, err := dialer.DialContext(ctx, dialNetwork, dialAddr)
 			if err != nil {
 				return nil, err
 			}
@@ -65,6 +82,57 @@ func buildTransport(insecure bool, parallel int) *http.Transport {
 		WriteBufferSize:       4 << 20, // 4 MiB
 		ReadBufferSize:        64 << 10,
 	}
+
+	// In forced-IP mode, perform TLS handshake explicitly so SNI is always
+	// derived from the request host (addr), never from the forced dial IP.
+	if forcedIP != "" {
+		t.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialNetwork := network
+			if dialNetwork == "" {
+				dialNetwork = "tcp"
+			}
+			if disableIPv6 {
+				switch network {
+				case "", "tcp", "tcp4", "tcp6":
+					dialNetwork = "tcp4"
+				}
+			}
+			_, portPart, splitErr := net.SplitHostPort(addr)
+			if splitErr != nil {
+				portPart = "443"
+			}
+			dialAddr := net.JoinHostPort(forcedIP, portPart)
+			conn, err := dialer.DialContext(ctx, dialNetwork, dialAddr)
+			if err != nil {
+				return nil, err
+			}
+			if tc, ok := conn.(*net.TCPConn); ok {
+				_ = tc.SetNoDelay(true)
+			}
+
+			hostPart, _, splitErr := net.SplitHostPort(addr)
+			if splitErr != nil {
+				hostPart = addr
+			}
+			hostPart = strings.TrimPrefix(hostPart, "[")
+			hostPart = strings.TrimSuffix(hostPart, "]")
+
+			cfg := &tls.Config{}
+			if t.TLSClientConfig != nil {
+				cfg = t.TLSClientConfig.Clone()
+			}
+			if cfg.ServerName == "" && net.ParseIP(hostPart) == nil {
+				cfg.ServerName = hostPart
+			}
+
+			tlsConn := tls.Client(conn, cfg)
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
+			return tlsConn, nil
+		}
+	}
 	if insecure {
 		t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
@@ -74,18 +142,25 @@ func buildTransport(insecure bool, parallel int) *http.Transport {
 const warmupTimeout = 3 * time.Second
 
 type uploadSubdomainPool struct {
-	mu         sync.Mutex
-	allowedMax int
-	nextProbe  int
+	mu       sync.Mutex
+	minIndex int
+	count    int
+	next     int
 }
 
 func newUploadSubdomainPool(maxParallel int) *uploadSubdomainPool {
-	if maxParallel < 1 {
-		maxParallel = 1
+	// Preserve historical default behavior: 1..N.
+	return newUploadSubdomainPoolRange(1, maxParallel)
+}
+
+func newUploadSubdomainPoolRange(minIndex int, count int) *uploadSubdomainPool {
+	if count < 1 {
+		count = 1
 	}
 	return &uploadSubdomainPool{
-		allowedMax: maxParallel,
-		nextProbe:  1,
+		minIndex: minIndex,
+		count:    count,
+		next:     minIndex,
 	}
 }
 
@@ -95,17 +170,19 @@ func (p *uploadSubdomainPool) acquire() int {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.allowedMax < 1 {
-		p.allowedMax = 1
+	if p.count < 1 {
+		p.count = 1
 	}
-	if p.nextProbe < 1 || p.nextProbe > p.allowedMax {
-		p.nextProbe = 1
+	min := p.minIndex
+	max := p.minIndex + p.count - 1
+	if p.next < min || p.next > max {
+		p.next = min
 	}
-	selected := p.nextProbe
-	if selected >= p.allowedMax {
-		p.nextProbe = 1
+	selected := p.next
+	if selected >= max {
+		p.next = min
 	} else {
-		p.nextProbe = selected + 1
+		p.next = selected + 1
 	}
 	return selected
 }
@@ -125,7 +202,7 @@ func shouldUseBrowserSubdomains(base *url.URL, disabled bool) bool {
 }
 
 func buildSubdomainUploadURL(rawURL string, index int) string {
-	if index <= 0 {
+	if index < 0 {
 		return rawURL
 	}
 	parsed, err := url.Parse(strings.TrimSpace(rawURL))
@@ -149,32 +226,40 @@ func (u *uploader) routeUploadURL(rawURL string) string {
 }
 
 func (u *uploader) warmConnections(ctx context.Context, count int) {
-	if count <= 0 || u.opts.serverBase == nil {
+	if count <= 0 {
+		return
+	}
+	bases := resolveServerBases(u.opts)
+	if len(bases) == 0 {
 		return
 	}
 	if count > 128 {
 		count = 128
 	}
-	warmURL := strings.TrimSuffix(u.opts.serverBase.String(), "/") + "/v1/health"
 	var wg sync.WaitGroup
 	for i := 0; i < count; i++ {
+		warmURL := strings.TrimSuffix(bases[i%len(bases)].String(), "/") + "/v1/health"
 		wg.Add(1)
-		go func() {
+		go func(targetURL string, chunkOrder int) {
 			defer wg.Done()
 			reqCtx, cancel := context.WithTimeout(ctx, warmupTimeout)
 			defer cancel()
-			reqURL := u.routeUploadURL(warmURL)
+			reqURL := targetURL
+			if u != nil && u.subdomains != nil {
+				reqURL = u.routeUploadURL(targetURL)
+			}
 			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, reqURL, nil)
 			if err != nil {
 				return
 			}
-			resp, err := u.client.Do(req)
+			client := u.clientForChunk(int64(chunkOrder))
+			resp, err := client.Do(req)
 			if err != nil {
 				return
 			}
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
-		}()
+		}(warmURL, i)
 	}
 	wg.Wait()
 }
@@ -241,6 +326,45 @@ func normalizeServerURL(raw string) (*url.URL, error) {
 		return nil, errors.New("scheme and host are required")
 	}
 	return parsed, nil
+}
+
+func normalizeServerURLs(raw string) ([]*url.URL, error) {
+	entries := strings.Split(strings.TrimSpace(raw), ",")
+	bases := make([]*url.URL, 0, len(entries))
+	for idx, entry := range entries {
+		part := strings.TrimSpace(entry)
+		if part == "" {
+			return nil, fmt.Errorf("empty server entry at position %d", idx+1)
+		}
+		base, err := normalizeServerURL(part)
+		if err != nil {
+			return nil, fmt.Errorf("entry %d: %w", idx+1, err)
+		}
+		bases = append(bases, base)
+	}
+	if len(bases) == 0 {
+		return nil, errors.New("empty value")
+	}
+	return bases, nil
+}
+
+func resolveServerBases(opts options) []*url.URL {
+	if len(opts.serverBases) > 0 {
+		return opts.serverBases
+	}
+	if opts.serverBase != nil {
+		return []*url.URL{opts.serverBase}
+	}
+	return nil
+}
+
+func hasAnyNonLoopbackServer(opts options) bool {
+	for _, base := range resolveServerBases(opts) {
+		if !isLoopbackServer(base) {
+			return true
+		}
+	}
+	return false
 }
 
 func isLoopbackServer(base *url.URL) bool {
@@ -533,5 +657,5 @@ func (u *uploader) logf(format string, args ...any) {
 	if !u.opts.verbose {
 		return
 	}
-	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	stderrLogf(format, args...)
 }

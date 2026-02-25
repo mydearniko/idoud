@@ -28,9 +28,9 @@ const (
 )
 
 const (
-	defaultServerURL            = "https://idoud.cc"
-	defaultParallelChunkSize    = browserChunkSize
-	defaultChunkSize            = defaultParallelChunkSize
+	defaultServerURL         = "https://idoud.cc"
+	defaultParallelChunkSize = browserChunkSize
+	defaultChunkSize         = defaultParallelChunkSize
 	// CLI uses much higher parallelism than browsers to compensate for
 	// per-chunk latency through Cloudflare and saturate high-bandwidth links.
 	defaultParallel             = 192
@@ -67,6 +67,8 @@ var errFinalizeTimeout = errors.New("upload finalization timeout")
 type options struct {
 	serverURL            string
 	serverBase           *url.URL
+	serverBases          []*url.URL
+	forcedIPs            []string
 	stdin                bool
 	stdinSize            int64
 	nameOverride         string
@@ -83,6 +85,8 @@ type options struct {
 	downloadLimit        int64
 	uploadKey            string
 	insecureTLS          bool
+	noIPv6               bool
+	subdomains           int
 	noSubdomains         bool
 	speedtest            bool
 	verbose              bool
@@ -90,16 +94,18 @@ type options struct {
 }
 
 type sourceFile struct {
-	readerAt        io.ReaderAt
-	stream          io.Reader
-	closer          io.Closer
-	size            int64
-	knownSize       bool
-	uploadName      string
-	uploadURL       string
-	uploadURLParsed *url.URL
-	displayName     string
-	fromStdin       bool
+	readerAt                io.ReaderAt
+	stream                  io.Reader
+	closer                  io.Closer
+	size                    int64
+	knownSize               bool
+	uploadName              string
+	uploadURL               string
+	uploadURLParsed         *url.URL
+	uploadURLs              []string
+	uploadURLParsedByServer []*url.URL
+	displayName             string
+	fromStdin               bool
 }
 
 type urlCapture struct {
@@ -161,10 +167,12 @@ func (e *requestError) Unwrap() error {
 }
 
 type uploader struct {
-	opts       options
-	client     *http.Client
-	dbg        *uploadDebugStats
-	subdomains *uploadSubdomainPool
+	opts         options
+	client       *http.Client
+	chunkClients []*http.Client
+	dbg          *uploadDebugStats
+	subdomains   *uploadSubdomainPool
+	chunkIPs     *chunkOriginIPSet
 }
 
 type fileMetadataPayload struct {

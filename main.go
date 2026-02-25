@@ -10,34 +10,54 @@ import (
 func main() {
 	opts, filePath, err := parseFlags(os.Args[1:])
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n\n%s\n", err, usageText())
+		stderrWritef("error: %v\n\n%s\n", err, usageText())
 		os.Exit(2)
 	}
 
 	src, cleanup, err := openSource(filePath, opts)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		stderrLogf("error: %v", err)
 		os.Exit(1)
 	}
 	defer cleanup()
 
 	client := &http.Client{
-		Transport: buildTransport(opts.insecureTLS, opts.parallel),
+		Transport: buildTransport(opts.insecureTLS, opts.noIPv6, opts.parallel, ""),
 	}
+	chunkClients := buildChunkClients(opts)
 
 	u := &uploader{
-		opts:   opts,
-		client: client,
+		opts:         opts,
+		client:       client,
+		chunkClients: chunkClients,
+		chunkIPs: &chunkOriginIPSet{
+			seen: make(map[string]struct{}),
+		},
 	}
-	if shouldUseBrowserSubdomains(opts.serverBase, opts.noSubdomains) {
+	if opts.subdomains > 0 {
+		u.subdomains = newUploadSubdomainPoolRange(0, opts.subdomains)
+	} else if len(opts.serverBases) == 1 && len(opts.forcedIPs) == 0 && shouldUseBrowserSubdomains(opts.serverBase, opts.noSubdomains) {
 		u.subdomains = newUploadSubdomainPool(opts.parallel)
 	}
 
 	finalURL, err := u.upload(context.Background(), src)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "upload failed: %v\n", err)
+		stderrLogf("upload failed: %v", err)
 		os.Exit(1)
 	}
 
 	fmt.Println(finalURL)
+}
+
+func buildChunkClients(opts options) []*http.Client {
+	if len(opts.forcedIPs) == 0 {
+		return nil
+	}
+	clients := make([]*http.Client, 0, len(opts.forcedIPs))
+	for _, ip := range opts.forcedIPs {
+		clients = append(clients, &http.Client{
+			Transport: buildTransport(opts.insecureTLS, opts.noIPv6, opts.parallel, ip),
+		})
+	}
+	return clients
 }

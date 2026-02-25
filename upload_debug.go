@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -272,9 +271,8 @@ func (d *uploadDebugStats) printLine(
 		serverWaitStr = fmt.Sprintf(" server_wait=%s", roundDuration(time.Since(time.Unix(0, swStart))))
 	}
 
-	fmt.Fprintf(
-		os.Stderr,
-		"%s mode=%s name=%q t=%s inflight=%d max=%d started=%d done=%d failed=%d attempts=%d retries=%d hedges=%d timeouts=%d status_429=%d status_5xx=%d final_started=%d final_done=%d final_failed=%d read=%s uploaded=%s read_rate=%s upload_rate=%s read_rate_avg7=%s upload_rate_avg7=%s attempt_rate=%s done_rate=%s stage_pool_wait_avg=%s stage_pool_wait_max=%s stage_pool_wait_n=%d stage_queue_wait_avg=%s stage_queue_wait_max=%s stage_queue_wait_n=%d stage_read_avg=%s stage_read_max=%s stage_read_n=%d stage_req_build_avg=%s stage_req_build_max=%s stage_req_build_n=%d stage_http_avg=%s stage_http_max=%s stage_http_n=%d stage_resp_read_avg=%s stage_resp_read_max=%s stage_resp_read_n=%d stage_retry_sleep_avg=%s stage_retry_sleep_max=%s stage_retry_sleep_total=%s stage_retry_sleep_n=%d stdin_state=%s stdin_idle=%s%s\n",
+	stderrLogf(
+		"%s mode=%s name=%q t=%s inflight=%d max=%d started=%d done=%d failed=%d attempts=%d retries=%d hedges=%d timeouts=%d status_429=%d status_5xx=%d final_started=%d final_done=%d final_failed=%d read=%s uploaded=%s read_rate=%s upload_rate=%s read_rate_avg7=%s upload_rate_avg7=%s attempt_rate=%s done_rate=%s stage_pool_wait_avg=%s stage_pool_wait_max=%s stage_pool_wait_n=%d stage_queue_wait_avg=%s stage_queue_wait_max=%s stage_queue_wait_n=%d stage_read_avg=%s stage_read_max=%s stage_read_n=%d stage_req_build_avg=%s stage_req_build_max=%s stage_req_build_n=%d stage_http_avg=%s stage_http_max=%s stage_http_n=%d stage_resp_read_avg=%s stage_resp_read_max=%s stage_resp_read_n=%d stage_retry_sleep_avg=%s stage_retry_sleep_max=%s stage_retry_sleep_total=%s stage_retry_sleep_n=%d stdin_state=%s stdin_idle=%s%s",
 		prefix,
 		d.label,
 		d.name,
@@ -342,8 +340,11 @@ func (u *uploader) upload(ctx context.Context, src *sourceFile) (string, error) 
 
 	stopDebug := u.startDebug(src)
 	defer stopDebug()
+	stopChunkIPLog := u.startChunkIPLogLoop(time.Second)
+	defer stopChunkIPLog()
+	defer u.logChunkOriginIPs()
 
-	if !isLoopbackServer(u.opts.serverBase) {
+	if hasAnyNonLoopbackServer(u.opts) {
 		u.warmConnections(ctx, u.opts.parallel)
 	}
 

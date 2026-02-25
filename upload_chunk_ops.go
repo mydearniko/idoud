@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
+	"net/http/httptrace"
 	"strconv"
 	"strings"
 	"sync"
@@ -144,13 +144,8 @@ func (u *uploader) doChunkAttempt(
 	}
 	hedgeDelay := u.opts.hedgeDelay
 	if finalChunk || hedgeDelay <= 0 {
-		start := time.Now()
 		body, status, err := fn(ctx)
 		u.debugChunkAttempt(status, err)
-		if u.opts.debug && (err != nil || time.Since(start) > 4*time.Second) {
-			fmt.Fprintf(os.Stderr, "chunk_attempt idx=%d final=%t status=%d dur=%s err=%v\n",
-				chunkIndex, finalChunk, status, roundDuration(time.Since(start)), err)
-		}
 		return body, status, err
 	}
 
@@ -284,14 +279,24 @@ func (u *uploader) uploadPUT(
 	body io.Reader,
 	contentLength int64,
 	contentRange string,
+	chunkIndex int64,
 	finalChunk bool,
 	setFinalChunkHeader bool,
 ) (string, int, error) {
 	if src == nil {
 		return "", 0, errors.New("missing upload source")
 	}
+	if chunkIndex >= 0 {
+		ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) {
+				if info.Conn != nil {
+					u.recordChunkRemoteIP(info.Conn.RemoteAddr())
+				}
+			},
+		})
+	}
 	buildStarted := time.Now()
-	req, err := u.newUploadPUTRequest(ctx, src, body)
+	req, err := u.newUploadPUTRequest(ctx, src, body, chunkIndex)
 	if err != nil {
 		u.debugRequestBuild(time.Since(buildStarted))
 		return "", 0, err
@@ -317,7 +322,11 @@ func (u *uploader) uploadPUT(
 	u.debugRequestBuild(time.Since(buildStarted))
 
 	httpStarted := time.Now()
-	resp, err := u.client.Do(req)
+	client := u.clientForChunk(chunkIndex)
+	if client == nil {
+		return "", 0, errors.New("missing HTTP client")
+	}
+	resp, err := client.Do(req)
 	u.debugHTTPRoundTrip(time.Since(httpStarted))
 	if err != nil {
 		return "", 0, &requestError{cause: err}
@@ -348,23 +357,27 @@ func (u *uploader) uploadPUT(
 	}
 }
 
-func (u *uploader) newUploadPUTRequest(ctx context.Context, src *sourceFile, body io.Reader) (*http.Request, error) {
+func (u *uploader) newUploadPUTRequest(ctx context.Context, src *sourceFile, body io.Reader, chunkIndex int64) (*http.Request, error) {
 	if src == nil {
 		return nil, errors.New("missing upload source")
 	}
 	if body == nil {
 		body = http.NoBody
 	}
-	if u != nil && u.subdomains == nil && src.uploadURLParsed != nil {
+	targetURL, targetParsed := src.uploadTargetForChunk(chunkIndex)
+	if targetURL == "" {
+		return nil, errors.New("missing upload target URL")
+	}
+	if u != nil && u.subdomains == nil && targetParsed != nil {
 		req := &http.Request{
 			Method: http.MethodPut,
-			URL:    cloneURL(src.uploadURLParsed),
+			URL:    cloneURL(targetParsed),
 			Header: make(http.Header, 8),
 			Body:   io.NopCloser(body),
 		}
 		return req.WithContext(ctx), nil
 	}
-	return http.NewRequestWithContext(ctx, http.MethodPut, u.routeUploadURL(src.uploadURL), body)
+	return http.NewRequestWithContext(ctx, http.MethodPut, u.routeUploadURL(targetURL), body)
 }
 
 func (u *uploader) uploadChunkOnce(ctx context.Context, src *sourceFile, chunkIndex int64, finalChunk bool) (string, int, error) {
@@ -390,14 +403,14 @@ func (u *uploader) uploadChunkOnce(ctx context.Context, src *sourceFile, chunkIn
 
 	reader := io.NewSectionReader(src.readerAt, start, length)
 	contentRange := buildContentRange(start, endExclusive)
-	return u.uploadPUT(reqCtx, src, reader, length, contentRange, finalChunk, true)
+	return u.uploadPUT(reqCtx, src, reader, length, contentRange, chunkIndex, finalChunk, true)
 }
 
 func (u *uploader) uploadEmptyOnce(ctx context.Context, src *sourceFile) (string, int, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, u.opts.finalChunkTimeout)
 	defer cancel()
 
-	return u.uploadPUT(reqCtx, src, http.NoBody, 0, "", false, false)
+	return u.uploadPUT(reqCtx, src, http.NoBody, 0, "", -1, false, false)
 }
 
 func buildContentRange(start, endExclusive int64) string {
@@ -473,7 +486,7 @@ func (u *uploader) waitForReadyAttempt(ctx context.Context, publicURL string, ti
 			}
 			if ready {
 				if u.opts.verbose || u.opts.debug {
-					fmt.Fprintf(os.Stderr, "finalize_ready file=%s polls=%d elapsed=%s\n", fileID, polls, time.Since(pollStart))
+					stderrLogf("finalize_ready file=%s polls=%d elapsed=%s", fileID, polls, time.Since(pollStart))
 				}
 				return true, nil
 			}
@@ -481,7 +494,7 @@ func (u *uploader) waitForReadyAttempt(ctx context.Context, publicURL string, ti
 				return false, errors.New("server marked upload as failed")
 			}
 			if u.opts.debug && polls%5 == 0 {
-				fmt.Fprintf(os.Stderr, "finalize_poll file=%s polls=%d elapsed=%s waiting_for=server_drain\n", fileID, polls, time.Since(pollStart))
+				stderrLogf("finalize_poll file=%s polls=%d elapsed=%s waiting_for=server_drain", fileID, polls, time.Since(pollStart))
 			}
 		} else {
 			ready, failed, err := u.probeHead(waitCtx, publicURL)
@@ -551,7 +564,7 @@ func (u *uploader) probeMetadata(ctx context.Context, fileID string, wait time.D
 		default:
 			if u.opts.debug && payload.TotalBytes > 0 {
 				pct := float64(payload.UploadedBytes) / float64(payload.TotalBytes) * 100
-				fmt.Fprintf(os.Stderr, "finalize_progress file=%s stored=%s/%s (%.1f%%)\n",
+				stderrLogf("finalize_progress file=%s stored=%s/%s (%.1f%%)",
 					fileID, formatByteSize(payload.UploadedBytes), formatByteSize(payload.TotalBytes), pct)
 			}
 			return false, false, nil

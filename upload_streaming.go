@@ -267,7 +267,7 @@ func (u *uploader) uploadPreparedChunkOnceWithContentRange(
 	defer cancel()
 
 	reader := bytes.NewReader(chunk.buf[:chunk.size])
-	return u.uploadPUT(reqCtx, src, reader, int64(chunk.size), contentRange, finalChunk, setFinalChunkHeader)
+	return u.uploadPUT(reqCtx, src, reader, int64(chunk.size), contentRange, chunk.index, finalChunk, setFinalChunkHeader)
 }
 
 // stdinScatterResult carries a chunk from the scatter-read goroutine to the

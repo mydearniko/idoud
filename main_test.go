@@ -21,6 +21,71 @@ func TestParseFlagsStdinPositionalName(t *testing.T) {
 	}
 }
 
+func TestParseFlagsServerList(t *testing.T) {
+	opts, _, err := parseFlags([]string{
+		"--server",
+		"https://one.example,https://two.example",
+		"file.bin",
+	})
+	if err != nil {
+		t.Fatalf("parseFlags returned error: %v", err)
+	}
+	if opts.serverBase == nil {
+		t.Fatal("opts.serverBase=nil, want first parsed server")
+	}
+	if opts.serverBase.String() != "https://one.example" {
+		t.Fatalf("serverBase=%q, want %q", opts.serverBase.String(), "https://one.example")
+	}
+	if len(opts.serverBases) != 2 {
+		t.Fatalf("len(serverBases)=%d, want 2", len(opts.serverBases))
+	}
+	if opts.serverBases[1] == nil || opts.serverBases[1].String() != "https://two.example" {
+		t.Fatalf("serverBases[1]=%v, want %q", opts.serverBases[1], "https://two.example")
+	}
+}
+
+func TestParseFlagsServerListRejectsEmptyEntry(t *testing.T) {
+	_, _, err := parseFlags([]string{
+		"--server",
+		"https://one.example,",
+		"file.bin",
+	})
+	if err == nil {
+		t.Fatal("expected parse error for empty server entry")
+	}
+}
+
+func TestParseFlagsIPs(t *testing.T) {
+	opts, _, err := parseFlags([]string{
+		"--ips",
+		"104.16.230.132,104.16.230.133,104.16.230.134",
+		"file.bin",
+	})
+	if err != nil {
+		t.Fatalf("parseFlags returned error: %v", err)
+	}
+	if len(opts.forcedIPs) != 3 {
+		t.Fatalf("len(forcedIPs)=%d, want 3", len(opts.forcedIPs))
+	}
+	if opts.forcedIPs[0] != "104.16.230.132" || opts.forcedIPs[2] != "104.16.230.134" {
+		t.Fatalf("forcedIPs=%v, unexpected order/content", opts.forcedIPs)
+	}
+}
+
+func TestParseFlagsIPsRejectsInvalid(t *testing.T) {
+	_, _, err := parseFlags([]string{"--ips", "104.16.1.1,bad-ip", "file.bin"})
+	if err == nil {
+		t.Fatal("expected parse error for invalid --ips list")
+	}
+}
+
+func TestParseFlagsNoIPv6RejectsIPv6InIPs(t *testing.T) {
+	_, _, err := parseFlags([]string{"--no-ipv6", "--ips", "2001:db8::1", "file.bin"})
+	if err == nil {
+		t.Fatal("expected parse error for IPv6 in --ips when --no-ipv6 is set")
+	}
+}
+
 func TestParseFlagsStdinPositionalNameConflict(t *testing.T) {
 	_, _, err := parseFlags([]string{"--stdin", "--name", "from-flag.zip", "from-arg.zip"})
 	if err == nil {
@@ -36,7 +101,7 @@ func TestParseFlagsStdinTooManyPositionalArgs(t *testing.T) {
 }
 
 func TestBuildTransportResponseHeaderTimeoutDisabled(t *testing.T) {
-	tr := buildTransport(false, 8)
+	tr := buildTransport(false, false, 8, "")
 	if tr.ResponseHeaderTimeout != 0 {
 		t.Fatalf("ResponseHeaderTimeout = %s, want 0", tr.ResponseHeaderTimeout)
 	}
@@ -50,6 +115,16 @@ func TestBuildTransportResponseHeaderTimeoutDisabled(t *testing.T) {
 	}
 	if len(tr.TLSNextProto) != 0 {
 		t.Fatalf("TLSNextProto has %d entries, want 0", len(tr.TLSNextProto))
+	}
+}
+
+func TestParseFlagsNoIPv6(t *testing.T) {
+	opts, _, err := parseFlags([]string{"--no-ipv6", "file.bin"})
+	if err != nil {
+		t.Fatalf("parseFlags --no-ipv6 returned error: %v", err)
+	}
+	if !opts.noIPv6 {
+		t.Fatal("opts.noIPv6=false, want true")
 	}
 }
 

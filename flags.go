@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"strconv"
 	"strings"
 )
@@ -17,8 +18,9 @@ func parseFlags(args []string) (options, string, error) {
 
 	chunkSizeRaw := strconv.FormatInt(defaultChunkSize, 10)
 	stdinSizeRaw := ""
+	ipsRaw := ""
 
-	fs.StringVar(&opts.serverURL, "server", defaultServerURL, "idoud server origin")
+	fs.StringVar(&opts.serverURL, "server", defaultServerURL, "idoud server origin (or comma-separated origins)")
 	fs.BoolVar(&opts.stdin, "stdin", false, "read file data from stdin")
 	fs.StringVar(&stdinSizeRaw, "stdin-size", "", "stdin size hint for stdin uploads")
 	fs.StringVar(&opts.nameOverride, "name", "", "upload file name override")
@@ -35,6 +37,9 @@ func parseFlags(args []string) (options, string, error) {
 	fs.Int64Var(&opts.downloadLimit, "download-limit", 0, "download limit (sets X-Upload-Download-Limit)")
 	fs.StringVar(&opts.uploadKey, "upload-key", "", "explicit upload key (default: random)")
 	fs.BoolVar(&opts.insecureTLS, "insecure", false, "skip TLS certificate verification")
+	fs.StringVar(&ipsRaw, "ips", "", "force chunk upload destination IPs (comma-separated)")
+	fs.BoolVar(&opts.noIPv6, "no-ipv6", false, "disable IPv6 and force IPv4-only connections")
+	fs.IntVar(&opts.subdomains, "subdomains", 0, "force upload subdomain pool size (uses 0..N-1 on idoud domains)")
 	fs.BoolVar(&opts.noSubdomains, "no-subdomains", false, "disable numbered subdomain upload routing")
 	fs.BoolVar(&opts.noSubdomains, "nosub", false, "alias for --no-subdomains")
 	fs.BoolVar(&opts.speedtest, "speedtest", false, "use server-side sink mode to benchmark ingest without backend storage writes")
@@ -45,11 +50,12 @@ func parseFlags(args []string) (options, string, error) {
 		return options{}, "", err
 	}
 
-	base, err := normalizeServerURL(opts.serverURL)
+	bases, err := normalizeServerURLs(opts.serverURL)
 	if err != nil {
 		return options{}, "", fmt.Errorf("invalid --server: %w", err)
 	}
-	opts.serverBase = base
+	opts.serverBases = bases
+	opts.serverBase = bases[0]
 
 	chunkSize, err := parseByteSize(chunkSizeRaw)
 	if err != nil {
@@ -66,6 +72,14 @@ func parseFlags(args []string) (options, string, error) {
 			return options{}, "", fmt.Errorf("invalid --stdin-size: %w", parseErr)
 		}
 		opts.stdinSize = stdinSize
+	}
+
+	if strings.TrimSpace(ipsRaw) != "" {
+		ips, parseErr := parseIPList(ipsRaw)
+		if parseErr != nil {
+			return options{}, "", fmt.Errorf("invalid --ips: %w", parseErr)
+		}
+		opts.forcedIPs = ips
 	}
 
 	if opts.chunkSize > int64(int(^uint(0)>>1)) {
@@ -97,6 +111,28 @@ func parseFlags(args []string) (options, string, error) {
 	}
 	if opts.finalizePollInterval <= 0 {
 		return options{}, "", errors.New("--finalize-poll-interval must be > 0")
+	}
+	if opts.subdomains < 0 {
+		return options{}, "", errors.New("--subdomains must be >= 0")
+	}
+	if opts.subdomains > 0 && opts.noSubdomains {
+		return options{}, "", errors.New("--subdomains cannot be combined with --no-subdomains/--nosub")
+	}
+	if opts.subdomains > 0 {
+		if len(opts.serverBases) != 1 {
+			return options{}, "", errors.New("--subdomains requires a single --server origin")
+		}
+		if !shouldUseBrowserSubdomains(opts.serverBase, false) {
+			return options{}, "", errors.New("--subdomains requires an idoud.cc server origin")
+		}
+	}
+	if opts.noIPv6 {
+		for _, ipText := range opts.forcedIPs {
+			ip := net.ParseIP(ipText)
+			if ip != nil && ip.To4() == nil {
+				return options{}, "", fmt.Errorf("--no-ipv6 cannot be used with IPv6 value in --ips: %s", ipText)
+			}
+		}
 	}
 	if opts.downloadLimit < 0 {
 		return options{}, "", errors.New("--download-limit must be >= 0")
@@ -145,18 +181,42 @@ Examples:
   idoud archive.zip
   cat archive.zip | idoud --stdin --name archive.zip
   cat archive.zip | idoud --stdin archive.zip
+  idoud --server https://s1.example,https://s2.example archive.zip
 
 Core flags:
-  --server        idoud server origin (default: https://idoud.cc)
+  --server        idoud server origin or comma-separated origins (default: https://idoud.cc)
   --stdin         read file data from stdin
   --stdin-size    known stdin size hint for stdin uploads
   --name          override upload file name
   --chunk-size    chunk size for range uploads (must be 3145728 bytes / 3MiB)
   --parallel      parallel non-final chunk uploads (default: 192)
+  --subdomains    force upload subdomain pool size (uses 0..N-1 on idoud domains)
+  --ips           force chunk upload destination IPs (comma-separated)
+  --no-ipv6       disable IPv6 and force IPv4-only connections
   --no-subdomains disable numbered subdomain upload routing (alias: --nosub)
   --speedtest     benchmark ingest path using server-side sink mode
   --retries       retries per chunk (default: 6)
   --hedge-delay   delay before speculative duplicate upload for slow non-final chunks (default: 0s, disabled)
   --debug         print live chunk concurrency and throughput stats to stderr
 `)
+}
+
+func parseIPList(raw string) ([]string, error) {
+	parts := strings.Split(strings.TrimSpace(raw), ",")
+	ips := make([]string, 0, len(parts))
+	for idx, part := range parts {
+		token := strings.TrimSpace(part)
+		if token == "" {
+			return nil, fmt.Errorf("empty IP entry at position %d", idx+1)
+		}
+		ip := net.ParseIP(token)
+		if ip == nil {
+			return nil, fmt.Errorf("entry %d is not a valid IP: %s", idx+1, token)
+		}
+		ips = append(ips, ip.String())
+	}
+	if len(ips) == 0 {
+		return nil, errors.New("empty value")
+	}
+	return ips, nil
 }
