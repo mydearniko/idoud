@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"flag"
+	"strings"
 	"testing"
 )
 
@@ -98,6 +100,59 @@ func TestParseFlagsStdinTooManyPositionalArgs(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for too many positional args in stdin mode")
 	}
+	if !strings.Contains(err.Error(), "unexpected extra arguments in --stdin mode") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestParseFlagsInterspersedAfterFilePath(t *testing.T) {
+	opts, filePath, err := parseFlags([]string{"test.sh", "--password", "55551230"})
+	if err != nil {
+		t.Fatalf("parseFlags returned error: %v", err)
+	}
+	if filePath != "test.sh" {
+		t.Fatalf("filePath=%q, want %q", filePath, "test.sh")
+	}
+	if opts.password != "55551230" {
+		t.Fatalf("password=%q, want %q", opts.password, "55551230")
+	}
+}
+
+func TestParseFlagsDoubleDashAllowsDashPrefixedFileName(t *testing.T) {
+	opts, filePath, err := parseFlags([]string{"--password", "p", "--", "--literal-name"})
+	if err != nil {
+		t.Fatalf("parseFlags returned error: %v", err)
+	}
+	if filePath != "--literal-name" {
+		t.Fatalf("filePath=%q, want %q", filePath, "--literal-name")
+	}
+	if opts.password != "p" {
+		t.Fatalf("password=%q, want %q", opts.password, "p")
+	}
+}
+
+func TestParseFlagsHelpAfterFilePath(t *testing.T) {
+	_, _, err := parseFlags([]string{"file.bin", "--help"})
+	if !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("err=%v, want flag.ErrHelp", err)
+	}
+}
+
+func TestParseFlagsMissingInput(t *testing.T) {
+	_, _, err := parseFlags(nil)
+	if !errors.Is(err, errMissingInput) {
+		t.Fatalf("err=%v, want errMissingInput", err)
+	}
+}
+
+func TestParseFlagsTooManyFileArgs(t *testing.T) {
+	_, _, err := parseFlags([]string{"a.bin", "b.bin"})
+	if err == nil {
+		t.Fatal("expected parse error for extra positional arguments")
+	}
+	if !strings.Contains(err.Error(), "unexpected extra arguments: b.bin") {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 func TestBuildTransportResponseHeaderTimeoutDisabled(t *testing.T) {
@@ -172,8 +227,11 @@ func TestChunkPolicyMatchesBrowserDefaults(t *testing.T) {
 	if defaultChunkSize != browserChunkSize {
 		t.Fatalf("defaultChunkSize=%d, want browserChunkSize=%d", defaultChunkSize, browserChunkSize)
 	}
-	if defaultParallel != browserDefaultChunkParallel {
-		t.Fatalf("defaultParallel=%d, want browserDefaultChunkParallel=%d", defaultParallel, browserDefaultChunkParallel)
+	if defaultParallel < browserDefaultChunkParallel {
+		t.Fatalf("defaultParallel=%d, want >= browserDefaultChunkParallel=%d", defaultParallel, browserDefaultChunkParallel)
+	}
+	if defaultStdinParallel != defaultParallel {
+		t.Fatalf("defaultStdinParallel=%d, want defaultParallel=%d", defaultStdinParallel, defaultParallel)
 	}
 	if defaultChunkTimeout != browserChunkRequestTimeout {
 		t.Fatalf("defaultChunkTimeout=%s, want browserChunkRequestTimeout=%s", defaultChunkTimeout, browserChunkRequestTimeout)

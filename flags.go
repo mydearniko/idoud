@@ -10,6 +10,8 @@ import (
 	"strings"
 )
 
+var errMissingInput = errors.New("missing input: pass a file path or use --stdin")
+
 func parseFlags(args []string) (options, string, error) {
 	opts := options{}
 
@@ -46,7 +48,8 @@ func parseFlags(args []string) (options, string, error) {
 	fs.BoolVar(&opts.verbose, "verbose", false, "print retry and finalization logs")
 	fs.BoolVar(&opts.debug, "debug", false, "enable verbose live upload debug stats")
 
-	if err := fs.Parse(args); err != nil {
+	normalizedArgs := normalizeInterspersedArgs(fs, args)
+	if err := fs.Parse(normalizedArgs); err != nil {
 		return options{}, "", err
 	}
 
@@ -155,7 +158,7 @@ func parseFlags(args []string) (options, string, error) {
 			opts.nameOverride = fs.Arg(0)
 			return opts, "", nil
 		default:
-			return options{}, "", errors.New("expected at most one stdin filename argument with --stdin")
+			return options{}, "", fmt.Errorf("unexpected extra arguments in --stdin mode: %s", strings.Join(fs.Args()[1:], ", "))
 		}
 	}
 
@@ -163,41 +166,155 @@ func parseFlags(args []string) (options, string, error) {
 		return options{}, "", errors.New("--stdin-size can only be used with --stdin")
 	}
 
-	if fs.NArg() != 1 {
-		return options{}, "", errors.New("expected exactly one file path or --stdin")
+	if fs.NArg() == 0 {
+		return options{}, "", errMissingInput
+	}
+	if fs.NArg() > 1 {
+		return options{}, "", fmt.Errorf("unexpected extra arguments: %s", strings.Join(fs.Args()[1:], ", "))
 	}
 	return opts, fs.Arg(0), nil
 }
 
+func normalizeInterspersedArgs(fs *flag.FlagSet, args []string) []string {
+	if len(args) < 2 {
+		return args
+	}
+
+	valueFlags := make(map[string]struct{}, 16)
+	fs.VisitAll(func(f *flag.Flag) {
+		if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+			return
+		}
+		valueFlags[f.Name] = struct{}{}
+	})
+
+	flagTokens := make([]string, 0, len(args))
+	positionals := make([]string, 0, len(args))
+	stopParsingFlags := false
+
+	for idx := 0; idx < len(args); idx++ {
+		token := args[idx]
+		if stopParsingFlags {
+			positionals = append(positionals, token)
+			continue
+		}
+		if token == "--" {
+			stopParsingFlags = true
+			continue
+		}
+		if len(token) <= 1 || !strings.HasPrefix(token, "-") {
+			positionals = append(positionals, token)
+			continue
+		}
+
+		flagTokens = append(flagTokens, token)
+		name, hasInlineValue := splitFlagToken(token)
+		if hasInlineValue {
+			continue
+		}
+		if _, needsValue := valueFlags[name]; needsValue && idx+1 < len(args) {
+			idx++
+			flagTokens = append(flagTokens, args[idx])
+		}
+	}
+
+	normalized := make([]string, 0, len(flagTokens)+len(positionals))
+	normalized = append(normalized, flagTokens...)
+	if len(positionals) > 0 {
+		normalized = append(normalized, "--")
+		normalized = append(normalized, positionals...)
+	}
+	return normalized
+}
+
+func splitFlagToken(token string) (string, bool) {
+	name := strings.TrimLeft(token, "-")
+	if name == "" {
+		return "", false
+	}
+	if eq := strings.IndexByte(name, '='); eq >= 0 {
+		return name[:eq], true
+	}
+	return name, false
+}
+
 func usageText() string {
 	return strings.TrimSpace(`
-idoud CLI uploader
+IDOUD CLI
+  Fast chunked uploader for idoud.
 
-Usage:
+USAGE
   idoud [flags] <file>
+  idoud <file> [flags]
   idoud --stdin [--name <filename> | <filename>] [flags]
 
-Examples:
+QUICK START
   idoud archive.zip
+  idoud archive.zip --password 55551230
   cat archive.zip | idoud --stdin --name archive.zip
-  cat archive.zip | idoud --stdin archive.zip
   idoud --server https://s1.example,https://s2.example archive.zip
 
-Core flags:
-  --server        idoud server origin or comma-separated origins (default: https://idoud.cc)
-  --stdin         read file data from stdin
-  --stdin-size    known stdin size hint for stdin uploads
-  --name          override upload file name
-  --chunk-size    chunk size for range uploads (must be 3145728 bytes / 3MiB)
-  --parallel      parallel non-final chunk uploads (default: 192)
-  --subdomains    force upload subdomain pool size (uses 0..N-1 on idoud domains)
-  --ips           force chunk upload destination IPs (comma-separated)
-  --no-ipv6       disable IPv6 and force IPv4-only connections
-  --no-subdomains disable numbered subdomain upload routing (alias: --nosub)
-  --speedtest     benchmark ingest path using server-side sink mode
-  --retries       retries per chunk (default: 6)
-  --hedge-delay   delay before speculative duplicate upload for slow non-final chunks (default: 0s, disabled)
-  --debug         print live chunk concurrency and throughput stats to stderr
+INPUT
+  --stdin
+      Read payload from stdin instead of a file path.
+  --stdin-size <size>
+      Known stdin size hint (only valid with --stdin).
+  --name <filename>
+      Override upload filename.
+
+ROUTING
+  --server <url[,url...]>
+      One origin or a comma-separated origin list.
+  --subdomains <n>
+      Force upload subdomains 0..N-1 on idoud domains.
+  --no-subdomains, --nosub
+      Disable numbered subdomain routing.
+  --ips <ip[,ip...]>
+      Pin chunk uploads to destination IPs (round-robin).
+  --no-ipv6
+      Force IPv4-only networking.
+
+UPLOAD TUNING
+  --chunk-size <size>
+      Must be exactly 3145728 bytes (3 MiB).
+  --parallel <n>
+      Parallel non-final chunk uploads (default: 192).
+  --retries <n>
+      Retries per failed chunk (default: 6).
+  --hedge-delay <dur>
+      Delay before speculative duplicate upload for slow chunks.
+  --request-timeout <dur>
+      Timeout for non-final chunk requests.
+  --final-request-timeout <dur>
+      Timeout for the final chunk request.
+  --finalize-recovery-timeout <dur>
+      Readiness wait after uncertain final chunk result.
+  --finalize-poll-interval <dur>
+      Poll interval while waiting for finalization.
+  --finalize-timeout <dur>
+      Maximum total finalization wait.
+
+SECURITY AND LIMITS
+  --password <value>
+      Set upload password.
+  --download-limit <n>
+      Set download limit.
+  --upload-key <value>
+      Explicit upload key (default: random).
+  --insecure
+      Skip TLS certificate verification.
+
+DIAGNOSTICS
+  --speedtest
+      Benchmark ingest path without persisted output.
+  --verbose
+      Print retry/finalization logs.
+  --debug
+      Print live chunk concurrency and throughput stats.
+
+HELP
+  -h, --help
+      Show this help and exit.
 `)
 }
 

@@ -2,15 +2,26 @@ package main
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"net/http"
 	"os"
 )
 
 func main() {
+	if len(os.Args) == 1 {
+		fmt.Println(usageText())
+		os.Exit(0)
+	}
+
 	opts, filePath, err := parseFlags(os.Args[1:])
 	if err != nil {
-		stderrWritef("error: %v\n\n%s\n", err, usageText())
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Println(usageText())
+			os.Exit(0)
+		}
+		printUsageError(err)
 		os.Exit(2)
 	}
 
@@ -47,6 +58,16 @@ func main() {
 	}
 
 	fmt.Println(finalURL)
+}
+
+func printUsageError(err error) {
+	stderrWritef("error: %v", err)
+	switch {
+	case errors.Is(err, errMissingInput):
+		stderrWritef("hint: pass a file path (idoud <file>) or use stdin mode (cat <file> | idoud --stdin --name <filename>)")
+	default:
+		stderrWritef("hint: run `idoud --help` for full usage")
+	}
 }
 
 func buildChunkClients(opts options) []*http.Client {
