@@ -545,7 +545,10 @@ func (u *uploader) requestFinalizeUpload(ctx context.Context, fileID string, wai
 
 	resp, err := u.client.Do(req)
 	if err != nil {
-		if isContextErr(err) {
+		if shouldFailFinalizeProbe(ctx, err) {
+			if ctx != nil && ctx.Err() != nil {
+				return false, false, "", ctx.Err()
+			}
 			return false, false, "", err
 		}
 		// Network/API blips can happen while finalization is still in progress.
@@ -579,7 +582,10 @@ func (u *uploader) probeMetadata(ctx context.Context, fileID string, wait time.D
 
 	resp, err := u.client.Do(req)
 	if err != nil {
-		if isContextErr(err) {
+		if shouldFailFinalizeProbe(ctx, err) {
+			if ctx != nil && ctx.Err() != nil {
+				return false, false, ctx.Err()
+			}
 			return false, false, err
 		}
 		return false, false, nil
@@ -624,7 +630,10 @@ func (u *uploader) probeHead(ctx context.Context, publicURL string) (ready bool,
 
 	resp, err := u.client.Do(req)
 	if err != nil {
-		if isContextErr(err) {
+		if shouldFailFinalizeProbe(ctx, err) {
+			if ctx != nil && ctx.Err() != nil {
+				return false, false, ctx.Err()
+			}
 			return false, false, err
 		}
 		return false, false, nil
@@ -639,4 +648,20 @@ func (u *uploader) probeHead(ctx context.Context, publicURL string) (ready bool,
 	default:
 		return false, true, nil
 	}
+}
+
+func shouldFailFinalizeProbe(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if ctx == nil {
+		return isContextErr(err)
+	}
+	ctxErr := ctx.Err()
+	if ctxErr == nil {
+		return false
+	}
+	// Caller cancellation should abort immediately. Deadline expiry is handled
+	// by the wait loop as a regular finalization timeout.
+	return errors.Is(ctxErr, context.Canceled)
 }
