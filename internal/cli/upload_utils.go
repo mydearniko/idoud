@@ -310,6 +310,24 @@ func buildMetadataURLWithWait(base *url.URL, fileID string, wait time.Duration) 
 	return u.String()
 }
 
+func buildFinalizeURLWithWait(base *url.URL, fileID string, wait time.Duration) string {
+	u := *base
+	u.RawQuery = ""
+	u.Fragment = ""
+	path := strings.TrimSuffix(u.Path, "/")
+	u.Path = path + "/v1/uploads/" + url.PathEscape(fileID) + "/finalize"
+	if wait > 0 {
+		waitValue := wait / time.Millisecond
+		if waitValue > 0 {
+			q := u.Query()
+			q.Set("wait_ms", strconv.FormatInt(int64(waitValue), 10))
+			u.RawQuery = q.Encode()
+		}
+	}
+	u.RawPath = ""
+	return u.String()
+}
+
 func normalizeServerURL(raw string) (*url.URL, error) {
 	value := strings.TrimSpace(raw)
 	if value == "" {
@@ -452,6 +470,22 @@ func avgFloat64(values []float64) float64 {
 	return sum / float64(len(values))
 }
 
+func avgRateWindow(values []float64, windowSize int) float64 {
+	if windowSize <= 0 || len(values) == 0 {
+		return 0
+	}
+	sum := 0.0
+	for _, v := range values {
+		if v <= 0 || math.IsNaN(v) || math.IsInf(v, 0) {
+			continue
+		}
+		sum += v
+	}
+	// Keep "avg7" semantics true even during startup by zero-filling
+	// missing samples until the rate window is full.
+	return sum / float64(windowSize)
+}
+
 func formatByteSizeFloat(value float64) string {
 	if !isFinitePositive(value) {
 		return "0B"
@@ -559,10 +593,12 @@ func isShortID(s string) bool {
 	return true
 }
 
-func isRetryableStatus(status int, err error) bool {
+func isRetryableStatus(ctx context.Context, status int, err error) bool {
 	if err != nil {
 		if isContextErr(err) {
-			return false
+			// Retry attempt-scoped request timeouts (reqCtx deadline exceeded),
+			// but never retry once the parent upload context is canceled.
+			return ctx == nil || ctx.Err() == nil
 		}
 		if status == 0 {
 			return true
@@ -587,7 +623,7 @@ func statusMayStillFinalize(status int) bool {
 
 func finalizationUncertainStatus(status int) bool {
 	switch status {
-	case 0, 409, 429, 504:
+	case 0, 409, 425, 429, 504, 524:
 		return true
 	default:
 		return false
