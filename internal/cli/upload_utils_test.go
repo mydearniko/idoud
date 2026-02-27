@@ -1,6 +1,9 @@
 package cli
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestAvgRateWindow(t *testing.T) {
 	t.Run("empty window", func(t *testing.T) {
@@ -27,6 +30,25 @@ func TestAvgRateWindow(t *testing.T) {
 		want := 700.0
 		if got != want {
 			t.Fatalf("avgRateWindow(full) = %v, want %v", got, want)
+		}
+	})
+}
+
+func TestIsRetryableStatus(t *testing.T) {
+	t.Run("attempt timeout is retryable while parent context is active", func(t *testing.T) {
+		err := &requestError{cause: context.DeadlineExceeded}
+		if !isRetryableStatus(context.Background(), 0, err) {
+			t.Fatal("isRetryableStatus returned false, want true")
+		}
+	})
+
+	t.Run("parent canceled context is not retryable", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		err := &requestError{cause: context.DeadlineExceeded}
+		if isRetryableStatus(ctx, 0, err) {
+			t.Fatal("isRetryableStatus returned true, want false")
 		}
 	})
 }

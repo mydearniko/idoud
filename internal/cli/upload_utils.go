@@ -593,10 +593,12 @@ func isShortID(s string) bool {
 	return true
 }
 
-func isRetryableStatus(status int, err error) bool {
+func isRetryableStatus(ctx context.Context, status int, err error) bool {
 	if err != nil {
 		if isContextErr(err) {
-			return false
+			// Retry attempt-scoped request timeouts (reqCtx deadline exceeded),
+			// but never retry once the parent upload context is canceled.
+			return ctx == nil || ctx.Err() == nil
 		}
 		if status == 0 {
 			return true

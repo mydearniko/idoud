@@ -120,7 +120,7 @@ func (u *uploader) uploadEmptyWithRetry(ctx context.Context, src *sourceFile, ur
 		}
 		lastErr = err
 
-		if !isRetryableStatus(status, err) || attempt >= u.opts.retries {
+		if !isRetryableStatus(ctx, status, err) || attempt >= u.opts.retries {
 			break
 		}
 
@@ -246,7 +246,7 @@ func (u *uploader) retryChunkUpload(
 			}
 		}
 
-		if !isRetryableStatus(status, err) || attempt >= u.opts.retries {
+		if !isRetryableStatus(ctx, status, err) || attempt >= u.opts.retries {
 			break
 		}
 
