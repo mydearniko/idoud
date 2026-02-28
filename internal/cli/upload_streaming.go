@@ -45,7 +45,7 @@ func (u *uploader) uploadKnownSizeStreamChunked(ctx context.Context, src *source
 		workers = int(nonFinal)
 	}
 
-	bufferCount := streamBufferPoolCount(workers)
+	bufferCount := streamBufferPoolCount(workers, u.opts.chunkSize)
 	streamReader := src.stream
 
 	pool := make(chan []byte, bufferCount)
@@ -425,7 +425,7 @@ func (u *uploader) uploadUnknownSizeStreamChunked(ctx context.Context, src *sour
 	if workers < 1 {
 		workers = 1
 	}
-	bufferCount := streamBufferPoolCount(workers)
+	bufferCount := streamBufferPoolCount(workers, u.opts.chunkSize)
 
 	pool := make(chan []byte, bufferCount)
 	for i := 0; i < bufferCount; i++ {
@@ -572,21 +572,4 @@ drainLoop:
 	}
 	u.logf("upload(stream-unknown) complete url=%s", finalURL)
 	return finalURL, nil
-}
-
-func streamBufferPoolCount(workers int) int {
-	if workers < 0 {
-		workers = 0
-	}
-	// Enough buffers for all in-flight workers plus moderate readahead.
-	// At 3 MiB per buffer, cap at 480 (~1440 MiB) to stay within the
-	// 1500 MiB upload memory budget.
-	n := workers + workers/3 + 8
-	if n < 4 {
-		n = 4
-	}
-	if n > 480 {
-		n = 480
-	}
-	return n
 }
