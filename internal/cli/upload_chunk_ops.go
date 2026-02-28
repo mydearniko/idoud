@@ -377,7 +377,7 @@ func (u *uploader) newUploadPUTRequest(ctx context.Context, src *sourceFile, bod
 		}
 		return req.WithContext(ctx), nil
 	}
-	return http.NewRequestWithContext(ctx, http.MethodPut, u.routeUploadURL(targetURL), body)
+	return http.NewRequestWithContext(ctx, http.MethodPut, u.routeUploadURLParsed(targetURL, targetParsed), body)
 }
 
 func (u *uploader) uploadChunkOnce(ctx context.Context, src *sourceFile, chunkIndex int64, finalChunk bool) (string, int, error) {

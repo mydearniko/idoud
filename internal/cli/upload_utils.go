@@ -202,27 +202,39 @@ func shouldUseBrowserSubdomains(base *url.URL, disabled bool) bool {
 }
 
 func buildSubdomainUploadURL(rawURL string, index int) string {
+	return buildSubdomainUploadURLParsed(rawURL, nil, index)
+}
+
+func buildSubdomainUploadURLParsed(rawURL string, parsed *url.URL, index int) string {
 	if index < 0 {
 		return rawURL
 	}
-	parsed, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil || parsed == nil || parsed.Host == "" {
-		return rawURL
+	if parsed == nil || parsed.Host == "" {
+		var err error
+		parsed, err = url.Parse(strings.TrimSpace(rawURL))
+		if err != nil || parsed == nil || parsed.Host == "" {
+			return rawURL
+		}
 	}
+	rewritten := *parsed
 	host := fmt.Sprintf("%d.%s", index, browserUploadDomain)
 	if port := parsed.Port(); port != "" {
-		parsed.Host = host + ":" + port
+		rewritten.Host = host + ":" + port
 	} else {
-		parsed.Host = host
+		rewritten.Host = host
 	}
-	return parsed.String()
+	return rewritten.String()
 }
 
 func (u *uploader) routeUploadURL(rawURL string) string {
+	return u.routeUploadURLParsed(rawURL, nil)
+}
+
+func (u *uploader) routeUploadURLParsed(rawURL string, parsed *url.URL) string {
 	if u == nil || u.subdomains == nil {
 		return rawURL
 	}
-	return buildSubdomainUploadURL(rawURL, u.subdomains.acquire())
+	return buildSubdomainUploadURLParsed(rawURL, parsed, u.subdomains.acquire())
 }
 
 func (u *uploader) warmConnections(ctx context.Context, count int) {
