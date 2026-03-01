@@ -201,10 +201,6 @@ func shouldUseBrowserSubdomains(base *url.URL, disabled bool) bool {
 	return strings.HasSuffix(host, "."+browserUploadDomain)
 }
 
-func buildSubdomainUploadURL(rawURL string, index int) string {
-	return buildSubdomainUploadURLParsed(rawURL, nil, index)
-}
-
 func buildSubdomainUploadURLParsed(rawURL string, parsed *url.URL, index int) string {
 	if index < 0 {
 		return rawURL
@@ -276,14 +272,25 @@ func (u *uploader) warmConnections(ctx context.Context, count int) {
 	wg.Wait()
 }
 
-func buildUploadURL(base *url.URL, filename string) string {
+func buildAPIURL(base *url.URL, pathSuffix string, waitQueryKey string, wait time.Duration) string {
 	u := *base
 	u.RawQuery = ""
 	u.Fragment = ""
-	path := strings.TrimSuffix(u.Path, "/")
-	u.Path = path + "/" + url.PathEscape(filename)
+	u.Path = strings.TrimSuffix(u.Path, "/") + pathSuffix
 	u.RawPath = ""
+	if waitQueryKey != "" && wait > 0 {
+		waitValue := wait / time.Millisecond
+		if waitValue > 0 {
+			q := u.Query()
+			q.Set(waitQueryKey, strconv.FormatInt(int64(waitValue), 10))
+			u.RawQuery = q.Encode()
+		}
+	}
 	return u.String()
+}
+
+func buildUploadURL(base *url.URL, filename string) string {
+	return buildAPIURL(base, "/"+url.PathEscape(filename), "", 0)
 }
 
 func cloneURL(in *url.URL) *url.URL {
@@ -295,49 +302,11 @@ func cloneURL(in *url.URL) *url.URL {
 }
 
 func buildSpeedtestUploadURL(base *url.URL, filename string) string {
-	u := *base
-	u.RawQuery = ""
-	u.Fragment = ""
-	path := strings.TrimSuffix(u.Path, "/")
-	u.Path = path + "/v1/speedtest/" + url.PathEscape(filename)
-	u.RawPath = ""
-	return u.String()
-}
-
-func buildMetadataURLWithWait(base *url.URL, fileID string, wait time.Duration) string {
-	u := *base
-	u.RawQuery = ""
-	u.Fragment = ""
-	path := strings.TrimSuffix(u.Path, "/")
-	u.Path = path + "/v1/files/" + url.PathEscape(fileID)
-	if wait > 0 {
-		waitValue := wait / time.Millisecond
-		if waitValue > 0 {
-			q := u.Query()
-			q.Set("wait_ready_ms", strconv.FormatInt(int64(waitValue), 10))
-			u.RawQuery = q.Encode()
-		}
-	}
-	u.RawPath = ""
-	return u.String()
+	return buildAPIURL(base, "/v1/speedtest/"+url.PathEscape(filename), "", 0)
 }
 
 func buildFinalizeURLWithWait(base *url.URL, fileID string, wait time.Duration) string {
-	u := *base
-	u.RawQuery = ""
-	u.Fragment = ""
-	path := strings.TrimSuffix(u.Path, "/")
-	u.Path = path + "/v1/uploads/" + url.PathEscape(fileID) + "/finalize"
-	if wait > 0 {
-		waitValue := wait / time.Millisecond
-		if waitValue > 0 {
-			q := u.Query()
-			q.Set("wait_ms", strconv.FormatInt(int64(waitValue), 10))
-			u.RawQuery = q.Encode()
-		}
-	}
-	u.RawPath = ""
-	return u.String()
+	return buildAPIURL(base, "/v1/uploads/"+url.PathEscape(fileID)+"/finalize", "wait_ms", wait)
 }
 
 func normalizeServerURL(raw string) (*url.URL, error) {
@@ -469,17 +438,6 @@ func pushRate(window []float64, value float64, max int) []float64 {
 	copy(window, window[1:])
 	window[len(window)-1] = value
 	return window
-}
-
-func avgFloat64(values []float64) float64 {
-	if len(values) == 0 {
-		return 0
-	}
-	sum := 0.0
-	for _, v := range values {
-		sum += v
-	}
-	return sum / float64(len(values))
 }
 
 func avgRateWindow(values []float64, windowSize int) float64 {

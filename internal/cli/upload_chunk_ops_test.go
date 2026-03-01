@@ -49,23 +49,6 @@ func TestRequestFinalizeUploadIgnoresTransientProbeTimeout(t *testing.T) {
 	}
 }
 
-func TestProbeMetadataIgnoresTransientProbeTimeout(t *testing.T) {
-	u := newFinalizeTestUploader(func(*http.Request) (*http.Response, error) {
-		return nil, context.DeadlineExceeded
-	})
-
-	ready, failed, err := u.probeMetadata(context.Background(), "AbC123", 30*time.Millisecond)
-	if err != nil {
-		t.Fatalf("probeMetadata error = %v, want nil", err)
-	}
-	if ready {
-		t.Fatal("probeMetadata ready=true, want false")
-	}
-	if failed {
-		t.Fatal("probeMetadata failed=true, want false")
-	}
-}
-
 func TestRequestFinalizeUploadPropagatesCallerCancel(t *testing.T) {
 	u := newFinalizeTestUploader(func(req *http.Request) (*http.Response, error) {
 		return nil, req.Context().Err()

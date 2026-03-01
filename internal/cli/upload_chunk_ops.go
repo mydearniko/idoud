@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -565,56 +564,6 @@ func (u *uploader) requestFinalizeUpload(ctx context.Context, fileID string, wai
 		return false, false, "", nil
 	default:
 		return false, true, "", nil
-	}
-}
-
-func (u *uploader) probeMetadata(ctx context.Context, fileID string, wait time.Duration) (ready bool, failed bool, err error) {
-	endpoint := buildMetadataURLWithWait(u.opts.serverBase, fileID, wait)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return false, false, err
-	}
-	req.Header.Set(headerCacheControl, cacheControlNoStoreNoCache)
-	if u.opts.password != "" {
-		req.Header.Set(headerDownloadPassword, u.opts.password)
-	}
-
-	resp, err := u.client.Do(req)
-	if err != nil {
-		if shouldFailFinalizeProbe(ctx, err) {
-			if ctx != nil && ctx.Err() != nil {
-				return false, false, ctx.Err()
-			}
-			return false, false, err
-		}
-		return false, false, nil
-	}
-	defer resp.Body.Close()
-
-	switch {
-	case resp.StatusCode == http.StatusOK:
-		var payload fileMetadataPayload
-		if decodeErr := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBodyBytes)).Decode(&payload); decodeErr != nil {
-			return false, false, nil
-		}
-		switch payload.Status {
-		case 1:
-			return true, false, nil
-		case 2:
-			return false, true, nil
-		default:
-			if u.opts.debug && payload.TotalBytes > 0 {
-				pct := float64(payload.UploadedBytes) / float64(payload.TotalBytes) * 100
-				stderrLogf("finalize_progress file=%s stored=%s/%s (%.1f%%)",
-					fileID, formatByteSize(payload.UploadedBytes), formatByteSize(payload.TotalBytes), pct)
-			}
-			return false, false, nil
-		}
-	case statusMayStillFinalize(resp.StatusCode):
-		return false, false, nil
-	default:
-		return false, true, nil
 	}
 }
 

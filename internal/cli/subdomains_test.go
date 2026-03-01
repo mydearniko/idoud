@@ -86,9 +86,9 @@ func TestBuildSubdomainUploadURL(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildSubdomainUploadURL(tc.raw, tc.index)
+			got := buildSubdomainUploadURLParsed(tc.raw, nil, tc.index)
 			if got != tc.want {
-				t.Fatalf("buildSubdomainUploadURL(%q, %d)=%q, want %q", tc.raw, tc.index, got, tc.want)
+				t.Fatalf("buildSubdomainUploadURLParsed(%q, %d)=%q, want %q", tc.raw, tc.index, got, tc.want)
 			}
 		})
 	}
