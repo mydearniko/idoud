@@ -70,7 +70,7 @@ func (u *uploader) uploadKnownSizeStreamChunked(ctx context.Context, src *source
 				}
 				return
 			}
-			err := u.uploadPreparedChunkWithRetry(ctx, src, task, false, urls)
+			err := u.uploadPreparedChunkWithRetryMode(ctx, src, task, false, urls, "stream", u.uploadPreparedChunkUnknownOnce)
 			select {
 			case pool <- task.buf:
 			case <-ctx.Done():
@@ -195,7 +195,7 @@ readLoop:
 	}
 	u.debugMarkStdinClosed(false)
 
-	finalErr := u.uploadPreparedChunkWithRetry(ctx, src, *finalTask, true, urls)
+	finalErr := u.uploadPreparedChunkWithRetryMode(ctx, src, *finalTask, true, urls, "stream", u.uploadPreparedChunkUnknownOnce)
 	select {
 	case pool <- finalTask.buf:
 	default:
@@ -210,14 +210,6 @@ readLoop:
 	}
 	u.logf("upload(stream) complete url=%s", finalURL)
 	return finalURL, nil
-}
-
-func (u *uploader) uploadPreparedChunkWithRetry(ctx context.Context, src *sourceFile, chunk preparedChunk, finalChunk bool, urls *urlCapture) error {
-	return u.uploadPreparedChunkWithRetryMode(ctx, src, chunk, finalChunk, urls, "stream", u.uploadPreparedChunkUnknownOnce)
-}
-
-func (u *uploader) uploadPreparedChunkUnknownWithRetry(ctx context.Context, src *sourceFile, chunk preparedChunk, finalChunk bool, urls *urlCapture) error {
-	return u.uploadPreparedChunkWithRetryMode(ctx, src, chunk, finalChunk, urls, "stream-unknown", u.uploadPreparedChunkUnknownOnce)
 }
 
 func (u *uploader) uploadPreparedChunkWithRetryMode(
@@ -463,7 +455,7 @@ func (u *uploader) uploadUnknownSizeStreamChunked(ctx context.Context, src *sour
 				putBuf(task.buf)
 				return
 			}
-			err := u.uploadPreparedChunkUnknownWithRetry(ctx, src, task, false, urls)
+			err := u.uploadPreparedChunkWithRetryMode(ctx, src, task, false, urls, "stream-unknown", u.uploadPreparedChunkUnknownOnce)
 			putBuf(task.buf)
 			if err != nil {
 				select {
@@ -484,6 +476,11 @@ func (u *uploader) uploadUnknownSizeStreamChunked(ctx context.Context, src *sour
 	// to workers, hold the final chunk for special handling.
 	var finalChunk *preparedChunk
 	var readErr error
+	defer func() {
+		if finalChunk != nil {
+			putBuf(finalChunk.buf)
+		}
+	}()
 
 drainLoop:
 	for res := range chunkCh {
@@ -528,22 +525,13 @@ drainLoop:
 
 	select {
 	case err := <-errCh:
-		if finalChunk != nil {
-			putBuf(finalChunk.buf)
-		}
 		return "", err
 	default:
 	}
 	if readErr != nil {
-		if finalChunk != nil {
-			putBuf(finalChunk.buf)
-		}
 		return "", readErr
 	}
 	if ctx.Err() != nil {
-		if finalChunk != nil {
-			putBuf(finalChunk.buf)
-		}
 		return "", ctx.Err()
 	}
 
@@ -560,11 +548,12 @@ drainLoop:
 	}
 
 	// Upload the final chunk.
-	finalErr := u.uploadPreparedChunkUnknownWithRetry(ctx, src, *finalChunk, true, urls)
-	putBuf(finalChunk.buf)
+	finalErr := u.uploadPreparedChunkWithRetryMode(ctx, src, *finalChunk, true, urls, "stream-unknown", u.uploadPreparedChunkUnknownOnce)
 	if finalErr != nil {
 		return "", finalErr
 	}
+	putBuf(finalChunk.buf)
+	finalChunk = nil
 
 	finalURL := urls.get()
 	if err := u.finalizeIfNeeded(ctx, finalURL); err != nil {

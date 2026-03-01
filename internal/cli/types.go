@@ -174,9 +174,3 @@ type uploader struct {
 	subdomains   *uploadSubdomainPool
 	chunkIPs     *chunkOriginIPSet
 }
-
-type fileMetadataPayload struct {
-	Status        int   `json:"Status"`
-	UploadedBytes int64 `json:"UploadedBytes,omitempty"`
-	TotalBytes    int64 `json:"TotalBytes,omitempty"`
-}

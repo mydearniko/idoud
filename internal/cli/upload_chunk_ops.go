@@ -14,6 +14,45 @@ import (
 	"time"
 )
 
+func readTrimmedResponseBody(resp *http.Response, limit int64) string {
+	if resp == nil || resp.Body == nil {
+		return ""
+	}
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, limit))
+	return strings.TrimSpace(string(bodyBytes))
+}
+
+func (u *uploader) readUploadResponseBody(resp *http.Response) string {
+	started := time.Now()
+	body := readTrimmedResponseBody(resp, maxResponseBodyBytes)
+	u.debugResponseRead(time.Since(started))
+	return body
+}
+
+func newNoCacheRequest(ctx context.Context, method string, endpoint string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set(headerCacheControl, cacheControlNoStoreNoCache)
+	return req, nil
+}
+
+func (u *uploader) doFinalizeProbeRequest(ctx context.Context, req *http.Request) (*http.Response, bool, error) {
+	resp, err := u.client.Do(req)
+	if err == nil {
+		return resp, false, nil
+	}
+	if shouldFailFinalizeProbe(ctx, err) {
+		if ctx != nil && ctx.Err() != nil {
+			return nil, false, ctx.Err()
+		}
+		return nil, false, err
+	}
+	// Network/API blips can happen while finalization is still in progress.
+	return nil, true, nil
+}
+
 func (u *uploader) uploadNonFinalChunks(ctx context.Context, src *sourceFile, lastChunk int64, urls *urlCapture) error {
 	if lastChunk <= 0 {
 		return nil
@@ -337,19 +376,14 @@ func (u *uploader) uploadPUT(
 		if resp.ContentLength == 0 {
 			return "", resp.StatusCode, nil
 		}
-		respReadStarted := time.Now()
-		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
-		u.debugResponseRead(time.Since(respReadStarted))
-		if len(bodyBytes) == 0 {
+		respBody := u.readUploadResponseBody(resp)
+		if respBody == "" {
 			return "", resp.StatusCode, nil
 		}
-		return strings.TrimSpace(string(bodyBytes)), resp.StatusCode, nil
+		return respBody, resp.StatusCode, nil
 	}
 
-	respReadStarted := time.Now()
-	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
-	u.debugResponseRead(time.Since(respReadStarted))
-	respBody := strings.TrimSpace(string(bodyBytes))
+	respBody := u.readUploadResponseBody(resp)
 	return "", resp.StatusCode, &requestError{
 		status: resp.StatusCode,
 		body:   respBody,
@@ -533,29 +567,23 @@ func (u *uploader) requestFinalizeUpload(ctx context.Context, fileID string, wai
 		return false, false, "", nil
 	}
 	endpoint := buildFinalizeURLWithWait(u.opts.serverBase, fileID, wait)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+	req, err := newNoCacheRequest(ctx, http.MethodPost, endpoint)
 	if err != nil {
 		return false, false, "", err
 	}
-	req.Header.Set(headerCacheControl, cacheControlNoStoreNoCache)
 	if u.opts.uploadKey != "" {
 		req.Header.Set(headerUploadKey, u.opts.uploadKey)
 	}
 
-	resp, err := u.client.Do(req)
+	resp, transient, err := u.doFinalizeProbeRequest(ctx, req)
 	if err != nil {
-		if shouldFailFinalizeProbe(ctx, err) {
-			if ctx != nil && ctx.Err() != nil {
-				return false, false, "", ctx.Err()
-			}
-			return false, false, "", err
-		}
-		// Network/API blips can happen while finalization is still in progress.
+		return false, false, "", err
+	}
+	if transient {
 		return false, false, "", nil
 	}
 	defer resp.Body.Close()
-	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
-	bodyText := strings.TrimSpace(string(bodyBytes))
+	bodyText := readTrimmedResponseBody(resp, maxResponseBodyBytes)
 
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
@@ -568,23 +596,19 @@ func (u *uploader) requestFinalizeUpload(ctx context.Context, fileID string, wai
 }
 
 func (u *uploader) probeHead(ctx context.Context, publicURL string) (ready bool, failed bool, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, publicURL, nil)
+	req, err := newNoCacheRequest(ctx, http.MethodHead, publicURL)
 	if err != nil {
 		return false, false, err
 	}
-	req.Header.Set(headerCacheControl, cacheControlNoStoreNoCache)
 	if u.opts.password != "" {
 		req.Header.Set(headerDownloadPassword, u.opts.password)
 	}
 
-	resp, err := u.client.Do(req)
+	resp, transient, err := u.doFinalizeProbeRequest(ctx, req)
 	if err != nil {
-		if shouldFailFinalizeProbe(ctx, err) {
-			if ctx != nil && ctx.Err() != nil {
-				return false, false, ctx.Err()
-			}
-			return false, false, err
-		}
+		return false, false, err
+	}
+	if transient {
 		return false, false, nil
 	}
 	defer resp.Body.Close()

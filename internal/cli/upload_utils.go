@@ -18,6 +18,56 @@ import (
 	"time"
 )
 
+func chooseDialNetwork(network string, disableIPv6 bool) string {
+	dialNetwork := network
+	if dialNetwork == "" {
+		dialNetwork = "tcp"
+	}
+	if !disableIPv6 {
+		return dialNetwork
+	}
+	switch network {
+	case "", "tcp", "tcp4", "tcp6":
+		return "tcp4"
+	default:
+		return dialNetwork
+	}
+}
+
+func addrPort(addr string) string {
+	_, portPart, splitErr := net.SplitHostPort(addr)
+	if splitErr != nil || strings.TrimSpace(portPart) == "" {
+		return "443"
+	}
+	return portPart
+}
+
+func forcedDialAddr(addr string, forcedIP string) string {
+	if strings.TrimSpace(forcedIP) == "" {
+		return addr
+	}
+	return net.JoinHostPort(forcedIP, addrPort(addr))
+}
+
+func tlsServerNameFromAddr(addr string) string {
+	hostPart, _, splitErr := net.SplitHostPort(addr)
+	if splitErr != nil {
+		hostPart = addr
+	}
+	hostPart = strings.TrimPrefix(hostPart, "[")
+	hostPart = strings.TrimSuffix(hostPart, "]")
+	return hostPart
+}
+
+func setConnNoDelay(conn net.Conn) {
+	if tc, ok := conn.(*net.TCPConn); ok {
+		// Do NOT call SetWriteBuffer — explicit setsockopt disables
+		// TCP auto-tuning and is capped by wmem_max. Let the kernel
+		// auto-tune the send buffer (tcp_wmem max, typically 4-16 MiB).
+		_ = tc.SetNoDelay(true)
+	}
+}
+
 func buildTransport(insecure bool, disableIPv6 bool, parallel int, forcedIP string) *http.Transport {
 	conns := parallel
 	if conns < 8 {
@@ -29,34 +79,11 @@ func buildTransport(insecure bool, disableIPv6 bool, parallel int, forcedIP stri
 	}
 	t := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			dialNetwork := network
-			if dialNetwork == "" {
-				dialNetwork = "tcp"
-			}
-			if disableIPv6 {
-				switch network {
-				case "", "tcp", "tcp4", "tcp6":
-					dialNetwork = "tcp4"
-				}
-			}
-			dialAddr := addr
-			if forcedIP != "" {
-				_, portPart, splitErr := net.SplitHostPort(addr)
-				if splitErr != nil {
-					portPart = "443"
-				}
-				dialAddr = net.JoinHostPort(forcedIP, portPart)
-			}
-			conn, err := dialer.DialContext(ctx, dialNetwork, dialAddr)
+			conn, err := dialer.DialContext(ctx, chooseDialNetwork(network, disableIPv6), forcedDialAddr(addr, forcedIP))
 			if err != nil {
 				return nil, err
 			}
-			if tc, ok := conn.(*net.TCPConn); ok {
-				// Do NOT call SetWriteBuffer — explicit setsockopt disables
-				// TCP auto-tuning and is capped by wmem_max. Let the kernel
-				// auto-tune the send buffer (tcp_wmem max, typically 4-16 MiB).
-				_ = tc.SetNoDelay(true)
-			}
+			setConnNoDelay(conn)
 			return conn, nil
 		},
 		MaxIdleConns:        conns * 2,
@@ -87,35 +114,13 @@ func buildTransport(insecure bool, disableIPv6 bool, parallel int, forcedIP stri
 	// derived from the request host (addr), never from the forced dial IP.
 	if forcedIP != "" {
 		t.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			dialNetwork := network
-			if dialNetwork == "" {
-				dialNetwork = "tcp"
-			}
-			if disableIPv6 {
-				switch network {
-				case "", "tcp", "tcp4", "tcp6":
-					dialNetwork = "tcp4"
-				}
-			}
-			_, portPart, splitErr := net.SplitHostPort(addr)
-			if splitErr != nil {
-				portPart = "443"
-			}
-			dialAddr := net.JoinHostPort(forcedIP, portPart)
-			conn, err := dialer.DialContext(ctx, dialNetwork, dialAddr)
+			conn, err := dialer.DialContext(ctx, chooseDialNetwork(network, disableIPv6), forcedDialAddr(addr, forcedIP))
 			if err != nil {
 				return nil, err
 			}
-			if tc, ok := conn.(*net.TCPConn); ok {
-				_ = tc.SetNoDelay(true)
-			}
+			setConnNoDelay(conn)
 
-			hostPart, _, splitErr := net.SplitHostPort(addr)
-			if splitErr != nil {
-				hostPart = addr
-			}
-			hostPart = strings.TrimPrefix(hostPart, "[")
-			hostPart = strings.TrimSuffix(hostPart, "]")
+			hostPart := tlsServerNameFromAddr(addr)
 
 			cfg := &tls.Config{}
 			if t.TLSClientConfig != nil {

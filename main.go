@@ -6,8 +6,6 @@ import (
 	"github.com/mydearniko/idoud/internal/cli"
 )
 
-var version = "dev"
-
 func main() {
 	os.Exit(cli.Run(os.Args[1:]))
 }
