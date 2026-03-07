@@ -44,21 +44,6 @@ cd cli
 go build -o idoud .
 ```
 
-## Automated Releases
-
-Push a semver tag (`v*`) to publish binaries automatically through GitHub Actions + GoReleaser:
-
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-Current release matrix (optimized for speed / 99.9% coverage):
-
-- Linux: `amd64`, `arm64`, `arm`
-- macOS: `amd64`, `arm64`
-- Windows: `amd64`, `arm64`
-
 ## Usage
 
 ```bash
@@ -108,8 +93,8 @@ idoud --password "secret" --download-limit 3 archive.zip
 - Stdin uploads are streamed with bounded RAM using a chunk buffer pool.
 - For unknown stdin size, the CLI still uploads in parallel using chunked `Content-Range: bytes .../*` requests and marks only the last chunk with `X-Upload-Final: 1`.
 - `--output url` prints exactly one final URL to stdout on success.
-- `--output none` prints nothing to stdout on success.
 - `--output json` prints exactly one JSON document to stdout for success, `--help`, and CLI errors.
+- `--output none` prints nothing to stdout on success (i don't know why)
 - `--verbose` and `--debug` never write to stdout; they only write diagnostics to stderr.
 
 ## Automation Output Modes
@@ -119,16 +104,14 @@ idoud --password "secret" --download-limit 3 archive.zip
 For successful uploads, stdout contains exactly one line:
 
 ```text
-https://idoud.cc/AbC123
+https://idoud.cc/AbC123/file.bin
 ```
 
 Errors stay on stderr.
 
 ### `--output none`
 
-For successful uploads, stdout is empty.
-
-Useful when the caller only cares about the exit code.
+For successful uploads, stdout is empty. Useful when the caller only cares about the exit code.
 
 ### `--output json` / `--json`
 
