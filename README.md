@@ -96,6 +96,8 @@ idoud --password "secret" --download-limit 3 archive.zip
 - `--finalize-recovery-timeout` readiness wait after uncertain final chunk responses (default `95s`)
 - `--finalize-poll-interval` readiness poll interval (default `1.2s`)
 - `--finalize-timeout` max wait for server finalization (default `20m`)
+- `--output` stdout mode: `url` (default), `json`, `none`
+- `--json` shorthand for `--output json`
 - `--password` sets `X-Upload-Password`
 - `--download-limit` sets `X-Upload-Download-Limit`
 - `--insecure` skip TLS verification
@@ -105,4 +107,114 @@ idoud --password "secret" --download-limit 3 archive.zip
 
 - Stdin uploads are streamed with bounded RAM using a chunk buffer pool.
 - For unknown stdin size, the CLI still uploads in parallel using chunked `Content-Range: bytes .../*` requests and marks only the last chunk with `X-Upload-Final: 1`.
-- The final URL is printed to stdout on success.
+- `--output url` prints exactly one final URL to stdout on success.
+- `--output none` prints nothing to stdout on success.
+- `--output json` prints exactly one JSON document to stdout for success, `--help`, and CLI errors.
+- `--verbose` and `--debug` never write to stdout; they only write diagnostics to stderr.
+
+## Automation Output Modes
+
+### `--output url` (default)
+
+For successful uploads, stdout contains exactly one line:
+
+```text
+https://idoud.cc/AbC123
+```
+
+Errors stay on stderr.
+
+### `--output none`
+
+For successful uploads, stdout is empty.
+
+Useful when the caller only cares about the exit code.
+
+### `--output json` / `--json`
+
+Stdout contains exactly one JSON object and nothing else. This applies to:
+
+- successful uploads
+- `--help`
+- CLI usage/argument errors
+- input/open errors
+- upload/runtime errors
+
+#### JSON schema
+
+Top-level fields:
+
+- `schema_version` integer schema version, currently `1`
+- `ok` boolean success flag
+- `type` one of `result`, `help`, `error`
+- `exit_code` process exit code
+- `result` present only when `type=result`
+- `help` present only when `type=help`
+- `error` present only when `type=error`
+
+`result` fields:
+
+- `url` final public URL
+- `name` upload filename after CLI sanitization
+- `source` `file` or `stdin`
+- `known_size` whether the CLI knew the full input size before upload completion
+- `size` total size in bytes when known
+
+`error` fields:
+
+- `code` stable machine code:
+  - `usage_error`
+  - `input_error`
+  - `upload_failed`
+- `message` human-readable error string
+- `hint` optional human-readable recovery hint, currently used for usage errors
+
+#### JSON examples
+
+Success:
+
+```json
+{
+  "schema_version": 1,
+  "ok": true,
+  "type": "result",
+  "exit_code": 0,
+  "result": {
+    "url": "https://idoud.cc/AbC123",
+    "name": "archive.zip",
+    "source": "file",
+    "known_size": true,
+    "size": 123456
+  }
+}
+```
+
+Usage error:
+
+```json
+{
+  "schema_version": 1,
+  "ok": false,
+  "type": "error",
+  "exit_code": 2,
+  "error": {
+    "code": "usage_error",
+    "message": "missing input: pass a file path or use --stdin",
+    "hint": "pass a file path (idoud <file>) or use stdin mode (cat <file> | idoud --stdin --name <filename>)"
+  }
+}
+```
+
+Help:
+
+```json
+{
+  "schema_version": 1,
+  "ok": true,
+  "type": "help",
+  "exit_code": 0,
+  "help": {
+    "text": "IDOUD CLI\n..."
+  }
+}
+```

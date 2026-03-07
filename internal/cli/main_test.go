@@ -209,6 +209,50 @@ func TestParseFlagsStdinAutoTuneRespectsExplicit(t *testing.T) {
 	}
 }
 
+func TestParseFlagsOutputModeDefaultsToURL(t *testing.T) {
+	opts, _, err := parseFlags([]string{"file.bin"})
+	if err != nil {
+		t.Fatalf("parseFlags returned error: %v", err)
+	}
+	if opts.outputMode != outputModeURL {
+		t.Fatalf("outputMode=%q, want %q", opts.outputMode, outputModeURL)
+	}
+}
+
+func TestParseFlagsOutputModeJSON(t *testing.T) {
+	opts, _, err := parseFlags([]string{"--output", "json", "file.bin"})
+	if err != nil {
+		t.Fatalf("parseFlags returned error: %v", err)
+	}
+	if opts.outputMode != outputModeJSON {
+		t.Fatalf("outputMode=%q, want %q", opts.outputMode, outputModeJSON)
+	}
+}
+
+func TestParseFlagsJSONShorthand(t *testing.T) {
+	opts, _, err := parseFlags([]string{"--json", "file.bin"})
+	if err != nil {
+		t.Fatalf("parseFlags returned error: %v", err)
+	}
+	if opts.outputMode != outputModeJSON {
+		t.Fatalf("outputMode=%q, want %q", opts.outputMode, outputModeJSON)
+	}
+}
+
+func TestParseFlagsJSONRejectsConflictingOutputMode(t *testing.T) {
+	_, _, err := parseFlags([]string{"--json", "--output", "none", "file.bin"})
+	if err == nil {
+		t.Fatal("expected conflict error when combining --json with --output none")
+	}
+}
+
+func TestParseFlagsRejectsEmptyOutputMode(t *testing.T) {
+	_, _, err := parseFlags([]string{"--output=", "file.bin"})
+	if err == nil {
+		t.Fatal("expected parse error for empty --output value")
+	}
+}
+
 func TestParseFlagsParallelChunkSizeStrict(t *testing.T) {
 	_, _, err := parseFlags([]string{"--parallel", "2", "--chunk-size", "1MiB", "file.bin"})
 	if err == nil {
