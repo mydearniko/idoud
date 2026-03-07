@@ -64,6 +64,14 @@ const (
 
 var errFinalizeTimeout = errors.New("upload finalization timeout")
 
+type outputMode string
+
+const (
+	outputModeURL  outputMode = "url"
+	outputModeJSON outputMode = "json"
+	outputModeNone outputMode = "none"
+)
+
 type options struct {
 	serverURL            string
 	serverBase           *url.URL
@@ -88,6 +96,7 @@ type options struct {
 	noIPv6               bool
 	subdomains           int
 	noSubdomains         bool
+	outputMode           outputMode
 	speedtest            bool
 	verbose              bool
 	debug                bool

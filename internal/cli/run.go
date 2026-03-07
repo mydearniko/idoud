@@ -4,30 +4,32 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"fmt"
 	"net/http"
 )
 
 // Run executes the CLI flow and returns an exit code.
 func Run(args []string) int {
+	out := newPrimaryOutput(args)
+
 	if len(args) == 0 {
-		fmt.Println(usageText())
+		out.printHelp(usageText())
 		return 0
 	}
 
 	opts, filePath, err := parseFlags(args)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			fmt.Println(usageText())
+			out.printHelp(usageText())
 			return 0
 		}
-		printUsageError(err)
+		out.printUsageError(err)
 		return 2
 	}
+	out.mode = opts.outputMode
 
 	src, cleanup, err := openSource(filePath, opts)
 	if err != nil {
-		stderrLogf("error: %v", err)
+		out.printInputError(err)
 		return 1
 	}
 	defer cleanup()
@@ -53,22 +55,12 @@ func Run(args []string) int {
 
 	finalURL, err := u.upload(context.Background(), src)
 	if err != nil {
-		stderrLogf("upload failed: %v", err)
+		out.printUploadError(err)
 		return 1
 	}
 
-	fmt.Println(finalURL)
+	out.printSuccess(src, finalURL)
 	return 0
-}
-
-func printUsageError(err error) {
-	stderrWritef("error: %v", err)
-	switch {
-	case errors.Is(err, errMissingInput):
-		stderrWritef("hint: pass a file path (idoud <file>) or use stdin mode (cat <file> | idoud --stdin --name <filename>)")
-	default:
-		stderrWritef("hint: run `idoud --help` for full usage")
-	}
 }
 
 func buildChunkClients(opts options) []*http.Client {

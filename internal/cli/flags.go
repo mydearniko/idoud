@@ -21,32 +21,10 @@ func parseFlags(args []string) (options, string, error) {
 	chunkSizeRaw := strconv.FormatInt(defaultChunkSize, 10)
 	stdinSizeRaw := ""
 	ipsRaw := ""
+	outputRaw := unsetOutputModeValue
+	jsonOutput := false
 
-	fs.StringVar(&opts.serverURL, "server", defaultServerURL, "idoud server origin (or comma-separated origins)")
-	fs.BoolVar(&opts.stdin, "stdin", false, "read file data from stdin")
-	fs.StringVar(&stdinSizeRaw, "stdin-size", "", "stdin size hint for stdin uploads")
-	fs.StringVar(&opts.nameOverride, "name", "", "upload file name override")
-	fs.StringVar(&chunkSizeRaw, "chunk-size", strconv.FormatInt(defaultChunkSize, 10), "chunk size for Content-Range uploads")
-	fs.IntVar(&opts.parallel, "parallel", defaultParallel, "parallel chunk uploads (non-final chunks)")
-	fs.IntVar(&opts.retries, "retries", defaultRetries, "retry count per chunk")
-	fs.DurationVar(&opts.hedgeDelay, "hedge-delay", defaultHedgeDelay, "delay before speculative duplicate upload for slow non-final chunks (0 disables)")
-	fs.DurationVar(&opts.requestTimeout, "request-timeout", defaultChunkTimeout, "timeout per non-final chunk request")
-	fs.DurationVar(&opts.finalChunkTimeout, "final-request-timeout", defaultFinalChunkTimeout, "timeout for final chunk request")
-	fs.DurationVar(&opts.finalizeRecover, "finalize-recovery-timeout", defaultFinalizeRecover, "readiness wait after uncertain final chunk result")
-	fs.DurationVar(&opts.finalizeTimeout, "finalize-timeout", defaultFinalizeTimeout, "max total wait for server finalization")
-	fs.DurationVar(&opts.finalizePollInterval, "finalize-poll-interval", defaultFinalizePollInterval, "readiness poll interval")
-	fs.StringVar(&opts.password, "password", "", "upload password (sets X-Upload-Password)")
-	fs.Int64Var(&opts.downloadLimit, "download-limit", 0, "download limit (sets X-Upload-Download-Limit)")
-	fs.StringVar(&opts.uploadKey, "upload-key", "", "explicit upload key (default: random)")
-	fs.BoolVar(&opts.insecureTLS, "insecure", false, "skip TLS certificate verification")
-	fs.StringVar(&ipsRaw, "ips", "", "force chunk upload destination IPs (comma-separated)")
-	fs.BoolVar(&opts.noIPv6, "no-ipv6", false, "disable IPv6 and force IPv4-only connections")
-	fs.IntVar(&opts.subdomains, "subdomains", 0, "force upload subdomain pool size (uses 0..N-1 on idoud domains)")
-	fs.BoolVar(&opts.noSubdomains, "no-subdomains", false, "disable numbered subdomain upload routing")
-	fs.BoolVar(&opts.noSubdomains, "nosub", false, "alias for --no-subdomains")
-	fs.BoolVar(&opts.speedtest, "speedtest", false, "use server-side sink mode to benchmark ingest without backend storage writes")
-	fs.BoolVar(&opts.verbose, "verbose", false, "print retry and finalization logs")
-	fs.BoolVar(&opts.debug, "debug", false, "enable verbose live upload debug stats")
+	registerFlags(fs, &opts, &chunkSizeRaw, &stdinSizeRaw, &ipsRaw, &outputRaw, &jsonOutput)
 
 	normalizedArgs := normalizeInterspersedArgs(fs, args)
 	if err := fs.Parse(normalizedArgs); err != nil {
@@ -140,6 +118,21 @@ func parseFlags(args []string) (options, string, error) {
 	if opts.downloadLimit < 0 {
 		return options{}, "", errors.New("--download-limit must be >= 0")
 	}
+	if outputRaw != unsetOutputModeValue {
+		mode, parseErr := parseOutputMode(outputRaw)
+		if parseErr != nil {
+			return options{}, "", fmt.Errorf("invalid --output: %w", parseErr)
+		}
+		opts.outputMode = mode
+	} else {
+		opts.outputMode = outputModeURL
+	}
+	if jsonOutput {
+		if outputRaw != unsetOutputModeValue && opts.outputMode != outputModeJSON {
+			return options{}, "", fmt.Errorf("--json cannot be combined with --output=%s", opts.outputMode)
+		}
+		opts.outputMode = outputModeJSON
+	}
 	if opts.uploadKey == "" {
 		opts.uploadKey = randomUploadKey()
 	}
@@ -180,13 +173,7 @@ func normalizeInterspersedArgs(fs *flag.FlagSet, args []string) []string {
 		return args
 	}
 
-	valueFlags := make(map[string]struct{}, 16)
-	fs.VisitAll(func(f *flag.Flag) {
-		if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
-			return
-		}
-		valueFlags[f.Name] = struct{}{}
-	})
+	valueFlags := flagValueNames(fs)
 
 	flagTokens := make([]string, 0, len(args))
 	positionals := make([]string, 0, len(args))
@@ -225,6 +212,47 @@ func normalizeInterspersedArgs(fs *flag.FlagSet, args []string) []string {
 		normalized = append(normalized, positionals...)
 	}
 	return normalized
+}
+
+func registerFlags(fs *flag.FlagSet, opts *options, chunkSizeRaw, stdinSizeRaw, ipsRaw, outputRaw *string, jsonOutput *bool) {
+	fs.StringVar(&opts.serverURL, "server", defaultServerURL, "idoud server origin (or comma-separated origins)")
+	fs.BoolVar(&opts.stdin, "stdin", false, "read file data from stdin")
+	fs.StringVar(stdinSizeRaw, "stdin-size", "", "stdin size hint for stdin uploads")
+	fs.StringVar(&opts.nameOverride, "name", "", "upload file name override")
+	fs.StringVar(chunkSizeRaw, "chunk-size", strconv.FormatInt(defaultChunkSize, 10), "chunk size for Content-Range uploads")
+	fs.IntVar(&opts.parallel, "parallel", defaultParallel, "parallel chunk uploads (non-final chunks)")
+	fs.IntVar(&opts.retries, "retries", defaultRetries, "retry count per chunk")
+	fs.DurationVar(&opts.hedgeDelay, "hedge-delay", defaultHedgeDelay, "delay before speculative duplicate upload for slow non-final chunks (0 disables)")
+	fs.DurationVar(&opts.requestTimeout, "request-timeout", defaultChunkTimeout, "timeout per non-final chunk request")
+	fs.DurationVar(&opts.finalChunkTimeout, "final-request-timeout", defaultFinalChunkTimeout, "timeout for final chunk request")
+	fs.DurationVar(&opts.finalizeRecover, "finalize-recovery-timeout", defaultFinalizeRecover, "readiness wait after uncertain final chunk result")
+	fs.DurationVar(&opts.finalizeTimeout, "finalize-timeout", defaultFinalizeTimeout, "max total wait for server finalization")
+	fs.DurationVar(&opts.finalizePollInterval, "finalize-poll-interval", defaultFinalizePollInterval, "readiness poll interval")
+	fs.StringVar(&opts.password, "password", "", "upload password (sets X-Upload-Password)")
+	fs.Int64Var(&opts.downloadLimit, "download-limit", 0, "download limit (sets X-Upload-Download-Limit)")
+	fs.StringVar(&opts.uploadKey, "upload-key", "", "explicit upload key (default: random)")
+	fs.BoolVar(&opts.insecureTLS, "insecure", false, "skip TLS certificate verification")
+	fs.StringVar(ipsRaw, "ips", "", "force chunk upload destination IPs (comma-separated)")
+	fs.BoolVar(&opts.noIPv6, "no-ipv6", false, "disable IPv6 and force IPv4-only connections")
+	fs.IntVar(&opts.subdomains, "subdomains", 0, "force upload subdomain pool size (uses 0..N-1 on idoud domains)")
+	fs.BoolVar(&opts.noSubdomains, "no-subdomains", false, "disable numbered subdomain upload routing")
+	fs.BoolVar(&opts.noSubdomains, "nosub", false, "alias for --no-subdomains")
+	fs.StringVar(outputRaw, "output", unsetOutputModeValue, "stdout mode: url, json, none")
+	fs.BoolVar(jsonOutput, "json", false, "shorthand for --output json")
+	fs.BoolVar(&opts.speedtest, "speedtest", false, "use server-side sink mode to benchmark ingest without backend storage writes")
+	fs.BoolVar(&opts.verbose, "verbose", false, "print retry and finalization logs")
+	fs.BoolVar(&opts.debug, "debug", false, "enable verbose live upload debug stats")
+}
+
+func flagValueNames(fs *flag.FlagSet) map[string]struct{} {
+	valueFlags := make(map[string]struct{}, 16)
+	fs.VisitAll(func(f *flag.Flag) {
+		if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+			return
+		}
+		valueFlags[f.Name] = struct{}{}
+	})
+	return valueFlags
 }
 
 func splitFlagToken(token string) (string, bool) {
@@ -304,13 +332,21 @@ SECURITY AND LIMITS
   --insecure
       Skip TLS certificate verification.
 
+OUTPUT
+  --output <mode>
+      Success stdout mode: url (default), json, none.
+      json emits exactly one JSON document on stdout.
+      none suppresses success stdout entirely.
+  --json
+      Shorthand for --output json.
+
 DIAGNOSTICS
   --speedtest
       Benchmark ingest path without persisted output.
   --verbose
-      Print retry/finalization logs.
+      Print retry/finalization logs to stderr.
   --debug
-      Print live chunk concurrency and throughput stats.
+      Print live chunk concurrency and throughput stats to stderr.
 
 HELP
   -h, --help
