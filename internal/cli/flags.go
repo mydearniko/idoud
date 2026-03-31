@@ -216,12 +216,17 @@ func normalizeInterspersedArgs(fs *flag.FlagSet, args []string) []string {
 
 func registerFlags(fs *flag.FlagSet, opts *options, chunkSizeRaw, stdinSizeRaw, ipsRaw, outputRaw *string, jsonOutput *bool) {
 	fs.StringVar(&opts.serverURL, "server", defaultServerURL, "idoud server origin (or comma-separated origins)")
+	fs.StringVar(&opts.serverURL, "s", defaultServerURL, "alias for --server")
 	fs.BoolVar(&opts.stdin, "stdin", false, "read file data from stdin")
+	fs.BoolVar(&opts.stdin, "S", false, "alias for --stdin")
 	fs.StringVar(stdinSizeRaw, "stdin-size", "", "stdin size hint for stdin uploads")
 	fs.StringVar(&opts.nameOverride, "name", "", "upload file name override")
+	fs.StringVar(&opts.nameOverride, "n", "", "alias for --name")
 	fs.StringVar(chunkSizeRaw, "chunk-size", strconv.FormatInt(defaultChunkSize, 10), "chunk size for Content-Range uploads")
 	fs.IntVar(&opts.parallel, "parallel", defaultParallel, "parallel chunk uploads (non-final chunks)")
+	fs.IntVar(&opts.parallel, "p", defaultParallel, "alias for --parallel")
 	fs.IntVar(&opts.retries, "retries", defaultRetries, "retry count per chunk")
+	fs.IntVar(&opts.retries, "r", defaultRetries, "alias for --retries")
 	fs.DurationVar(&opts.hedgeDelay, "hedge-delay", defaultHedgeDelay, "delay before speculative duplicate upload for slow non-final chunks (0 disables)")
 	fs.DurationVar(&opts.requestTimeout, "request-timeout", defaultChunkTimeout, "timeout per non-final chunk request")
 	fs.DurationVar(&opts.finalChunkTimeout, "final-request-timeout", defaultFinalChunkTimeout, "timeout for final chunk request")
@@ -229,19 +234,28 @@ func registerFlags(fs *flag.FlagSet, opts *options, chunkSizeRaw, stdinSizeRaw, 
 	fs.DurationVar(&opts.finalizeTimeout, "finalize-timeout", defaultFinalizeTimeout, "max total wait for server finalization")
 	fs.DurationVar(&opts.finalizePollInterval, "finalize-poll-interval", defaultFinalizePollInterval, "readiness poll interval")
 	fs.StringVar(&opts.password, "password", "", "upload password (sets X-Upload-Password)")
+	fs.StringVar(&opts.password, "P", "", "alias for --password")
 	fs.Int64Var(&opts.downloadLimit, "download-limit", 0, "download limit (sets X-Upload-Download-Limit)")
+	fs.Int64Var(&opts.downloadLimit, "l", 0, "alias for --download-limit")
 	fs.StringVar(&opts.uploadKey, "upload-key", "", "explicit upload key (default: random)")
+	fs.StringVar(&opts.uploadKey, "k", "", "alias for --upload-key")
 	fs.BoolVar(&opts.insecureTLS, "insecure", false, "skip TLS certificate verification")
 	fs.StringVar(ipsRaw, "ips", "", "force chunk upload destination IPs (comma-separated)")
 	fs.BoolVar(&opts.noIPv6, "no-ipv6", false, "disable IPv6 and force IPv4-only connections")
 	fs.IntVar(&opts.subdomains, "subdomains", 0, "force upload subdomain pool size (uses 0..N-1 on idoud domains)")
 	fs.BoolVar(&opts.noSubdomains, "no-subdomains", false, "disable numbered subdomain upload routing")
 	fs.BoolVar(&opts.noSubdomains, "nosub", false, "alias for --no-subdomains")
+	fs.StringVar(&opts.bindInterface, "interface", "", "bind outgoing connections to a local address (IP or interface name)")
+	fs.StringVar(&opts.bindInterface, "I", "", "alias for --interface")
 	fs.StringVar(outputRaw, "output", unsetOutputModeValue, "stdout mode: url, json, none")
+	fs.StringVar(outputRaw, "o", unsetOutputModeValue, "alias for --output")
 	fs.BoolVar(jsonOutput, "json", false, "shorthand for --output json")
 	fs.BoolVar(&opts.speedtest, "speedtest", false, "use server-side sink mode to benchmark ingest without backend storage writes")
+	fs.BoolVar(&opts.speedtest, "T", false, "alias for --speedtest")
 	fs.BoolVar(&opts.verbose, "verbose", false, "print retry and finalization logs")
+	fs.BoolVar(&opts.verbose, "v", false, "alias for --verbose")
 	fs.BoolVar(&opts.debug, "debug", false, "enable verbose live upload debug stats")
+	fs.BoolVar(&opts.debug, "d", false, "alias for --debug")
 }
 
 func flagValueNames(fs *flag.FlagSet) map[string]struct{} {
@@ -283,15 +297,15 @@ QUICK START
   idoud --server https://s1.example,https://s2.example archive.zip
 
 INPUT
-  --stdin
+  -S, --stdin
       Read payload from stdin instead of a file path.
   --stdin-size <size>
       Known stdin size hint (only valid with --stdin).
-  --name <filename>
+  -n, --name <filename>
       Override upload filename.
 
 ROUTING
-  --server <url[,url...]>
+  -s, --server <url[,url...]>
       One origin or a comma-separated origin list.
   --subdomains <n>
       Force upload subdomains 0..N-1 on idoud domains.
@@ -299,15 +313,17 @@ ROUTING
       Disable numbered subdomain routing.
   --ips <ip[,ip...]>
       Pin chunk uploads to destination IPs (round-robin).
+  -I, --interface <addr>
+      Bind outgoing connections to a local IP or interface name.
   --no-ipv6
       Force IPv4-only networking.
 
 UPLOAD TUNING
   --chunk-size <size>
       Must be exactly 3145728 bytes (3 MiB).
-  --parallel <n>
+  -p, --parallel <n>
       Parallel non-final chunk uploads (default: 32).
-  --retries <n>
+  -r, --retries <n>
       Retries per failed chunk (default: 6).
   --hedge-delay <dur>
       Delay before speculative duplicate upload for slow chunks.
@@ -323,17 +339,17 @@ UPLOAD TUNING
       Maximum total finalization wait.
 
 SECURITY AND LIMITS
-  --password <value>
+  -P, --password <value>
       Set upload password.
-  --download-limit <n>
+  -l, --download-limit <n>
       Set download limit.
-  --upload-key <value>
+  -k, --upload-key <value>
       Explicit upload key (default: random).
   --insecure
       Skip TLS certificate verification.
 
 OUTPUT
-  --output <mode>
+  -o, --output <mode>
       Success stdout mode: url (default), json, none.
       json emits exactly one JSON document on stdout.
       none suppresses success stdout entirely.
@@ -341,11 +357,11 @@ OUTPUT
       Shorthand for --output json.
 
 DIAGNOSTICS
-  --speedtest
+  -T, --speedtest
       Benchmark ingest path without persisted output.
-  --verbose
+  -v, --verbose
       Print retry/finalization logs to stderr.
-  --debug
+  -d, --debug
       Print live chunk concurrency and throughput stats to stderr.
 
 HELP

@@ -96,6 +96,7 @@ type options struct {
 	noIPv6               bool
 	subdomains           int
 	noSubdomains         bool
+	bindInterface        string
 	outputMode           outputMode
 	speedtest            bool
 	verbose              bool

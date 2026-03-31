@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
+	"net"
 	"net/http"
 )
 
@@ -34,10 +36,16 @@ func Run(args []string) int {
 	}
 	defer cleanup()
 
-	client := &http.Client{
-		Transport: buildTransport(opts.insecureTLS, opts.noIPv6, opts.parallel, ""),
+	localAddr, err := resolveBindAddr(opts.bindInterface)
+	if err != nil {
+		out.printInputError(fmt.Errorf("--interface: %w", err))
+		return 1
 	}
-	chunkClients := buildChunkClients(opts)
+
+	client := &http.Client{
+		Transport: buildTransport(opts.insecureTLS, opts.noIPv6, opts.parallel, "", localAddr),
+	}
+	chunkClients := buildChunkClients(opts, localAddr)
 
 	u := &uploader{
 		opts:         opts,
@@ -63,14 +71,14 @@ func Run(args []string) int {
 	return 0
 }
 
-func buildChunkClients(opts options) []*http.Client {
+func buildChunkClients(opts options, localAddr net.Addr) []*http.Client {
 	if len(opts.forcedIPs) == 0 {
 		return nil
 	}
 	clients := make([]*http.Client, 0, len(opts.forcedIPs))
 	for _, ip := range opts.forcedIPs {
 		clients = append(clients, &http.Client{
-			Transport: buildTransport(opts.insecureTLS, opts.noIPv6, opts.parallel, ip),
+			Transport: buildTransport(opts.insecureTLS, opts.noIPv6, opts.parallel, ip, localAddr),
 		})
 	}
 	return clients
