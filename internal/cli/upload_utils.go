@@ -18,26 +18,53 @@ import (
 	"time"
 )
 
-// resolveBindAddr resolves a --interface value to a *net.TCPAddr.
+// bindConfig holds the resolved network binding parameters from --interface.
+type bindConfig struct {
+	localAddr net.Addr // Source IP for net.Dialer.LocalAddr
+	ifaceName string   // Interface name for SO_BINDTODEVICE (Linux)
+}
+
+// resolveBindAddr resolves a --interface value to a bindConfig.
 // The value can be an IP address or a network interface name.
-// Returns nil when raw is empty.
-func resolveBindAddr(raw string) (net.Addr, error) {
+// Returns zero-value bindConfig when raw is empty.
+func resolveBindAddr(raw string) (bindConfig, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return nil, nil
+		return bindConfig{}, nil
 	}
 	// Try direct IP parse first.
 	if ip := net.ParseIP(raw); ip != nil {
-		return &net.TCPAddr{IP: ip}, nil
+		// Resolve which interface owns this IP so we can SO_BINDTODEVICE.
+		ifaces, _ := net.Interfaces()
+		for _, iface := range ifaces {
+			addrs, _ := iface.Addrs()
+			for _, a := range addrs {
+				var ifIP net.IP
+				switch v := a.(type) {
+				case *net.IPNet:
+					ifIP = v.IP
+				case *net.IPAddr:
+					ifIP = v.IP
+				}
+				if ifIP != nil && ifIP.Equal(ip) {
+					return bindConfig{
+						localAddr: &net.TCPAddr{IP: ip},
+						ifaceName: iface.Name,
+					}, nil
+				}
+			}
+		}
+		// IP not found on any interface — still bind source IP, skip device bind.
+		return bindConfig{localAddr: &net.TCPAddr{IP: ip}}, nil
 	}
 	// Treat as interface name — pick the first unicast IP.
 	iface, err := net.InterfaceByName(raw)
 	if err != nil {
-		return nil, fmt.Errorf("not a valid IP and interface lookup failed: %w", err)
+		return bindConfig{}, fmt.Errorf("not a valid IP and interface lookup failed: %w", err)
 	}
 	addrs, err := iface.Addrs()
 	if err != nil {
-		return nil, fmt.Errorf("listing addresses for %s: %w", raw, err)
+		return bindConfig{}, fmt.Errorf("listing addresses for %s: %w", raw, err)
 	}
 	for _, a := range addrs {
 		var ip net.IP
@@ -48,7 +75,10 @@ func resolveBindAddr(raw string) (net.Addr, error) {
 			ip = v.IP
 		}
 		if ip != nil && ip.To4() != nil {
-			return &net.TCPAddr{IP: ip}, nil
+			return bindConfig{
+				localAddr: &net.TCPAddr{IP: ip},
+				ifaceName: raw,
+			}, nil
 		}
 	}
 	// Fallback: accept any IPv6 if no v4 found.
@@ -61,13 +91,16 @@ func resolveBindAddr(raw string) (net.Addr, error) {
 			ip = v.IP
 		}
 		if ip != nil {
-			return &net.TCPAddr{IP: ip}, nil
+			return bindConfig{
+				localAddr: &net.TCPAddr{IP: ip},
+				ifaceName: raw,
+			}, nil
 		}
 	}
-	return nil, fmt.Errorf("interface %s has no usable addresses", raw)
+	return bindConfig{}, fmt.Errorf("interface %s has no usable addresses", raw)
 }
 
-func buildTransport(insecure bool, disableIPv6 bool, parallel int, forcedIP string, localAddr net.Addr) *http.Transport {
+func buildTransport(insecure bool, disableIPv6 bool, parallel int, forcedIP string, bind bindConfig) *http.Transport {
 	conns := parallel
 	if conns < 8 {
 		conns = 8
@@ -75,7 +108,8 @@ func buildTransport(insecure bool, disableIPv6 bool, parallel int, forcedIP stri
 	dialer := &net.Dialer{
 		Timeout:   5 * time.Second,
 		KeepAlive: 30 * time.Second,
-		LocalAddr: localAddr,
+		LocalAddr: bind.localAddr,
+		Control:   bindToDeviceControl(bind.ifaceName),
 	}
 	t := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {

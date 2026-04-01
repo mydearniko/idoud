@@ -156,7 +156,7 @@ func TestParseFlagsTooManyFileArgs(t *testing.T) {
 }
 
 func TestBuildTransportResponseHeaderTimeoutDisabled(t *testing.T) {
-	tr := buildTransport(false, false, 8, "", nil)
+	tr := buildTransport(false, false, 8, "", bindConfig{})
 	if tr.ResponseHeaderTimeout != 0 {
 		t.Fatalf("ResponseHeaderTimeout = %s, want 0", tr.ResponseHeaderTimeout)
 	}

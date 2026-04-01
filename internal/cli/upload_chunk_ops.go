@@ -227,7 +227,16 @@ func (u *uploader) retryChunkUpload(
 	var lastErr error
 	lastStatus := 0
 
-	for attempt := 0; attempt <= u.opts.retries; attempt++ {
+	// Connection-level errors (status == 0: TLS timeout, dial failure, etc.)
+	// get extended retries with longer backoff to survive transient network
+	// hiccups — especially important for interface-bound uploads (-I).
+	// HTTP-level errors (status > 0) use the normal retry budget.
+	maxRetries := u.opts.retries
+	connRetries := 0
+	const maxConnRetries = 24 // ~5 min runway for connection outages
+	const connRetryBackoff = 10 * time.Second
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		body, status, err := u.doChunkAttempt(ctx, chunkIndex, finalChunk, once)
 		if err == nil {
 			urls.set(body)
@@ -246,13 +255,30 @@ func (u *uploader) retryChunkUpload(
 			}
 		}
 
-		if !isRetryableStatus(ctx, status, err) || attempt >= u.opts.retries {
+		if !isRetryableStatus(ctx, status, err) || attempt >= maxRetries {
 			break
+		}
+
+		// Pure connection error on a non-final chunk: use extended retry budget.
+		if status == 0 && !finalChunk && !isContextErr(err) {
+			connRetries++
+			if connRetries <= maxConnRetries {
+				// Extend the retry budget so this attempt doesn't count toward
+				// the normal HTTP-error limit.
+				maxRetries++
+				delay := connRetryBackoff
+				u.logf("chunk(%s) conn-retry idx=%d attempt=%d/%d conn=%d/%d delay=%s err=%v",
+					mode, chunkIndex, attempt+1, maxRetries, connRetries, maxConnRetries, delay, err)
+				if sleepErr := sleepContext(ctx, delay); sleepErr != nil {
+					return sleepErr
+				}
+				continue
+			}
 		}
 
 		delay := retryBackoff(attempt + 1)
 		u.debugRetry()
-		u.logf("chunk(%s) retry idx=%d final=%t attempt=%d/%d status=%d delay=%s err=%v", mode, chunkIndex, finalChunk, attempt+1, u.opts.retries, status, delay, err)
+		u.logf("chunk(%s) retry idx=%d final=%t attempt=%d/%d status=%d delay=%s err=%v", mode, chunkIndex, finalChunk, attempt+1, maxRetries, status, delay, err)
 		sleepStarted := time.Now()
 		sleepErr := sleepContext(ctx, delay)
 		u.debugRetrySleep(time.Since(sleepStarted))
