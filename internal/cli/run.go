@@ -86,6 +86,7 @@ func runTransfer(args []string) int {
 
 	u := &uploader{
 		opts:         opts,
+		resumeID:     resumeID,
 		client:       client,
 		chunkClients: chunkClients,
 		routes:       newRouteCircuitSet(),

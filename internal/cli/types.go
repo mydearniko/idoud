@@ -229,6 +229,7 @@ func (e *requestError) Unwrap() error {
 
 type uploader struct {
 	opts            options
+	resumeID        string
 	client          *http.Client
 	chunkClients    []*http.Client
 	uploadBodies    chan struct{}

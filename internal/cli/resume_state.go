@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -149,4 +150,33 @@ func completeUploadResume(id string) error {
 	state := loadUploadResumeState(path)
 	delete(state.Records, id)
 	return saveUploadResumeState(path, state)
+}
+
+func refreshUploadResumeKey(id, expectedKey string) (string, error) {
+	id = strings.TrimSpace(id)
+	expectedKey = strings.TrimSpace(expectedKey)
+	if id == "" {
+		return "", errors.New("missing upload resume identity")
+	}
+	path, err := uploadResumeStatePath()
+	if err != nil {
+		return "", err
+	}
+	state := loadUploadResumeState(path)
+	rec := state.Records[id]
+	if current := strings.TrimSpace(rec.UploadKey); current != "" && current != expectedKey {
+		return current, nil
+	}
+
+	nextKey := randomUploadKey()
+	for nextKey == "" || nextKey == expectedKey {
+		nextKey = randomUploadKey()
+	}
+	rec.UploadKey = nextKey
+	rec.UpdatedAt = time.Now().Unix()
+	state.Records[id] = rec
+	if err := saveUploadResumeState(path, state); err != nil {
+		return "", fmt.Errorf("save refreshed upload resume state: %w", err)
+	}
+	return nextKey, nil
 }

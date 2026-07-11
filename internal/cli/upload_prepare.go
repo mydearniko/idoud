@@ -15,12 +15,15 @@ import (
 	"github.com/mydearniko/idoud/internal/protocol"
 )
 
+const uploadPrepareTargetAlreadyExists = "upload target already exists"
+
 func (u *uploader) prepareUpload(ctx context.Context, src *sourceFile) error {
 	if u == nil || src == nil || u.opts.speedtest {
 		return nil
 	}
 	started := time.Now()
 	var lastErr error
+	resumeKeyRefreshed := false
 	for attempt := 0; ; attempt++ {
 		err := u.prepareUploadOnce(ctx, src)
 		if err == nil {
@@ -28,6 +31,20 @@ func (u *uploader) prepareUpload(ctx context.Context, src *sourceFile) error {
 		}
 		lastErr = err
 		var reqErr *requestError
+		if !resumeKeyRefreshed && u.canRefreshCompletedResumeTarget(err) {
+			nextKey, refreshErr := refreshUploadResumeKey(u.resumeID, u.opts.uploadKey)
+			if refreshErr != nil {
+				return fmt.Errorf("refresh completed upload resume state: %w", refreshErr)
+			}
+			u.opts.uploadKey = nextKey
+			resumeKeyRefreshed = true
+			u.logf("upload prepare found a completed automatic resume target; refreshed the resume key")
+			if u.ui != nil {
+				u.ui.retried()
+				u.ui.emitInfo("resume", "previous upload is complete · starting a fresh upload")
+			}
+			continue
+		}
 		if !errors.As(err, &reqErr) || reqErr == nil || !retryablePrepareFailure(ctx, reqErr) {
 			return err
 		}
@@ -46,6 +63,17 @@ func (u *uploader) prepareUpload(ctx context.Context, src *sourceFile) error {
 			return err
 		}
 	}
+}
+
+func (u *uploader) canRefreshCompletedResumeTarget(err error) bool {
+	if u == nil || u.opts.uploadKeyExplicit || strings.TrimSpace(u.resumeID) == "" {
+		return false
+	}
+	var reqErr *requestError
+	if !errors.As(err, &reqErr) || reqErr == nil {
+		return false
+	}
+	return reqErr.status == http.StatusBadRequest && strings.TrimSpace(reqErr.body) == uploadPrepareTargetAlreadyExists
 }
 
 func retryablePrepareFailure(ctx context.Context, err *requestError) bool {
@@ -105,7 +133,10 @@ func (u *uploader) prepareUploadOnce(ctx context.Context, src *sourceFile) error
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 	bodyText := strings.TrimSpace(string(respBody))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("upload prepare failed: %w", &requestError{status: resp.StatusCode})
+		return fmt.Errorf("upload prepare failed: %w", &requestError{
+			status: resp.StatusCode,
+			body:   publicUploadPrepareErrorBody(bodyText),
+		})
 	}
 	if bodyText == "" {
 		return errors.New("upload prepare returned an empty plan")
@@ -120,6 +151,31 @@ func (u *uploader) prepareUploadOnce(ctx context.Context, src *sourceFile) error
 		return u.applyUploadPreparePlan(src, plan)
 	}
 	return u.applyPreparedUploadURL(src, bodyText)
+}
+
+func publicUploadPrepareErrorBody(body string) string {
+	body = strings.TrimSpace(body)
+	switch body {
+	case "upload password is too long",
+		"invalid upload download limit",
+		"x-upload-key is required",
+		"x-upload-key is too long",
+		"invalid upload prepare payload",
+		"invalid upload size",
+		"invalid upload path",
+		"invalid archive entry path",
+		"invalid archive entry size",
+		"failed to resolve upload target",
+		uploadPrepareTargetAlreadyExists,
+		"upload access options mismatch",
+		"upload route unavailable",
+		"failed to store archive sizes",
+		"failed to apply archive sizes",
+		"failed to start upload":
+		return body
+	default:
+		return ""
+	}
 }
 
 func (u *uploader) applyUploadPreparePlan(src *sourceFile, plan protocol.UploadPrepareResponse) error {
