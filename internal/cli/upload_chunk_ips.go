@@ -5,7 +5,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"time"
 )
 
 type chunkOriginIPSet struct {
@@ -99,32 +98,4 @@ func (u *uploader) logChunkOriginIPs() {
 		return
 	}
 	u.logf("chunk_origin_ips count=%d ips=%s", len(ips), strings.Join(ips, ","))
-}
-
-func (u *uploader) startChunkIPLogLoop(interval time.Duration) func() {
-	if u == nil || !u.opts.verbose {
-		return func() {}
-	}
-	if interval <= 0 {
-		interval = time.Second
-	}
-	stopCh := make(chan struct{})
-	doneCh := make(chan struct{})
-	go func() {
-		defer close(doneCh)
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stopCh:
-				return
-			case <-ticker.C:
-				u.logChunkOriginIPs()
-			}
-		}
-	}()
-	return func() {
-		close(stopCh)
-		<-doneCh
-	}
 }

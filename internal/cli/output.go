@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-const outputJSONSchemaVersion = 1
+const outputJSONSchemaVersion = 2
 const unsetOutputModeValue = "\x00"
 
 type primaryOutput struct {
@@ -30,6 +30,7 @@ type jsonEnvelope struct {
 
 type jsonResult struct {
 	URL       string `json:"url"`
+	Path      string `json:"path,omitempty"`
 	Name      string `json:"name,omitempty"`
 	Source    string `json:"source"`
 	KnownSize bool   `json:"known_size"`
@@ -37,9 +38,9 @@ type jsonResult struct {
 }
 
 type jsonError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-	Hint    string `json:"hint,omitempty"`
+	Code   string `json:"code"`
+	Detail string `json:"detail"`
+	Hint   string `json:"hint,omitempty"`
 }
 
 type jsonHelp struct {
@@ -70,7 +71,7 @@ func detectRequestedOutputMode(args []string) outputMode {
 	ipsRaw := ""
 	outputRaw := unsetOutputModeValue
 	jsonOutput := false
-	fs := flag.NewFlagSet("idoud", flag.ContinueOnError)
+	fs := flag.NewFlagSet(cliCommandName(), flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	registerFlags(fs, &opts, &chunkSizeRaw, &stdinSizeRaw, &ipsRaw, &outputRaw, &jsonOutput)
 	valueFlags := flagValueNames(fs)
@@ -147,6 +148,27 @@ func (o primaryOutput) printSuccess(src *sourceFile, finalURL string) {
 	}
 }
 
+func (o primaryOutput) printDownloadSuccess(path string) {
+	switch o.mode {
+	case outputModeNone:
+		return
+	case outputModeJSON:
+		o.writeJSON(jsonEnvelope{
+			SchemaVersion: outputJSONSchemaVersion,
+			OK:            true,
+			Type:          "result",
+			ExitCode:      0,
+			Result: &jsonResult{
+				Path:      path,
+				Source:    "download",
+				KnownSize: false,
+			},
+		})
+	default:
+		fmt.Fprintln(os.Stdout, path)
+	}
+}
+
 func (o primaryOutput) printUsageError(err error) {
 	hint := usageHint(err)
 	if o.mode == outputModeJSON {
@@ -156,9 +178,9 @@ func (o primaryOutput) printUsageError(err error) {
 			Type:          "error",
 			ExitCode:      2,
 			Error: &jsonError{
-				Code:    "usage_error",
-				Message: err.Error(),
-				Hint:    hint,
+				Code:   "usage_error",
+				Detail: err.Error(),
+				Hint:   hint,
 			},
 		})
 		return
@@ -177,13 +199,30 @@ func (o primaryOutput) printInputError(err error) {
 			Type:          "error",
 			ExitCode:      1,
 			Error: &jsonError{
-				Code:    "input_error",
-				Message: err.Error(),
+				Code:   "input_error",
+				Detail: err.Error(),
 			},
 		})
 		return
 	}
 	stderrLogf("error: %v", err)
+}
+
+func (o primaryOutput) printDownloadError(err error) {
+	if o.mode == outputModeJSON {
+		o.writeJSON(jsonEnvelope{
+			SchemaVersion: outputJSONSchemaVersion,
+			OK:            false,
+			Type:          "error",
+			ExitCode:      1,
+			Error: &jsonError{
+				Code:   "download_failed",
+				Detail: err.Error(),
+			},
+		})
+		return
+	}
+	stderrLogf("download failed: %v", err)
 }
 
 func (o primaryOutput) printUploadError(err error) {
@@ -194,8 +233,8 @@ func (o primaryOutput) printUploadError(err error) {
 			Type:          "error",
 			ExitCode:      1,
 			Error: &jsonError{
-				Code:    "upload_failed",
-				Message: err.Error(),
+				Code:   "upload_failed",
+				Detail: err.Error(),
 			},
 		})
 		return
@@ -236,10 +275,11 @@ func jsonResultFromSource(src *sourceFile, finalURL string) *jsonResult {
 }
 
 func usageHint(err error) string {
+	name := cliCommandName()
 	switch {
 	case errors.Is(err, errMissingInput):
-		return "pass a file path (idoud <file>) or use stdin mode (cat <file> | idoud --stdin --name <filename>)"
+		return fmt.Sprintf("pass a file path (%s <file>) or use stdin mode (cat <file> | %s --stdin --name <filename>)", name, name)
 	default:
-		return "run `idoud --help` for full usage"
+		return fmt.Sprintf("run `%s --help` for full usage", name)
 	}
 }

@@ -197,12 +197,12 @@ func TestParseFlagsStdinAutoTuneDefaults(t *testing.T) {
 }
 
 func TestParseFlagsStdinAutoTuneRespectsExplicit(t *testing.T) {
-	opts, _, err := parseFlags([]string{"--stdin", "--chunk-size", "3MiB", "--parallel", "77"})
+	opts, _, err := parseFlags([]string{"--stdin", "--chunk-size", "1MiB", "--parallel", "77"})
 	if err != nil {
 		t.Fatalf("parseFlags returned error: %v", err)
 	}
-	if opts.chunkSize != 3*1024*1024 {
-		t.Fatalf("stdin chunkSize = %d, want %d", opts.chunkSize, 3*1024*1024)
+	if opts.chunkSize != 1024*1024 {
+		t.Fatalf("stdin chunkSize = %d, want %d", opts.chunkSize, 1024*1024)
 	}
 	if opts.parallel != 77 {
 		t.Fatalf("stdin parallel = %d, want %d", opts.parallel, 77)
@@ -253,17 +253,16 @@ func TestParseFlagsRejectsEmptyOutputMode(t *testing.T) {
 	}
 }
 
-func TestParseFlagsParallelChunkSizeStrict(t *testing.T) {
-	_, _, err := parseFlags([]string{"--parallel", "2", "--chunk-size", "1MiB", "file.bin"})
-	if err == nil {
-		t.Fatal("expected error for non-3MiB chunk size with parallel upload")
+func TestParseFlagsChunkSizeIsDeprecatedFallback(t *testing.T) {
+	opts, _, err := parseFlags([]string{"--parallel", "2", "--chunk-size", "1MiB", "file.bin"})
+	if err != nil {
+		t.Fatalf("parseFlags returned error: %v", err)
 	}
-}
-
-func TestParseFlagsParallelOneRejectsCustomChunkSize(t *testing.T) {
-	_, _, err := parseFlags([]string{"--parallel", "1", "--chunk-size", "1MiB", "file.bin"})
-	if err == nil {
-		t.Fatal("expected error for non-3MiB chunk size with parallel=1")
+	if opts.chunkSize != 1024*1024 {
+		t.Fatalf("chunkSize=%d, want 1MiB", opts.chunkSize)
+	}
+	if !opts.chunkSizeExplicit {
+		t.Fatal("chunkSizeExplicit=false, want true")
 	}
 }
 
@@ -274,11 +273,11 @@ func TestChunkPolicyMatchesBrowserDefaults(t *testing.T) {
 	if defaultParallel < browserDefaultChunkParallel {
 		t.Fatalf("defaultParallel=%d, want >= browserDefaultChunkParallel=%d", defaultParallel, browserDefaultChunkParallel)
 	}
-	if defaultStdinParallel != defaultParallel {
-		t.Fatalf("defaultStdinParallel=%d, want defaultParallel=%d", defaultStdinParallel, defaultParallel)
+	if defaultStdinParallel >= defaultParallel {
+		t.Fatalf("defaultStdinParallel=%d, want lower than regular-file parallel=%d", defaultStdinParallel, defaultParallel)
 	}
-	if defaultChunkTimeout != browserChunkRequestTimeout {
-		t.Fatalf("defaultChunkTimeout=%s, want browserChunkRequestTimeout=%s", defaultChunkTimeout, browserChunkRequestTimeout)
+	if defaultChunkTimeout <= browserChunkRequestTimeout {
+		t.Fatalf("defaultChunkTimeout=%s, want longer than browserChunkRequestTimeout=%s", defaultChunkTimeout, browserChunkRequestTimeout)
 	}
 	if defaultFinalChunkTimeout != browserFinalChunkRequestTimeout {
 		t.Fatalf("defaultFinalChunkTimeout=%s, want browserFinalChunkRequestTimeout=%s", defaultFinalChunkTimeout, browserFinalChunkRequestTimeout)
@@ -297,6 +296,23 @@ func TestChunkPolicyMatchesBrowserDefaults(t *testing.T) {
 	}
 	if defaultBackoffMax != browserChunkRetryMaxDelay {
 		t.Fatalf("defaultBackoffMax=%s, want browserChunkRetryMaxDelay=%s", defaultBackoffMax, browserChunkRetryMaxDelay)
+	}
+}
+
+func TestParseFlagsUsesSeparateAutomaticParallelism(t *testing.T) {
+	fileOpts, _, err := parseFlags([]string{"file.bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fileOpts.parallel != defaultParallel || fileOpts.parallelExplicit {
+		t.Fatalf("file parallel=%d explicit=%t", fileOpts.parallel, fileOpts.parallelExplicit)
+	}
+	downloadOpts, _, err := parseFlags([]string{"--download", "AbC123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if downloadOpts.parallel != defaultDownloadParallel || downloadOpts.parallelExplicit {
+		t.Fatalf("download parallel=%d explicit=%t", downloadOpts.parallel, downloadOpts.parallelExplicit)
 	}
 }
 

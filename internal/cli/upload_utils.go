@@ -163,7 +163,7 @@ func buildTransport(insecure bool, disableIPv6 bool, parallel int, forcedIP stri
 		// own timeout enforcement. Keep this disabled to avoid premature ~20s
 		// aborts on slower links.
 		ResponseHeaderTimeout: 0,
-		WriteBufferSize:       4 << 20, // 4 MiB
+		WriteBufferSize:       256 << 10,
 		ReadBufferSize:        64 << 10,
 	}
 
@@ -220,6 +220,19 @@ func buildTransport(insecure bool, disableIPv6 bool, parallel int, forcedIP stri
 	if insecure {
 		t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
+	return t
+}
+
+func buildHTTP2Transport(insecure bool, disableIPv6 bool, parallel int, forcedIP string, bind bindConfig) *http.Transport {
+	t := buildTransport(insecure, disableIPv6, parallel, forcedIP, bind)
+	// A pool of these transports supplies multiple independent congestion
+	// windows, while each connection multiplexes many request bodies. This is
+	// materially more stable than opening one lossy TCP connection per chunk on
+	// high-bandwidth, long-RTT paths.
+	t.ForceAttemptHTTP2 = true
+	t.TLSNextProto = nil
+	t.MaxConnsPerHost = 1
+	t.MaxIdleConnsPerHost = 1
 	return t
 }
 
@@ -309,22 +322,29 @@ func (u *uploader) routeUploadURL(rawURL string) string {
 	return buildSubdomainUploadURL(rawURL, u.subdomains.acquire())
 }
 
-func (u *uploader) warmConnections(ctx context.Context, count int) {
-	if count <= 0 {
-		return
-	}
-	bases := resolveServerBases(u.opts)
-	if len(bases) == 0 {
+func (u *uploader) warmConnections(ctx context.Context, src *sourceFile, count int) {
+	if count <= 0 || src == nil {
 		return
 	}
 	if count > 128 {
 		count = 128
 	}
+	u.probeUploadRoutes(ctx, src)
 	var wg sync.WaitGroup
 	for i := 0; i < count; i++ {
-		warmURL := strings.TrimSuffix(bases[i%len(bases)].String(), "/") + "/v1/health"
+		selected, err := u.selectUploadRoute(src, int64(i))
+		target := selected.parsedURL
+		if err != nil || target == nil || target.Scheme == "" || target.Host == "" {
+			continue
+		}
+		warmTarget := *target
+		warmTarget.Path = "/v1/health"
+		warmTarget.RawPath = ""
+		warmTarget.RawQuery = ""
+		warmTarget.Fragment = ""
+		warmURL := warmTarget.String()
 		wg.Add(1)
-		go func(targetURL string, chunkOrder int) {
+		go func(targetURL string, routeURL string, chunkOrder int) {
 			defer wg.Done()
 			reqCtx, cancel := context.WithTimeout(ctx, warmupTimeout)
 			defer cancel()
@@ -339,11 +359,21 @@ func (u *uploader) warmConnections(ctx context.Context, count int) {
 			client := u.clientForChunk(int64(chunkOrder))
 			resp, err := client.Do(req)
 			if err != nil {
+				if u.routes != nil {
+					u.routes.failure(routeURL, 0, err)
+				}
 				return
 			}
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
-		}(warmURL, i)
+			if u.routes != nil {
+				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+					u.routes.success(routeURL)
+				} else {
+					u.routes.failure(routeURL, http.StatusServiceUnavailable, &requestError{status: resp.StatusCode})
+				}
+			}
+		}(warmURL, selected.rawURL, i)
 	}
 	wg.Wait()
 }
@@ -372,6 +402,16 @@ func buildSpeedtestUploadURL(base *url.URL, filename string) string {
 	u.Fragment = ""
 	path := strings.TrimSuffix(u.Path, "/")
 	u.Path = path + "/v1/speedtest/" + url.PathEscape(filename)
+	u.RawPath = ""
+	return u.String()
+}
+
+func buildUploadPrepareURL(base *url.URL) string {
+	u := *base
+	u.RawQuery = ""
+	u.Fragment = ""
+	path := strings.TrimSuffix(u.Path, "/")
+	u.Path = path + "/v1/uploads/prepare"
 	u.RawPath = ""
 	return u.String()
 }

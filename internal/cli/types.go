@@ -8,12 +8,13 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
 	// Keep these values aligned with web/js/upload.js chunked upload policy.
-	browserChunkSize                = int64(3 * 1024 * 1024)
+	browserChunkSize                = int64(10485689)
 	browserDefaultChunkParallel     = 12
 	browserChunkRetryLimit          = 6
 	browserChunkRetryBaseDelay      = 120 * time.Millisecond
@@ -33,33 +34,42 @@ const (
 	defaultChunkSize         = defaultParallelChunkSize
 	// CLI uses much higher parallelism than browsers to compensate for
 	// per-chunk latency through Cloudflare and saturate high-bandwidth links.
-	defaultParallel             = 32
-	defaultStdinChunkSize       = defaultParallelChunkSize
-	defaultStdinParallel        = 32
-	defaultRetries              = browserChunkRetryLimit
-	defaultHedgeDelay           = 0 * time.Second
-	defaultChunkTimeout         = browserChunkRequestTimeout
+	defaultParallel         = 384
+	defaultStdinChunkSize   = defaultParallelChunkSize
+	defaultStdinParallel    = 24
+	defaultDownloadParallel = 32
+	defaultRetries          = browserChunkRetryLimit
+	defaultHedgeDelay       = 0 * time.Second
+	// CLI uploads wait for provider durability. Live production traces include
+	// rare healthy confirmations around one minute, so the browser's shorter
+	// interaction deadline would cause needless duplicate range retries here.
+	defaultChunkTimeout         = 2 * time.Minute
 	defaultFinalChunkTimeout    = browserFinalChunkRequestTimeout
 	defaultFinalizeRecover      = browserFinalizeRecoveryTimeout
 	defaultFinalizeTimeout      = browserFinalizeTimeout
 	defaultFinalizePollInterval = browserFinalizePollInterval
+	defaultResumeTimeout        = 24 * time.Hour
 	defaultMetadataWaitMax      = browserFinalizeMetadataWait
 	defaultBackoffBase          = browserChunkRetryBaseDelay
 	defaultBackoffMax           = browserChunkRetryMaxDelay
+	defaultMaxUploadBodyWrites  = 96
 	maxResponseBodyBytes        = 1 << 20
 )
 
 const (
 	headerUploadKey            = "X-Upload-Key"
 	headerUploadFinalChunk     = "X-Upload-Final"
+	headerUploadWaitStored     = "X-Upload-Wait-Stored"
 	headerUploadPassword       = "X-Upload-Password"
 	headerUploadDownloadLimit  = "X-Upload-Download-Limit"
 	headerUploadSpeedtest      = "X-Upload-Speedtest"
+	headerUploadPlan           = "X-Upload-Plan"
 	headerDownloadPassword     = "X-Download-Password"
 	headerContentType          = "Content-Type"
 	headerCacheControl         = "Cache-Control"
 	contentTypeOctetStream     = "application/octet-stream"
 	cacheControlNoStoreNoCache = "no-store, no-cache, must-revalidate, max-age=0"
+	uploadPlanMultiNodeV1      = "multi-node-v1"
 )
 
 var errFinalizeTimeout = errors.New("upload finalization timeout")
@@ -73,34 +83,44 @@ const (
 )
 
 type options struct {
-	serverURL            string
-	serverBase           *url.URL
-	serverBases          []*url.URL
-	forcedIPs            []string
-	stdin                bool
-	stdinSize            int64
-	nameOverride         string
-	chunkSize            int64
-	parallel             int
-	retries              int
-	hedgeDelay           time.Duration
-	requestTimeout       time.Duration
-	finalChunkTimeout    time.Duration
-	finalizeRecover      time.Duration
-	finalizeTimeout      time.Duration
-	finalizePollInterval time.Duration
-	password             string
-	downloadLimit        int64
-	uploadKey            string
-	insecureTLS          bool
-	noIPv6               bool
-	subdomains           int
-	noSubdomains         bool
-	bindInterface        string
-	outputMode           outputMode
-	speedtest            bool
-	verbose              bool
-	debug                bool
+	serverURL             string
+	serverBase            *url.URL
+	serverBases           []*url.URL
+	forcedIPs             []string
+	stdin                 bool
+	stdinSize             int64
+	nameOverride          string
+	chunkSize             int64
+	chunkSizeExplicit     bool
+	parallel              int
+	parallelExplicit      bool
+	http2Connections      int
+	uploadBodyConcurrency int
+	uploadRampRPS         int
+	uploadRampBurst       int
+	retries               int
+	hedgeDelay            time.Duration
+	requestTimeout        time.Duration
+	finalChunkTimeout     time.Duration
+	finalizeRecover       time.Duration
+	finalizeTimeout       time.Duration
+	finalizePollInterval  time.Duration
+	password              string
+	downloadLimit         int64
+	uploadKey             string
+	uploadKeyExplicit     bool
+	resumeTimeout         time.Duration
+	insecureTLS           bool
+	noIPv6                bool
+	subdomains            int
+	noSubdomains          bool
+	bindInterface         string
+	outputMode            outputMode
+	speedtest             bool
+	download              bool
+	downloadOutput        string
+	verbose               bool
+	debug                 bool
 }
 
 type sourceFile struct {
@@ -114,8 +134,25 @@ type sourceFile struct {
 	uploadURLParsed         *url.URL
 	uploadURLs              []string
 	uploadURLParsedByServer []*url.URL
+	uploadTargetSchedule    []int
+	uploadRouteTargets      []uploadRouteTarget
+	uploadFallbackTargets   []uploadRouteTarget
+	preparedPublicURL       string
 	displayName             string
 	fromStdin               bool
+	modTimeUnixNano         int64
+	committedChunks         map[int64]struct{}
+	committedMu             sync.Mutex
+}
+
+type uploadRouteTarget struct {
+	rawURL           string
+	parsedURL        *url.URL
+	nodeID           string
+	maxParallel      int
+	failoverPriority int
+	fallback         bool
+	master           bool
 }
 
 type urlCapture struct {
@@ -141,10 +178,21 @@ func (u *urlCapture) get() string {
 	return u.val
 }
 
+func newURLCapture(src *sourceFile) *urlCapture {
+	out := &urlCapture{}
+	if src != nil {
+		out.set(src.preparedPublicURL)
+	}
+	return out
+}
+
 type requestError struct {
-	status int
-	body   string
-	cause  error
+	status   int
+	body     string
+	cause    error
+	route    string
+	fallback bool
+	master   bool
 }
 
 type chunkAttemptResult struct {
@@ -177,12 +225,19 @@ func (e *requestError) Unwrap() error {
 }
 
 type uploader struct {
-	opts         options
-	client       *http.Client
-	chunkClients []*http.Client
-	dbg          *uploadDebugStats
-	subdomains   *uploadSubdomainPool
-	chunkIPs     *chunkOriginIPSet
+	opts            options
+	client          *http.Client
+	chunkClients    []*http.Client
+	uploadBodies    chan struct{}
+	chunkBodyLanes  chan int
+	dbg             *uploadDebugStats
+	subdomains      *uploadSubdomainPool
+	chunkIPs        *chunkOriginIPSet
+	planMaxParallel int
+	masterFallback  atomic.Bool
+	routeInit       sync.Once
+	routes          *routeCircuitSet
+	routeLimits     *routeLimiterSet
 }
 
 type fileMetadataPayload struct {

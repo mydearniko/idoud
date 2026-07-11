@@ -349,14 +349,17 @@ func (u *uploader) upload(ctx context.Context, src *sourceFile) (string, error) 
 		return "", errors.New("invalid source")
 	}
 
+	if err := u.prepareUpload(ctx, src); err != nil {
+		return "", err
+	}
+	parallel := u.effectiveUploadParallel()
+
 	stopDebug := u.startDebug(src)
 	defer stopDebug()
-	stopChunkIPLog := u.startChunkIPLogLoop(time.Second)
-	defer stopChunkIPLog()
 	defer u.logChunkOriginIPs()
 
 	if hasAnyNonLoopbackServer(u.opts) {
-		u.warmConnections(ctx, u.opts.parallel)
+		u.warmConnections(ctx, src, parallel)
 	}
 
 	if !src.knownSize {
@@ -367,8 +370,8 @@ func (u *uploader) upload(ctx context.Context, src *sourceFile) (string, error) 
 		return u.uploadKnownSizeStreamChunked(ctx, src)
 	}
 
-	urls := &urlCapture{}
-	u.logf("upload start name=%q size=%d chunk=%d parallel=%d", src.uploadName, src.size, u.opts.chunkSize, u.opts.parallel)
+	urls := newURLCapture(src)
+	u.logf("upload start name=%q size=%d chunk=%d parallel=%d", src.uploadName, src.size, u.opts.chunkSize, parallel)
 
 	if src.size == 0 {
 		if err := u.uploadEmptyWithRetry(ctx, src, urls); err != nil {
@@ -393,8 +396,10 @@ func (u *uploader) upload(ctx context.Context, src *sourceFile) (string, error) 
 		}
 	}
 
-	if err := u.uploadChunkWithRetry(ctx, src, lastChunk, true, urls); err != nil {
-		return "", err
+	if !src.isChunkCommitted(lastChunk) {
+		if err := u.uploadChunkWithRetry(ctx, src, lastChunk, true, urls); err != nil {
+			return "", err
+		}
 	}
 
 	finalURL := urls.get()

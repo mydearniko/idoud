@@ -12,3 +12,10 @@ func (u *uploader) clientForChunk(chunkIndex int64) *http.Client {
 	}
 	return u.client
 }
+
+func (u *uploader) clientForUpload(chunkIndex int64, lease *uploadBodyLease) *http.Client {
+	if u != nil && lease != nil && lease.connectionLane >= 0 && lease.connectionLane < len(u.chunkClients) {
+		return u.chunkClients[lease.connectionLane]
+	}
+	return u.clientForChunk(chunkIndex)
+}

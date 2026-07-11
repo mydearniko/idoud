@@ -20,18 +20,13 @@ func (u *uploader) uploadNonFinalChunks(ctx context.Context, src *sourceFile, la
 		return nil
 	}
 
-	// Mirror browser warmup behavior: complete the first non-final chunk before
-	// ramping up to the configured parallelism.
+	// Upload prepare already allocated the canonical file ID and target. Start
+	// chunk zero with the rest of the independent ranges so one cold TCP stream
+	// cannot serialize startup on a high-bandwidth, long-RTT path. The node still
+	// buffers chunk zero completely before acknowledging it.
 	startChunk := int64(0)
-	if err := u.uploadChunkWithRetry(ctx, src, 0, false, urls); err != nil {
-		return err
-	}
-	startChunk = 1
-	if startChunk >= lastChunk {
-		return nil
-	}
 
-	workers := u.opts.parallel
+	workers := u.effectiveUploadParallel()
 	if workers < 1 {
 		workers = 1
 	}
@@ -45,6 +40,13 @@ func (u *uploader) uploadNonFinalChunks(ctx context.Context, src *sourceFile, la
 
 	jobs := make(chan int64)
 	errCh := make(chan error, 1)
+	rampReady := make(chan struct{})
+	rampConfirmationsNeeded := int64(u.opts.uploadRampBurst / 2)
+	if rampConfirmationsNeeded < 1 {
+		rampConfirmationsNeeded = 1
+	}
+	var rampConfirmations int64
+	var rampReadyOnce sync.Once
 
 	var wg sync.WaitGroup
 	worker := func() {
@@ -58,6 +60,9 @@ func (u *uploader) uploadNonFinalChunks(ctx context.Context, src *sourceFile, la
 				cancel()
 				return
 			}
+			if atomic.AddInt64(&rampConfirmations, 1) >= rampConfirmationsNeeded {
+				rampReadyOnce.Do(func() { close(rampReady) })
+			}
 		}
 	}
 
@@ -66,8 +71,50 @@ func (u *uploader) uploadNonFinalChunks(ctx context.Context, src *sourceFile, la
 		go worker()
 	}
 
+	var nextRampStart time.Time
+	rampInterval := time.Duration(0)
+	rampConfirmed := false
+	if u.opts.uploadRampRPS > 0 {
+		rampInterval = time.Second / time.Duration(u.opts.uploadRampRPS)
+		if rampInterval < time.Microsecond {
+			rampInterval = time.Microsecond
+		}
+		nextRampStart = time.Now()
+	}
+
 sendLoop:
 	for idx := startChunk; idx < lastChunk; idx++ {
+		if src.isChunkCommitted(idx) {
+			continue
+		}
+		ordinal := idx - startChunk
+		if rampInterval > 0 && ordinal >= int64(u.opts.uploadRampBurst) {
+			if !rampConfirmed {
+				select {
+				case <-ctx.Done():
+					break sendLoop
+				case <-rampReady:
+					rampConfirmed = true
+					nextRampStart = time.Now()
+				}
+			}
+			nextRampStart = nextRampStart.Add(rampInterval)
+			wait := time.Until(nextRampStart)
+			if wait > 0 {
+				timer := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					break sendLoop
+				case <-timer.C:
+				}
+			}
+		}
 		select {
 		case <-ctx.Done():
 			break sendLoop
@@ -97,35 +144,50 @@ func (u *uploader) uploadChunkWithRetry(ctx context.Context, src *sourceFile, ch
 			chunkSize = end - start
 		}
 	}
-	return u.retryChunkUpload(
+	err := u.retryChunkUpload(
 		ctx,
 		chunkIndex,
 		chunkSize,
 		finalChunk,
 		urls,
 		"file",
-		func(reqCtx context.Context) (string, int, error) {
-			return u.uploadChunkOnce(reqCtx, src, chunkIndex, finalChunk)
+		func(reqCtx context.Context, attempt int) (string, int, error) {
+			return u.uploadChunkOnce(reqCtx, src, chunkIndex, finalChunk, attempt)
 		},
 	)
+	if err == nil {
+		src.markChunkCommitted(chunkIndex)
+	}
+	return err
 }
 
 func (u *uploader) uploadEmptyWithRetry(ctx context.Context, src *sourceFile, urls *urlCapture) error {
 	var lastErr error
-	for attempt := 0; attempt <= u.opts.retries; attempt++ {
-		body, status, err := u.uploadEmptyOnce(ctx, src)
+	started := time.Now()
+	for attempt := 0; ; attempt++ {
+		body, status, err := u.uploadEmptyOnce(ctx, src, attempt)
 		if err == nil {
 			urls.set(body)
 			return nil
 		}
 		lastErr = err
 
-		if !isRetryableStatus(ctx, status, err) || attempt >= u.opts.retries {
+		if !isRetryableStatus(ctx, status, err) {
+			break
+		}
+		if u.opts.resumeTimeout > 0 && time.Since(started) >= u.opts.resumeTimeout {
 			break
 		}
 
 		delay := retryBackoff(attempt + 1)
-		u.logf("empty upload retry attempt=%d/%d status=%d delay=%s err=%v", attempt+1, u.opts.retries, status, delay, err)
+		if routeFailure(status, err) {
+			delay = 50 * time.Millisecond
+		}
+		var reqErr *requestError
+		if attempt >= u.opts.retries && errors.As(err, &reqErr) && reqErr != nil && reqErr.master {
+			delay = 10 * time.Second
+		}
+		u.logf("empty upload retry attempt=%d status=%d delay=%s err=%v", attempt+1, status, delay, err)
 		if err := sleepContext(ctx, delay); err != nil {
 			return err
 		}
@@ -137,14 +199,15 @@ func (u *uploader) doChunkAttempt(
 	ctx context.Context,
 	chunkIndex int64,
 	finalChunk bool,
-	fn func(context.Context) (string, int, error),
+	attempt int,
+	fn func(context.Context, int) (string, int, error),
 ) (string, int, error) {
 	if fn == nil {
 		return "", 0, errors.New("missing chunk upload function")
 	}
 	hedgeDelay := u.opts.hedgeDelay
 	if finalChunk || hedgeDelay <= 0 {
-		body, status, err := fn(ctx)
+		body, status, err := fn(ctx, attempt)
 		u.debugChunkAttempt(status, err)
 		return body, status, err
 	}
@@ -154,7 +217,7 @@ func (u *uploader) doChunkAttempt(
 
 	results := make(chan chunkAttemptResult, 2)
 	go func() {
-		body, status, err := fn(primaryCtx)
+		body, status, err := fn(primaryCtx, attempt)
 		results <- chunkAttemptResult{body: body, status: status, err: err}
 	}()
 
@@ -173,7 +236,7 @@ func (u *uploader) doChunkAttempt(
 	hedgeCtx, cancelHedge := context.WithCancel(ctx)
 	defer cancelHedge()
 	go func() {
-		body, status, err := fn(hedgeCtx)
+		body, status, err := fn(hedgeCtx, attempt)
 		results <- chunkAttemptResult{body: body, status: status, err: err}
 	}()
 	u.debugHedge()
@@ -218,7 +281,7 @@ func (u *uploader) retryChunkUpload(
 	finalChunk bool,
 	urls *urlCapture,
 	mode string,
-	once func(context.Context) (string, int, error),
+	once func(context.Context, int) (string, int, error),
 ) error {
 	u.debugChunkStart(chunkSize, finalChunk)
 	success := false
@@ -231,13 +294,9 @@ func (u *uploader) retryChunkUpload(
 	// get extended retries with longer backoff to survive transient network
 	// hiccups — especially important for interface-bound uploads (-I).
 	// HTTP-level errors (status > 0) use the normal retry budget.
-	maxRetries := u.opts.retries
-	connRetries := 0
-	const maxConnRetries = 24 // ~5 min runway for connection outages
-	const connRetryBackoff = 10 * time.Second
-
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		body, status, err := u.doChunkAttempt(ctx, chunkIndex, finalChunk, once)
+	retryStartedAt := time.Now()
+	for attempt := 0; ; attempt++ {
+		body, status, err := u.doChunkAttempt(ctx, chunkIndex, finalChunk, attempt, once)
 		if err == nil {
 			urls.set(body)
 			success = true
@@ -255,30 +314,23 @@ func (u *uploader) retryChunkUpload(
 			}
 		}
 
-		if !isRetryableStatus(ctx, status, err) || attempt >= maxRetries {
+		if !isRetryableStatus(ctx, status, err) {
+			break
+		}
+		if u.opts.resumeTimeout > 0 && time.Since(retryStartedAt) >= u.opts.resumeTimeout {
 			break
 		}
 
-		// Pure connection error on a non-final chunk: use extended retry budget.
-		if status == 0 && !finalChunk && !isContextErr(err) {
-			connRetries++
-			if connRetries <= maxConnRetries {
-				// Extend the retry budget so this attempt doesn't count toward
-				// the normal HTTP-error limit.
-				maxRetries++
-				delay := connRetryBackoff
-				u.logf("chunk(%s) conn-retry idx=%d attempt=%d/%d conn=%d/%d delay=%s err=%v",
-					mode, chunkIndex, attempt+1, maxRetries, connRetries, maxConnRetries, delay, err)
-				if sleepErr := sleepContext(ctx, delay); sleepErr != nil {
-					return sleepErr
-				}
-				continue
-			}
-		}
-
 		delay := retryBackoff(attempt + 1)
+		if routeFailure(status, err) {
+			delay = 50 * time.Millisecond
+		}
+		var reqErr *requestError
+		if attempt >= u.opts.retries && errors.As(err, &reqErr) && reqErr != nil && reqErr.master {
+			delay = 10 * time.Second
+		}
 		u.debugRetry()
-		u.logf("chunk(%s) retry idx=%d final=%t attempt=%d/%d status=%d delay=%s err=%v", mode, chunkIndex, finalChunk, attempt+1, maxRetries, status, delay, err)
+		u.logf("chunk(%s) retry idx=%d final=%t attempt=%d status=%d delay=%s master_fallback=%t err=%v", mode, chunkIndex, finalChunk, attempt+1, status, delay, u.masterFallback.Load(), err)
 		sleepStarted := time.Now()
 		sleepErr := sleepContext(ctx, delay)
 		u.debugRetrySleep(time.Since(sleepStarted))
@@ -308,10 +360,31 @@ func (u *uploader) uploadPUT(
 	chunkIndex int64,
 	finalChunk bool,
 	setFinalChunkHeader bool,
+	attempt int,
 ) (string, int, error) {
 	if src == nil {
 		return "", 0, errors.New("missing upload source")
 	}
+	_ = attempt
+	u.ensureRouteState()
+	target, err := u.selectUploadRoute(src, chunkIndex)
+	if err != nil {
+		return "", 0, &requestError{cause: err}
+	}
+	if u.routeLimits == nil {
+		u.routeLimits = newRouteLimiterSet()
+	}
+	u.routeLimits.configure([]uploadRouteTarget{target})
+	releaseRoute, err := u.routeLimits.acquire(ctx, target.rawURL)
+	if err != nil {
+		return "", 0, &requestError{cause: err, route: target.rawURL, fallback: target.fallback, master: target.master}
+	}
+	defer releaseRoute()
+	uploadBodyLease, err := u.acquireUploadBody(ctx, chunkIndex)
+	if err != nil {
+		return "", 0, &requestError{cause: err, route: target.rawURL, fallback: target.fallback, master: target.master}
+	}
+	defer uploadBodyLease.releaseRequest()
 	if chunkIndex >= 0 {
 		ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
 			GotConn: func(info httptrace.GotConnInfo) {
@@ -319,10 +392,13 @@ func (u *uploader) uploadPUT(
 					u.recordChunkRemoteIP(info.Conn.RemoteAddr())
 				}
 			},
+			WroteRequest: func(httptrace.WroteRequestInfo) {
+				uploadBodyLease.releaseWritten()
+			},
 		})
 	}
 	buildStarted := time.Now()
-	req, err := u.newUploadPUTRequest(ctx, src, body, chunkIndex)
+	req, err := u.newUploadPUTRequest(ctx, body, target)
 	if err != nil {
 		u.debugRequestBuild(time.Since(buildStarted))
 		return "", 0, err
@@ -333,8 +409,14 @@ func (u *uploader) uploadPUT(
 	if contentRange != "" {
 		req.Header.Set("Content-Range", contentRange)
 	}
-	if setFinalChunkHeader && finalChunk {
-		req.Header.Set(headerUploadFinalChunk, "1")
+	if setFinalChunkHeader {
+		req.Header.Set(headerUploadWaitStored, "1")
+		if finalChunk {
+			req.Header.Set(headerUploadFinalChunk, "1")
+		}
+	}
+	if target.fallback || target.master {
+		req.Header.Set("X-Upload-Fallback", "1")
 	}
 	if u.opts.speedtest {
 		req.Header.Set(headerUploadSpeedtest, "1")
@@ -348,17 +430,27 @@ func (u *uploader) uploadPUT(
 	u.debugRequestBuild(time.Since(buildStarted))
 
 	httpStarted := time.Now()
-	client := u.clientForChunk(chunkIndex)
+	client := u.clientForUpload(chunkIndex, uploadBodyLease)
 	if client == nil {
 		return "", 0, errors.New("missing HTTP client")
 	}
 	resp, err := client.Do(req)
 	u.debugHTTPRoundTrip(time.Since(httpStarted))
 	if err != nil {
-		return "", 0, &requestError{cause: err}
+		requestErr := &requestError{cause: err, route: target.rawURL, fallback: target.fallback, master: target.master}
+		if u.routes != nil {
+			u.routes.failure(target.rawURL, 0, requestErr)
+		}
+		if target.master {
+			u.masterFallback.Store(true)
+		}
+		return "", 0, requestErr
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if u.routes != nil {
+			u.routes.success(target.rawURL)
+		}
 		// Most non-final chunk responses are empty; skip body allocation on that
 		// hot path while preserving connection reuse.
 		if resp.ContentLength == 0 {
@@ -377,20 +469,91 @@ func (u *uploader) uploadPUT(
 	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 	u.debugResponseRead(time.Since(respReadStarted))
 	respBody := strings.TrimSpace(string(bodyBytes))
-	return "", resp.StatusCode, &requestError{
-		status: resp.StatusCode,
-		body:   respBody,
+	requestErr := &requestError{
+		status:   resp.StatusCode,
+		body:     respBody,
+		route:    target.rawURL,
+		fallback: target.fallback,
+		master:   target.master,
 	}
+	if u.routes != nil {
+		u.routes.failure(target.rawURL, resp.StatusCode, requestErr)
+	}
+	if target.master {
+		u.masterFallback.Store(true)
+	}
+	return "", resp.StatusCode, requestErr
 }
 
-func (u *uploader) newUploadPUTRequest(ctx context.Context, src *sourceFile, body io.Reader, chunkIndex int64) (*http.Request, error) {
-	if src == nil {
-		return nil, errors.New("missing upload source")
+type uploadBodyLease struct {
+	writeOnce      sync.Once
+	uploadBodyGate chan struct{}
+	connectionPool chan int
+	connectionLane int
+}
+
+func (l *uploadBodyLease) releaseWritten() {
+	if l == nil {
+		return
 	}
+	l.writeOnce.Do(func() {
+		if l.uploadBodyGate != nil {
+			<-l.uploadBodyGate
+		}
+		// An HTTP/2 lane limits concurrent request-body writers, not requests
+		// awaiting a response. Once net/http reports WroteRequest, the stream no
+		// longer contributes upload bytes and the same connection can safely
+		// carry the next body while Discord confirmation is still pending.
+		if l.connectionPool != nil && l.connectionLane >= 0 {
+			l.connectionPool <- l.connectionLane
+		}
+	})
+}
+
+func (l *uploadBodyLease) releaseRequest() {
+	if l == nil {
+		return
+	}
+	// WroteRequest is not guaranteed after a dial or early transport failure,
+	// so the request defer remains the idempotent fallback release path.
+	l.releaseWritten()
+}
+
+func (u *uploader) acquireUploadBody(ctx context.Context, chunkIndex int64) (*uploadBodyLease, error) {
+	lease := &uploadBodyLease{connectionLane: -1}
+	if u == nil || chunkIndex < 0 {
+		return lease, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if u.chunkBodyLanes != nil {
+		lease.connectionPool = u.chunkBodyLanes
+		select {
+		case lease.connectionLane = <-lease.connectionPool:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if u.uploadBodies != nil {
+		lease.uploadBodyGate = u.uploadBodies
+		select {
+		case lease.uploadBodyGate <- struct{}{}:
+		case <-ctx.Done():
+			if lease.connectionPool != nil && lease.connectionLane >= 0 {
+				lease.connectionPool <- lease.connectionLane
+			}
+			return nil, ctx.Err()
+		}
+	}
+	return lease, nil
+}
+
+func (u *uploader) newUploadPUTRequest(ctx context.Context, body io.Reader, target uploadRouteTarget) (*http.Request, error) {
 	if body == nil {
 		body = http.NoBody
 	}
-	targetURL, targetParsed := src.uploadTargetForChunk(chunkIndex)
+	targetURL, targetParsed := target.rawURL, target.parsedURL
 	if targetURL == "" {
 		return nil, errors.New("missing upload target URL")
 	}
@@ -406,7 +569,7 @@ func (u *uploader) newUploadPUTRequest(ctx context.Context, src *sourceFile, bod
 	return http.NewRequestWithContext(ctx, http.MethodPut, u.routeUploadURL(targetURL), body)
 }
 
-func (u *uploader) uploadChunkOnce(ctx context.Context, src *sourceFile, chunkIndex int64, finalChunk bool) (string, int, error) {
+func (u *uploader) uploadChunkOnce(ctx context.Context, src *sourceFile, chunkIndex int64, finalChunk bool, attempt int) (string, int, error) {
 	start := chunkIndex * u.opts.chunkSize
 	if start < 0 || start >= src.size {
 		return "", 0, fmt.Errorf("chunk index out of range: %d", chunkIndex)
@@ -429,14 +592,14 @@ func (u *uploader) uploadChunkOnce(ctx context.Context, src *sourceFile, chunkIn
 
 	reader := io.NewSectionReader(src.readerAt, start, length)
 	contentRange := buildContentRange(start, endExclusive)
-	return u.uploadPUT(reqCtx, src, reader, length, contentRange, chunkIndex, finalChunk, true)
+	return u.uploadPUT(reqCtx, src, reader, length, contentRange, chunkIndex, finalChunk, true, attempt)
 }
 
-func (u *uploader) uploadEmptyOnce(ctx context.Context, src *sourceFile) (string, int, error) {
+func (u *uploader) uploadEmptyOnce(ctx context.Context, src *sourceFile, attempt int) (string, int, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, u.opts.finalChunkTimeout)
 	defer cancel()
 
-	return u.uploadPUT(reqCtx, src, http.NoBody, 0, "", -1, false, false)
+	return u.uploadPUT(reqCtx, src, http.NoBody, 0, "", -1, false, false, attempt)
 }
 
 func buildContentRange(start, endExclusive int64) string {
@@ -632,7 +795,7 @@ func (u *uploader) probeMetadata(ctx context.Context, fileID string, wait time.D
 		default:
 			if u.opts.debug && payload.TotalBytes > 0 {
 				pct := float64(payload.UploadedBytes) / float64(payload.TotalBytes) * 100
-				stderrLogf("finalize_progress file=%s stored=%s/%s (%.1f%%)",
+				stderrLogf("finalize_progress file=%s uploaded=%s/%s (%.1f%%)",
 					fileID, formatByteSize(payload.UploadedBytes), formatByteSize(payload.TotalBytes), pct)
 			}
 			return false, false, nil

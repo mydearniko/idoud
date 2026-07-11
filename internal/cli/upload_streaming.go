@@ -15,8 +15,9 @@ func (u *uploader) uploadKnownSizeStreamChunked(ctx context.Context, src *source
 		return "", errors.New("invalid stream source")
 	}
 
-	urls := &urlCapture{}
-	u.logf("upload(stream) start name=%q size=%d chunk=%d parallel=%d", src.uploadName, src.size, u.opts.chunkSize, u.opts.parallel)
+	urls := newURLCapture(src)
+	parallel := u.effectiveUploadParallel()
+	u.logf("upload(stream) start name=%q size=%d chunk=%d parallel=%d", src.uploadName, src.size, u.opts.chunkSize, parallel)
 
 	if src.size == 0 {
 		if err := u.uploadEmptyWithRetry(ctx, src, urls); err != nil {
@@ -35,7 +36,7 @@ func (u *uploader) uploadKnownSizeStreamChunked(ctx context.Context, src *source
 	}
 
 	nonFinal := totalChunks - 1
-	workers := u.opts.parallel
+	workers := parallel
 	if workers < 1 {
 		workers = 1
 	}
@@ -45,7 +46,7 @@ func (u *uploader) uploadKnownSizeStreamChunked(ctx context.Context, src *source
 		workers = int(nonFinal)
 	}
 
-	bufferCount := streamBufferPoolCount(workers)
+	bufferCount := streamBufferPoolCount(workers, u.opts.chunkSize)
 	streamReader := src.stream
 
 	pool := make(chan []byte, bufferCount)
@@ -227,7 +228,7 @@ func (u *uploader) uploadPreparedChunkWithRetryMode(
 	finalChunk bool,
 	urls *urlCapture,
 	mode string,
-	once func(context.Context, *sourceFile, preparedChunk, bool) (string, int, error),
+	once func(context.Context, *sourceFile, preparedChunk, bool, int) (string, int, error),
 ) error {
 	return u.retryChunkUpload(
 		ctx,
@@ -236,19 +237,19 @@ func (u *uploader) uploadPreparedChunkWithRetryMode(
 		finalChunk,
 		urls,
 		mode,
-		func(reqCtx context.Context) (string, int, error) {
-			return once(reqCtx, src, chunk, finalChunk)
+		func(reqCtx context.Context, attempt int) (string, int, error) {
+			return once(reqCtx, src, chunk, finalChunk, attempt)
 		},
 	)
 }
 
-func (u *uploader) uploadPreparedChunkUnknownOnce(ctx context.Context, src *sourceFile, chunk preparedChunk, finalChunk bool) (string, int, error) {
+func (u *uploader) uploadPreparedChunkUnknownOnce(ctx context.Context, src *sourceFile, chunk preparedChunk, finalChunk bool, attempt int) (string, int, error) {
 	if chunk.size <= 0 {
 		return "", 0, errors.New("invalid prepared chunk size")
 	}
 	endExclusive := chunk.start + int64(chunk.size)
 	contentRange := buildContentRange(chunk.start, endExclusive)
-	return u.uploadPreparedChunkOnceWithContentRange(ctx, src, chunk, finalChunk, contentRange, true)
+	return u.uploadPreparedChunkOnceWithContentRange(ctx, src, chunk, finalChunk, contentRange, true, attempt)
 }
 
 func (u *uploader) uploadPreparedChunkOnceWithContentRange(
@@ -258,6 +259,7 @@ func (u *uploader) uploadPreparedChunkOnceWithContentRange(
 	finalChunk bool,
 	contentRange string,
 	setFinalChunkHeader bool,
+	attempt int,
 ) (string, int, error) {
 	timeout := u.opts.requestTimeout
 	if finalChunk {
@@ -267,7 +269,7 @@ func (u *uploader) uploadPreparedChunkOnceWithContentRange(
 	defer cancel()
 
 	reader := bytes.NewReader(chunk.buf[:chunk.size])
-	return u.uploadPUT(reqCtx, src, reader, int64(chunk.size), contentRange, chunk.index, finalChunk, setFinalChunkHeader)
+	return u.uploadPUT(reqCtx, src, reader, int64(chunk.size), contentRange, chunk.index, finalChunk, setFinalChunkHeader, attempt)
 }
 
 // stdinScatterResult carries a chunk from the scatter-read goroutine to the
@@ -280,10 +282,9 @@ type stdinScatterResult struct {
 	err   error // non-nil on read failure
 }
 
-// scatterReadStdin reads from stdin directly into pool-allocated 3 MiB chunk
-// buffers using io.ReadFull.  With the 64 MiB pipe buffer, each ReadFull
-// typically completes in a single read() syscall because the pipe already
-// holds enough data.  Zero intermediate copies — data goes pipe → chunk buf.
+// scatterReadStdin reads from stdin directly into pool-allocated planned-size
+// chunk buffers using io.ReadFull. With the large pipe buffer, each ReadFull
+// usually completes in a small number of read() syscalls.
 // One completed chunk is always held back so the final chunk can be tagged.
 func (u *uploader) scatterReadStdin(
 	ctx context.Context,
@@ -345,8 +346,7 @@ func (u *uploader) scatterReadStdin(
 			u.debugPoolWait(time.Since(poolStart))
 		}
 
-		// Read directly into the chunk buffer — zero intermediate copy.
-		// With a 64 MiB pipe buffer, ReadFull usually completes in 1 syscall.
+		// Read directly into the chunk buffer without an intermediate copy.
 		readStart := time.Now()
 		n, err := io.ReadFull(src, buf[:chunkSize])
 		u.debugReadWait(time.Since(readStart))
@@ -415,17 +415,18 @@ func (u *uploader) uploadUnknownSizeStreamChunked(ctx context.Context, src *sour
 	if src == nil || src.stream == nil {
 		return "", errors.New("invalid stream source")
 	}
-	u.logf("upload(stream-unknown) start name=%q chunk=%d parallel=%d", src.uploadName, u.opts.chunkSize, u.opts.parallel)
+	parallel := u.effectiveUploadParallel()
+	u.logf("upload(stream-unknown) start name=%q chunk=%d parallel=%d", src.uploadName, u.opts.chunkSize, parallel)
 
 	chunkCap := int(u.opts.chunkSize)
 	if chunkCap <= 0 {
 		return "", errors.New("invalid chunk size")
 	}
-	workers := u.opts.parallel
+	workers := parallel
 	if workers < 1 {
 		workers = 1
 	}
-	bufferCount := streamBufferPoolCount(workers)
+	bufferCount := streamBufferPoolCount(workers, u.opts.chunkSize)
 
 	pool := make(chan []byte, bufferCount)
 	for i := 0; i < bufferCount; i++ {
@@ -442,13 +443,12 @@ func (u *uploader) uploadUnknownSizeStreamChunked(ctx context.Context, src *sour
 		}
 	}
 
-	urls := &urlCapture{}
+	urls := newURLCapture(src)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Scatter-read goroutine: drains stdin with large reads (up to 16 MiB per
-	// syscall), scatters data into pooled 3 MiB chunks.  Multiple chunks can
-	// be produced from a single read(), dramatically reducing syscall count.
+	// Scatter-read goroutine: drains stdin directly into pooled planned-size
+	// chunks. One completed chunk is held back so the final chunk can be tagged.
 	chunkCh := make(chan stdinScatterResult, workers*2)
 	go u.scatterReadStdin(ctx, src.stream, chunkCap, pool, chunkCh)
 
@@ -516,7 +516,7 @@ drainLoop:
 		}
 	}
 
-	// Drain any remaining chunks from the channel after cancellation.
+	// Release any buffered chunks still waiting after cancellation.
 	for res := range chunkCh {
 		if res.chunk.buf != nil {
 			putBuf(res.chunk.buf)
@@ -574,19 +574,29 @@ drainLoop:
 	return finalURL, nil
 }
 
-func streamBufferPoolCount(workers int) int {
+func streamBufferPoolCount(workers int, chunkSize int64) int {
 	if workers < 0 {
 		workers = 0
 	}
 	// Enough buffers for all in-flight workers plus moderate readahead.
-	// At 3 MiB per buffer, cap at 480 (~1440 MiB) to stay within the
-	// 1500 MiB upload memory budget.
 	n := workers + workers/3 + 8
 	if n < 4 {
 		n = 4
 	}
-	if n > 480 {
-		n = 480
+	if chunkSize <= 0 {
+		chunkSize = defaultChunkSize
+	}
+	// Keep stdin lightweight and predictable: at the production chunk size the
+	// 256 MiB ceiling holds 25 complete, independently retryable chunks. That
+	// fully feeds the automatic 24-worker stdin window without coupling a node
+	// request to the speed of the incoming stream.
+	const maxStreamBufferBytes = int64(256 * 1024 * 1024)
+	maxByBytes := int(maxStreamBufferBytes / chunkSize)
+	if maxByBytes < 4 {
+		maxByBytes = 4
+	}
+	if n > maxByBytes {
+		n = maxByBytes
 	}
 	return n
 }

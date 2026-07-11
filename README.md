@@ -1,203 +1,97 @@
 # idoud CLI
 
-Standalone Go CLI accelerated uploader for idoud.
+Small, static command-line client for uploading to and downloading from idoud.
 
-## Install / Update
+## Install
 
-### Linux / macOS
+Linux and macOS:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mydearniko/idoud/main/install.sh | sh
 ```
 
-### Windows (PowerShell)
+Windows PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/mydearniko/idoud/main/install.ps1 | iex
 ```
 
-### Other systems
-
 Build from source:
 
 ```bash
-go build -o idoud .
+go build -trimpath -ldflags="-s -w" -o idoud .
 ```
 
-## Features
-
-- Upload a single file:
-  - `idoud archive.zip`
-- Upload from stdin:
-  - `cat archive.zip | idoud --stdin --name archive.zip`
-- Full chunked upload flow:
-  - sends `PUT` requests with `Content-Range`
-  - uses `X-Upload-Key` across all chunks
-  - retries retryable chunk failures (409/429/5xx/network)
-  - waits for finalization via `/v1/files/{id}` readiness checks (with short server-side wait hints when supported)
-- Optional upload password and download limit headers.
-
-## Build
+## Use
 
 ```bash
-cd cli
-go build -o idoud .
-```
-
-## Usage
-
-```bash
-idoud [flags] <file>
-idoud --stdin [--name <filename> | <filename>] [flags]
-```
-
-### Examples
-
-```bash
+# Upload a file and print its public URL.
 idoud archive.zip
-cat archive.zip | idoud --stdin archive.zip
-idoud --server https://idoud.cc --parallel 16 archive.zip
-idoud --password "secret" --download-limit 3 archive.zip
+
+# Upload standard input with an explicit filename.
+cat archive.zip | idoud --stdin --name archive.zip
+
+# Protect an upload and limit downloads.
+idoud archive.zip --password secret --download-limit 3
+
+# Download by public URL or file ID.
+idoud --download https://idoud.cc/AbC123/archive.zip
+idoud --download AbC123 --download-output ./archive.zip
 ```
 
-## Important flags
+Run `idoud --help` for user-facing options and `idoud --version` for build
+identification.
 
-- `--server` server origin, or comma-separated origins for per-chunk round-robin (default `https://idoud.cc`)
-- `--stdin` read payload from stdin instead of a path argument
-- `--stdin-size` known stdin size hint for stdin uploads
-- `--name` upload filename override (recommended with `--stdin`)
-- `--chunk-size` chunk size for `Content-Range` uploads (must be exactly `3145728` bytes / 3 MiB)
-- `--parallel` parallel non-final chunk uploads (default `32`)
-- `--subdomains` force numbered upload subdomains `0..N-1` on `idoud.cc` origin
-- `--ips` force chunk upload destination IPs (comma-separated), round-robin by chunk index
-- `--no-ipv6` disable IPv6 and force IPv4-only connections
-- `--no-subdomains` disable numbered subdomain upload routing (alias: `--nosub`)
-- `--speedtest` benchmark ingest path with server-side sink mode (no persisted file output)
-- `--retries` retries per chunk (default `6`)
-- `--hedge-delay` speculative duplicate delay for slow non-final chunks (default `0s`, disabled)
-- `--debug` print live chunk concurrency, retries, throughput, and 7-sample moving average speed to stderr
-- `--request-timeout` timeout for non-final chunk requests (default `45s`)
-- `--final-request-timeout` timeout for final chunk request (default `95s`)
-- `--finalize-recovery-timeout` readiness wait after uncertain final chunk responses (default `95s`)
-- `--finalize-poll-interval` readiness poll interval (default `1.2s`)
-- `--finalize-timeout` max wait for server finalization (default `20m`)
-- `--output` stdout mode: `url` (default), `json`, `none`
-- `--json` shorthand for `--output json`
-- `--password` sets `X-Upload-Password`
-- `--download-limit` sets `X-Upload-Download-Limit`
-- `--insecure` skip TLS verification
-- `--verbose` enable retry/finalization logs to stderr
+## Behavior
 
-## Notes
+- The CLI asks the public API for an upload or download plan.
+- Upload chunks are distributed across the plan's active node origins. Route
+  health is shared by every worker, so one failed probe moves the transfer to
+  another route—or directly to the plan's standby—without sending every chunk
+  through the same failure first. The public server is only the final emergency
+  relay, not the normal data path.
+- Normal-file uploads keep a small local resume token. Re-running the same
+  command reuses the existing upload and skips chunks already stored by the
+  provider.
+- Large/high-latency uploads separate active request-body writes from requests
+  waiting for server confirmation, preventing slow connections from creating a
+  long completion tail.
+- Downloads fetch independent byte ranges from the plan's mirrors and write
+  directly to a persistent `.idoud.part` file. Re-running the command skips
+  verified ranges and atomically promotes the file when complete.
+- Transfers retry interruptions for 24 hours by default; individual CLI chunk
+  requests allow two minutes for durable provider confirmation. Change these
+  windows with `--resume-timeout` and `--request-timeout`.
+- Standard-input uploads use at most 256 MiB of complete retryable chunk
+  buffers at the production chunk size and work with either known or unknown
+  input size.
+- Diagnostics go to stderr. Successful machine-readable output stays isolated
+  on stdout.
 
-- Stdin uploads are streamed with bounded RAM using a chunk buffer pool.
-- For unknown stdin size, the CLI still uploads in parallel using chunked `Content-Range: bytes .../*` requests and marks only the last chunk with `X-Upload-Final: 1`.
-- `--output url` prints exactly one final URL to stdout on success.
-- `--output json` prints exactly one JSON document to stdout for success, `--help`, and CLI errors.
-- `--output none` prints nothing to stdout on success (i don't know why)
-- `--verbose` and `--debug` never write to stdout; they only write diagnostics to stderr.
+## Automation
 
-## Automation Output Modes
+`--output url` is the default and prints one URL (upload) or output path
+(download). `--output none` suppresses success output when only the exit status
+matters. `--output json` or `--json` emits one schema-versioned JSON document
+for success, help, and errors.
 
-### `--output url` (default)
+Stable JSON error codes are:
 
-For successful uploads, stdout contains exactly one line:
+- `usage_error`
+- `input_error`
+- `upload_failed`
+- `download_failed`
 
-```text
-https://idoud.cc/AbC123/file.bin
-```
+## Operator diagnostics
 
-Errors stay on stderr.
+Set `IDOUD_SHOW_OPERATOR_FLAGS=1` before `idoud --help` to show transport,
+address-pinning, and speed-test controls. These flags are intentionally hidden
+from normal help because server-provided plans are the production source of
+truth.
 
-### `--output none`
+## Development
 
-For successful uploads, stdout is empty. Useful when the caller only cares about the exit code.
-
-### `--output json` / `--json`
-
-Stdout contains exactly one JSON object and nothing else. This applies to:
-
-- successful uploads
-- `--help`
-- CLI usage/argument errors
-- input/open errors
-- upload/runtime errors
-
-#### JSON schema
-
-Top-level fields:
-
-- `schema_version` integer schema version, currently `1`
-- `ok` boolean success flag
-- `type` one of `result`, `help`, `error`
-- `exit_code` process exit code
-- `result` present only when `type=result`
-- `help` present only when `type=help`
-- `error` present only when `type=error`
-
-`result` fields:
-
-- `url` final public URL
-- `name` upload filename after CLI sanitization
-- `source` `file` or `stdin`
-- `known_size` whether the CLI knew the full input size before upload completion
-- `size` total size in bytes when known
-
-`error` fields:
-
-- `code` stable machine code:
-  - `usage_error`
-  - `input_error`
-  - `upload_failed`
-- `message` human-readable error string
-- `hint` optional human-readable recovery hint, currently used for usage errors
-
-#### JSON examples
-
-Success:
-
-```json
-{
-  "schema_version": 1,
-  "ok": true,
-  "type": "result",
-  "exit_code": 0,
-  "result": {
-    "url": "https://idoud.cc/AbC123",
-    "name": "archive.zip",
-    "source": "file",
-    "known_size": true,
-    "size": 123456
-  }
-}
-```
-
-Usage error:
-
-```json
-{
-  "schema_version": 1,
-  "ok": false,
-  "type": "error",
-  "exit_code": 2,
-  "error": {
-    "code": "usage_error",
-    "message": "missing input: pass a file path or use --stdin",
-    "hint": "pass a file path (idoud <file>) or use stdin mode (cat <file> | idoud --stdin --name <filename>)"
-  }
-}
-```
-
-Help:
-
-```json
-{
-  "schema_version": 1,
-  "ok": true,
-  "type": "help",
-  "exit_code": 0,
-  "help": {
-    "text": "IDOUD CLI\n..."
-  }
-}
+```bash
+go test ./...
+go vet ./...
 ```

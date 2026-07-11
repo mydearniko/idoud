@@ -97,6 +97,7 @@ func openSource(filePath string, opts options) (*sourceFile, func(), error) {
 		uploadURLs:              uploadURLs,
 		uploadURLParsedByServer: uploadParsed,
 		displayName:             filePath,
+		modTimeUnixNano:         stat.ModTime().UnixNano(),
 	}
 	cleanup := func() {
 		if src.closer != nil {
@@ -147,7 +148,14 @@ func (src *sourceFile) uploadTargetForChunk(chunkIndex int64) (string, *url.URL)
 
 	index := 0
 	if len(src.uploadURLs) > 1 && chunkIndex >= 0 {
-		index = int(chunkIndex % int64(len(src.uploadURLs)))
+		if len(src.uploadTargetSchedule) > 0 {
+			index = src.uploadTargetSchedule[int(chunkIndex%int64(len(src.uploadTargetSchedule)))]
+		} else {
+			index = int(chunkIndex % int64(len(src.uploadURLs)))
+		}
+		if index < 0 || index >= len(src.uploadURLs) {
+			index = int(chunkIndex % int64(len(src.uploadURLs)))
+		}
 	}
 
 	rawURL := src.uploadURLs[index]
@@ -155,4 +163,29 @@ func (src *sourceFile) uploadTargetForChunk(chunkIndex int64) (string, *url.URL)
 		return rawURL, src.uploadURLParsedByServer[index]
 	}
 	return rawURL, src.uploadURLParsed
+}
+
+func (src *sourceFile) isChunkCommitted(chunkIndex int64) bool {
+	if src == nil || chunkIndex < 0 {
+		return false
+	}
+	src.committedMu.Lock()
+	defer src.committedMu.Unlock()
+	if src.committedChunks == nil {
+		return false
+	}
+	_, ok := src.committedChunks[chunkIndex]
+	return ok
+}
+
+func (src *sourceFile) markChunkCommitted(chunkIndex int64) {
+	if src == nil || chunkIndex < 0 {
+		return
+	}
+	src.committedMu.Lock()
+	defer src.committedMu.Unlock()
+	if src.committedChunks == nil {
+		src.committedChunks = make(map[int64]struct{})
+	}
+	src.committedChunks[chunkIndex] = struct{}{}
 }

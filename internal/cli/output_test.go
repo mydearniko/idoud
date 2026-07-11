@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -30,6 +31,36 @@ func TestRunJSONHelp(t *testing.T) {
 	if payload.Help == nil || !strings.Contains(payload.Help.Text, "IDOUD CLI") {
 		t.Fatalf("help payload=%+v, want usage text", payload.Help)
 	}
+	assertNoPublicPrivateBoundaryTerms(t, "JSON help text", payload.Help.Text)
+	assertNoPublicPrivateBoundaryTerms(t, "JSON help envelope", stdout)
+}
+
+func TestRunTextHelpDoesNotExposePrivateBoundaryTerms(t *testing.T) {
+	t.Setenv("IDOUD_SHOW_OPERATOR_FLAGS", "")
+
+	for _, args := range [][]string{
+		{"--help"},
+		{},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			exitCode, stdout, stderr := captureRunOutput(t, args)
+			if exitCode != 0 {
+				t.Fatalf("Run exitCode=%d, want 0", exitCode)
+			}
+			if stdout == "" || !strings.Contains(stdout, "IDOUD CLI") {
+				t.Fatalf("stdout=%q, want public help text", stdout)
+			}
+			if stderr != "" {
+				t.Fatalf("stderr=%q, want empty", stderr)
+			}
+			assertNoPublicPrivateBoundaryTerms(t, "text help", stdout)
+			for _, hiddenFlag := range []string{"--chunk-size", "--subdomains", "--ips", "--interface", "--no-ipv6", "--speedtest"} {
+				if strings.Contains(stdout, hiddenFlag) {
+					t.Fatalf("text help exposed operator compatibility flag %q in %q", hiddenFlag, stdout)
+				}
+			}
+		})
+	}
 }
 
 func TestRunJSONUsageError(t *testing.T) {
@@ -51,8 +82,15 @@ func TestRunJSONUsageError(t *testing.T) {
 	if payload.Error == nil || payload.Error.Code != "usage_error" {
 		t.Fatalf("error payload=%+v, want usage_error", payload.Error)
 	}
+	if payload.Error.Detail == "" {
+		t.Fatal("expected JSON error detail")
+	}
 	if payload.Error.Hint == "" {
 		t.Fatal("expected usage hint in JSON error output")
+	}
+	legacyKey := `"mes` + `sage"`
+	if strings.Contains(stdout, legacyKey) {
+		t.Fatalf("stdout contains legacy error text field: %q", stdout)
 	}
 }
 
@@ -197,13 +235,39 @@ func TestRunJSONInputError(t *testing.T) {
 	}
 }
 
+func TestRunUploadPrepareHTTPErrorDoesNotExposePrivateProviderDetails(t *testing.T) {
+	privateBody := "Discord provider URL https://cdn.discordapp.com/private/webhook bot token idou-master backend internal scheduler"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/prepare":
+			http.Error(w, privateBody, http.StatusForbidden)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	filePath := writeUploadFixture(t, "archive.zip", []byte("blocked"))
+	exitCode, stdout, stderr := captureRunOutput(t, []string{"--server", server.URL, filePath})
+	if exitCode == 0 {
+		t.Fatalf("Run succeeded stdout=%q stderr=%q, want upload failure", stdout, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout=%q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "upload failed") || !strings.Contains(stderr, "http status 403") {
+		t.Fatalf("stderr=%q, want generic upload failure with status", stderr)
+	}
+	assertNoPublicPrivateBoundaryTerms(t, "upload prepare error", stderr)
+}
+
 func TestRunJSONUploadFailure(t *testing.T) {
 	server := newUploadFailureServer()
 	defer server.Close()
 
 	filePath := writeUploadFixture(t, "archive.zip", []byte("broken"))
 
-	exitCode, stdout, stderr := captureRunOutput(t, []string{"--json", "--server", server.URL, filePath})
+	exitCode, stdout, stderr := captureRunOutput(t, []string{"--json", "--resume-timeout", "1ms", "--server", server.URL, filePath})
 	if exitCode != 1 {
 		t.Fatalf("Run exitCode=%d, want 1", exitCode)
 	}
@@ -243,6 +307,35 @@ func TestRunJSONWithVerboseKeepsStdoutPure(t *testing.T) {
 	}
 	if !payload.OK || payload.Type != "result" {
 		t.Fatalf("payload=%+v, want success result", payload)
+	}
+}
+
+type forbiddenPublicBoundaryTerm struct {
+	name string
+	re   *regexp.Regexp
+}
+
+var forbiddenPublicBoundaryTerms = []forbiddenPublicBoundaryTerm{
+	{name: "private product name idou", re: regexp.MustCompile(`(?i)\bidou\b`)},
+	{name: "Discord provider brand", re: regexp.MustCompile(`(?i)\bdiscord\b`)},
+	{name: "webhook", re: regexp.MustCompile(`(?i)\bwebhook\b`)},
+	{name: "bot token", re: regexp.MustCompile(`(?i)\bbot[\s_-]*token\b`)},
+	{name: "CDN", re: regexp.MustCompile(`(?i)\bcdn\b`)},
+	{name: "provider", re: regexp.MustCompile(`(?i)\bprovider\b`)},
+	{name: "backend", re: regexp.MustCompile(`(?i)\bbackend\b`)},
+	{name: "internal", re: regexp.MustCompile(`(?i)\binternal\b`)},
+	{name: "admin", re: regexp.MustCompile(`(?i)\badmin\b`)},
+	{name: "scheduler", re: regexp.MustCompile(`(?i)\bscheduler\b`)},
+	{name: "topology", re: regexp.MustCompile(`(?i)\btopology\b`)},
+	{name: "subdomain topology", re: regexp.MustCompile(`(?i)\bsubdomain`)},
+}
+
+func assertNoPublicPrivateBoundaryTerms(t *testing.T, surface string, text string) {
+	t.Helper()
+	for _, term := range forbiddenPublicBoundaryTerms {
+		if match := term.re.FindString(text); match != "" {
+			t.Fatalf("%s exposed %s term %q in %q", surface, term.name, match, text)
+		}
 	}
 }
 
@@ -300,6 +393,25 @@ func newUploadSuccessServer(t *testing.T) *httptest.Server {
 		finalURL := server.URL + "/" + fileID
 
 		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/prepare":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"url":            finalURL,
+				"uploadPath":     "/" + fileID + "/archive.zip",
+				"fileID":         fileID,
+				"fileName":       "archive.zip",
+				"chunkSize":      defaultChunkSize,
+				"finalizeUrl":    server.URL + "/v1/uploads/" + fileID + "/finalize",
+				"assignmentMode": "weighted_round_robin",
+				"nodes": []map[string]any{
+					{
+						"id":          "node-a",
+						"publicUrl":   server.URL,
+						"weight":      1,
+						"maxParallel": 32,
+					},
+				},
+			})
 		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/") && !strings.HasPrefix(r.URL.Path, "/v1/"):
 			_, _ = io.Copy(io.Discard, r.Body)
 			_ = r.Body.Close()
@@ -316,8 +428,29 @@ func newUploadSuccessServer(t *testing.T) *httptest.Server {
 }
 
 func newUploadFailureServer() *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	const fileID = "AbC123"
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/prepare":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"url":            server.URL + "/" + fileID,
+				"uploadPath":     "/" + fileID + "/archive.zip",
+				"fileID":         fileID,
+				"fileName":       "archive.zip",
+				"chunkSize":      defaultChunkSize,
+				"finalizeUrl":    server.URL + "/v1/uploads/" + fileID + "/finalize",
+				"assignmentMode": "weighted_round_robin",
+				"nodes": []map[string]any{
+					{
+						"id":          "node-a",
+						"publicUrl":   server.URL,
+						"weight":      1,
+						"maxParallel": 32,
+					},
+				},
+			})
 		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/") && !strings.HasPrefix(r.URL.Path, "/v1/"):
 			_, _ = io.Copy(io.Discard, r.Body)
 			_ = r.Body.Close()
@@ -326,6 +459,7 @@ func newUploadFailureServer() *httptest.Server {
 			http.NotFound(w, r)
 		}
 	}))
+	return server
 }
 
 func writeUploadFixture(t *testing.T, name string, body []byte) string {

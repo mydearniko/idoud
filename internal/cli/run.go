@@ -28,6 +28,27 @@ func Run(args []string) int {
 	}
 	out.mode = opts.outputMode
 
+	bind, err := resolveBindAddr(opts.bindInterface)
+	if err != nil {
+		out.printInputError(fmt.Errorf("--interface: %w", err))
+		return 1
+	}
+
+	if opts.download {
+		client := &http.Client{
+			Transport: buildTransport(opts.insecureTLS, opts.noIPv6, opts.parallel, "", bind),
+			Timeout:   downloadTimeout(opts),
+		}
+		d := &downloader{opts: opts, client: client}
+		outputPath, err := d.download(context.Background(), filePath)
+		if err != nil {
+			out.printDownloadError(err)
+			return 1
+		}
+		out.printDownloadSuccess(outputPath)
+		return 0
+	}
+
 	src, cleanup, err := openSource(filePath, opts)
 	if err != nil {
 		out.printInputError(err)
@@ -35,9 +56,9 @@ func Run(args []string) int {
 	}
 	defer cleanup()
 
-	bind, err := resolveBindAddr(opts.bindInterface)
+	resumeID, err := configureUploadResume(&opts, src)
 	if err != nil {
-		out.printInputError(fmt.Errorf("--interface: %w", err))
+		out.printInputError(err)
 		return 1
 	}
 
@@ -50,9 +71,21 @@ func Run(args []string) int {
 		opts:         opts,
 		client:       client,
 		chunkClients: chunkClients,
+		routes:       newRouteCircuitSet(),
+		routeLimits:  newRouteLimiterSet(),
 		chunkIPs: &chunkOriginIPSet{
 			seen: make(map[string]struct{}),
 		},
+	}
+	bodyConcurrency := effectiveUploadBodyConcurrency(opts.parallel, opts.uploadBodyConcurrency)
+	if bodyConcurrency > 0 && bodyConcurrency < opts.parallel {
+		u.uploadBodies = make(chan struct{}, bodyConcurrency)
+	}
+	if len(chunkClients) > 0 {
+		u.chunkBodyLanes = make(chan int, len(chunkClients))
+		for i := range chunkClients {
+			u.chunkBodyLanes <- i
+		}
 	}
 	if opts.subdomains > 0 {
 		u.subdomains = newUploadSubdomainPoolRange(0, opts.subdomains)
@@ -65,12 +98,38 @@ func Run(args []string) int {
 		out.printUploadError(err)
 		return 1
 	}
+	if resumeID != "" {
+		_ = completeUploadResume(resumeID)
+	}
 
 	out.printSuccess(src, finalURL)
 	return 0
 }
 
+func effectiveUploadBodyConcurrency(parallel int, configured int) int {
+	if configured > 0 {
+		return configured
+	}
+	if parallel > defaultMaxUploadBodyWrites {
+		return defaultMaxUploadBodyWrites
+	}
+	return parallel
+}
+
 func buildChunkClients(opts options, bind bindConfig) []*http.Client {
+	if opts.http2Connections > 0 {
+		clients := make([]*http.Client, 0, opts.http2Connections)
+		for i := 0; i < opts.http2Connections; i++ {
+			forcedIP := ""
+			if len(opts.forcedIPs) > 0 {
+				forcedIP = opts.forcedIPs[i%len(opts.forcedIPs)]
+			}
+			clients = append(clients, &http.Client{
+				Transport: buildHTTP2Transport(opts.insecureTLS, opts.noIPv6, opts.parallel, forcedIP, bind),
+			})
+		}
+		return clients
+	}
 	if len(opts.forcedIPs) == 0 {
 		return nil
 	}

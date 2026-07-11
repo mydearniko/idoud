@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -15,7 +16,7 @@ var errMissingInput = errors.New("missing input: pass a file path or use --stdin
 func parseFlags(args []string) (options, string, error) {
 	opts := options{}
 
-	fs := flag.NewFlagSet("idoud", flag.ContinueOnError)
+	fs := flag.NewFlagSet(cliCommandName(), flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 
 	chunkSizeRaw := strconv.FormatInt(defaultChunkSize, 10)
@@ -29,6 +30,25 @@ func parseFlags(args []string) (options, string, error) {
 	normalizedArgs := normalizeInterspersedArgs(fs, args)
 	if err := fs.Parse(normalizedArgs); err != nil {
 		return options{}, "", err
+	}
+	fs.Visit(func(f *flag.Flag) {
+		if f == nil {
+			return
+		}
+		switch f.Name {
+		case "chunk-size":
+			opts.chunkSizeExplicit = true
+		case "parallel", "p":
+			opts.parallelExplicit = true
+		case "upload-key", "k":
+			opts.uploadKeyExplicit = true
+		}
+	})
+	if opts.stdin && !opts.parallelExplicit {
+		opts.parallel = defaultStdinParallel
+	}
+	if opts.download && !opts.parallelExplicit {
+		opts.parallel = defaultDownloadParallel
 	}
 
 	bases, err := normalizeServerURLs(opts.serverURL)
@@ -66,11 +86,26 @@ func parseFlags(args []string) (options, string, error) {
 	if opts.chunkSize > int64(int(^uint(0)>>1)) {
 		return options{}, "", errors.New("--chunk-size is too large for this platform")
 	}
-	if opts.chunkSize != defaultParallelChunkSize {
-		return options{}, "", fmt.Errorf("--chunk-size must be exactly %d bytes (3MiB)", defaultParallelChunkSize)
-	}
 	if opts.parallel < 1 {
 		return options{}, "", errors.New("--parallel must be >= 1")
+	}
+	if opts.http2Connections < 0 || opts.http2Connections > 128 {
+		return options{}, "", errors.New("--http2-connections must be between 0 and 128")
+	}
+	if opts.uploadBodyConcurrency < 0 {
+		return options{}, "", errors.New("--upload-body-concurrency must be >= 0")
+	}
+	if opts.uploadBodyConcurrency > opts.parallel {
+		return options{}, "", errors.New("--upload-body-concurrency cannot exceed --parallel")
+	}
+	if opts.uploadRampRPS < 0 {
+		return options{}, "", errors.New("--upload-ramp-rps must be >= 0")
+	}
+	if opts.uploadRampBurst < 0 {
+		return options{}, "", errors.New("--upload-ramp-burst must be >= 0")
+	}
+	if opts.uploadRampRPS > 0 && opts.uploadRampBurst == 0 {
+		return options{}, "", errors.New("--upload-ramp-burst must be > 0 when upload pacing is enabled")
 	}
 	if opts.retries < 0 {
 		return options{}, "", errors.New("--retries must be >= 0")
@@ -92,6 +127,9 @@ func parseFlags(args []string) (options, string, error) {
 	}
 	if opts.finalizePollInterval <= 0 {
 		return options{}, "", errors.New("--finalize-poll-interval must be > 0")
+	}
+	if opts.resumeTimeout <= 0 {
+		return options{}, "", errors.New("--resume-timeout must be > 0")
 	}
 	if opts.subdomains < 0 {
 		return options{}, "", errors.New("--subdomains must be >= 0")
@@ -138,6 +176,31 @@ func parseFlags(args []string) (options, string, error) {
 	}
 	if opts.debug {
 		opts.verbose = true
+	}
+
+	if opts.download {
+		if opts.stdin {
+			return options{}, "", errors.New("--download cannot be combined with --stdin")
+		}
+		if opts.stdinSize > 0 {
+			return options{}, "", errors.New("--stdin-size can only be used with --stdin")
+		}
+		if strings.TrimSpace(opts.nameOverride) != "" {
+			return options{}, "", errors.New("--name cannot be used with --download")
+		}
+		if opts.downloadLimit > 0 {
+			return options{}, "", errors.New("--download-limit is only valid for uploads")
+		}
+		if fs.NArg() == 0 {
+			return options{}, "", errors.New("missing download URL or file id")
+		}
+		if fs.NArg() > 1 {
+			return options{}, "", fmt.Errorf("unexpected extra arguments: %s", strings.Join(fs.Args()[1:], ", "))
+		}
+		return opts, fs.Arg(0), nil
+	}
+	if strings.TrimSpace(opts.downloadOutput) != "" {
+		return options{}, "", errors.New("--download-output requires --download")
 	}
 
 	if opts.stdin {
@@ -225,6 +288,10 @@ func registerFlags(fs *flag.FlagSet, opts *options, chunkSizeRaw, stdinSizeRaw, 
 	fs.StringVar(chunkSizeRaw, "chunk-size", strconv.FormatInt(defaultChunkSize, 10), "chunk size for Content-Range uploads")
 	fs.IntVar(&opts.parallel, "parallel", defaultParallel, "parallel chunk uploads (non-final chunks)")
 	fs.IntVar(&opts.parallel, "p", defaultParallel, "alias for --parallel")
+	fs.IntVar(&opts.http2Connections, "http2-connections", 0, "HTTP/2 connection pool for chunk uploads (0 disables)")
+	fs.IntVar(&opts.uploadBodyConcurrency, "upload-body-concurrency", 0, "maximum concurrently written chunk bodies (0 auto-caps large uploads)")
+	fs.IntVar(&opts.uploadRampRPS, "upload-ramp-rps", 0, "pace new requests after half the initial burst confirms (0 disables)")
+	fs.IntVar(&opts.uploadRampBurst, "upload-ramp-burst", 0, "initial chunk request burst when upload pacing is enabled")
 	fs.IntVar(&opts.retries, "retries", defaultRetries, "retry count per chunk")
 	fs.IntVar(&opts.retries, "r", defaultRetries, "alias for --retries")
 	fs.DurationVar(&opts.hedgeDelay, "hedge-delay", defaultHedgeDelay, "delay before speculative duplicate upload for slow non-final chunks (0 disables)")
@@ -233,6 +300,7 @@ func registerFlags(fs *flag.FlagSet, opts *options, chunkSizeRaw, stdinSizeRaw, 
 	fs.DurationVar(&opts.finalizeRecover, "finalize-recovery-timeout", defaultFinalizeRecover, "readiness wait after uncertain final chunk result")
 	fs.DurationVar(&opts.finalizeTimeout, "finalize-timeout", defaultFinalizeTimeout, "max total wait for server finalization")
 	fs.DurationVar(&opts.finalizePollInterval, "finalize-poll-interval", defaultFinalizePollInterval, "readiness poll interval")
+	fs.DurationVar(&opts.resumeTimeout, "resume-timeout", defaultResumeTimeout, "time to keep retrying an interrupted transfer")
 	fs.StringVar(&opts.password, "password", "", "upload password (sets X-Upload-Password)")
 	fs.StringVar(&opts.password, "P", "", "alias for --password")
 	fs.Int64Var(&opts.downloadLimit, "download-limit", 0, "download limit (sets X-Upload-Download-Limit)")
@@ -250,8 +318,10 @@ func registerFlags(fs *flag.FlagSet, opts *options, chunkSizeRaw, stdinSizeRaw, 
 	fs.StringVar(outputRaw, "output", unsetOutputModeValue, "stdout mode: url, json, none")
 	fs.StringVar(outputRaw, "o", unsetOutputModeValue, "alias for --output")
 	fs.BoolVar(jsonOutput, "json", false, "shorthand for --output json")
-	fs.BoolVar(&opts.speedtest, "speedtest", false, "use server-side sink mode to benchmark ingest without backend storage writes")
+	fs.BoolVar(&opts.speedtest, "speedtest", false, "run a transfer benchmark without creating a downloadable file")
 	fs.BoolVar(&opts.speedtest, "T", false, "alias for --speedtest")
+	fs.BoolVar(&opts.download, "download", false, "download a public URL or file id using a download plan")
+	fs.StringVar(&opts.downloadOutput, "download-output", "", "output file path or directory for --download")
 	fs.BoolVar(&opts.verbose, "verbose", false, "print retry and finalization logs")
 	fs.BoolVar(&opts.verbose, "v", false, "alias for --verbose")
 	fs.BoolVar(&opts.debug, "debug", false, "enable verbose live upload debug stats")
@@ -280,21 +350,29 @@ func splitFlagToken(token string) (string, bool) {
 	return name, false
 }
 
+func cliCommandName() string {
+	return "idoud"
+}
+
 func usageText() string {
-	return strings.TrimSpace(`
-IDOUD CLI
-  Fast chunked uploader for idoud.
+	name := cliCommandName()
+	title := strings.ToUpper(name)
+	public := strings.TrimSpace(fmt.Sprintf(`
+%s CLI
+  Fast chunked uploader and planned downloader using idoud.cc metadata APIs.
 
 USAGE
-  idoud [flags] <file>
-  idoud <file> [flags]
-  idoud --stdin [--name <filename> | <filename>] [flags]
+  %[2]s [flags] <file>
+  %[2]s <file> [flags]
+  %[2]s --stdin [--name <filename> | <filename>] [flags]
+  %[2]s --download <url-or-file-id> [--download-output <path>] [flags]
 
 QUICK START
-  idoud archive.zip
-  idoud archive.zip --password 55551230
-  cat archive.zip | idoud --stdin --name archive.zip
-  idoud --server https://s1.example,https://s2.example archive.zip
+  %[2]s archive.zip
+  %[2]s archive.zip --password 55551230
+  cat archive.zip | %[2]s --stdin --name archive.zip
+  %[2]s --server https://s1.example,https://s2.example archive.zip
+  %[2]s --download https://idoud.cc/AbC123/archive.zip
 
 INPUT
   -S, --stdin
@@ -304,23 +382,11 @@ INPUT
   -n, --name <filename>
       Override upload filename.
 
-ROUTING
+CONNECTION
   -s, --server <url[,url...]>
       One origin or a comma-separated origin list.
-  --subdomains <n>
-      Force upload subdomains 0..N-1 on idoud domains.
-  --no-subdomains, --nosub
-      Disable numbered subdomain routing.
-  --ips <ip[,ip...]>
-      Pin chunk uploads to destination IPs (round-robin).
-  -I, --interface <addr>
-      Bind outgoing connections to a local IP or interface name.
-  --no-ipv6
-      Force IPv4-only networking.
 
-UPLOAD TUNING
-  --chunk-size <size>
-      Must be exactly 3145728 bytes (3 MiB).
+UPLOAD
   -p, --parallel <n>
       Parallel non-final chunk uploads (default: 32).
   -r, --retries <n>
@@ -337,16 +403,21 @@ UPLOAD TUNING
       Poll interval while waiting for finalization.
   --finalize-timeout <dur>
       Maximum total finalization wait.
+  --resume-timeout <dur>
+      Keep retrying and resuming an interrupted transfer (default: 24h).
 
 SECURITY AND LIMITS
   -P, --password <value>
-      Set upload password.
+      Set upload and download password.
   -l, --download-limit <n>
       Set download limit.
-  -k, --upload-key <value>
-      Explicit upload key (default: random).
-  --insecure
-      Skip TLS certificate verification.
+
+DOWNLOAD
+  --download
+      Download a public file URL or file id.
+  --download-output <path>
+      Output file path or directory. Defaults to the server file name.
+      Interrupted downloads keep a verified .idoud.part checkpoint.
 
 OUTPUT
   -o, --output <mode>
@@ -357,8 +428,6 @@ OUTPUT
       Shorthand for --output json.
 
 DIAGNOSTICS
-  -T, --speedtest
-      Benchmark ingest path without persisted output.
   -v, --verbose
       Print retry/finalization logs to stderr.
   -d, --debug
@@ -367,6 +436,40 @@ DIAGNOSTICS
 HELP
   -h, --help
       Show this help and exit.
+  -V, --version
+      Print the build version and exit.
+`, title, name))
+	if strings.TrimSpace(os.Getenv("IDOUD_SHOW_OPERATOR_FLAGS")) == "" {
+		return public
+	}
+	return public + "\n\n" + strings.TrimSpace(`
+OPERATOR FLAGS
+  --http2-connections <n>
+      Use a fixed pool of HTTP/2 connections for chunk bodies.
+  --upload-body-concurrency <n>
+      Limit simultaneously written request bodies (0 selects a safe default).
+  --upload-ramp-rps <n>
+      Pace request starts after the initial burst.
+  --upload-ramp-burst <n>
+      Initial requests allowed before upload pacing begins.
+  --chunk-size <size>
+      Deprecated fallback; public uploads use the server-selected chunk size.
+  --subdomains <n>
+      Force upload subdomains 0..N-1 on idoud domains.
+  --no-subdomains, --nosub
+      Disable numbered subdomain routing.
+  --ips <ip[,ip...]>
+      Pin chunk uploads to destination IPs (round-robin).
+  -I, --interface <addr>
+      Bind outgoing connections to a local IP or interface name.
+  --no-ipv6
+      Force IPv4-only networking.
+  -k, --upload-key <value>
+      Explicit upload key (default: random).
+  --insecure
+      Skip TLS certificate verification.
+  -T, --speedtest
+      Run a transfer benchmark without creating a downloadable file.
 `)
 }
 
