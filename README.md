@@ -28,6 +28,10 @@ go build -trimpath -ldflags="-s -w" -o idoud .
 # Upload a file and print its public URL.
 idoud archive.zip
 
+# Stream a directory as an LZ4-compressed tar archive and upload it immediately.
+# This names the upload after the selected path, for example project.tar.lz4.
+idoud -z ./project
+
 # Upload standard input with an explicit filename.
 cat archive.zip | idoud --stdin --name archive.zip
 
@@ -65,6 +69,10 @@ identification.
 - Standard-input uploads use at most 256 MiB of complete retryable chunk
   buffers at the production chunk size and work with either known or unknown
   input size.
+- `-z`/`--archive` streams a standards-compatible `.tar.lz4` archive directly
+  into the uploader without creating a temporary archive. Absolute source paths
+  are never stored in the tar, symlinks are preserved rather than followed, and
+  LZ4 compression runs concurrently across the available CPU capacity.
 - Diagnostics go to stderr. Successful machine-readable output stays isolated
   on stdout.
 

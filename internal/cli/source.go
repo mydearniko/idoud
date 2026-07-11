@@ -10,6 +10,9 @@ import (
 )
 
 func openSource(filePath string, opts options) (*sourceFile, func(), error) {
+	if opts.archive {
+		return openArchiveSource(filePath, opts)
+	}
 	if opts.stdin {
 		stat, err := os.Stdin.Stat()
 		if err != nil {

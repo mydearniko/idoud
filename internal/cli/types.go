@@ -88,6 +88,7 @@ type options struct {
 	serverBases           []*url.URL
 	forcedIPs             []string
 	stdin                 bool
+	archive               bool
 	stdinSize             int64
 	nameOverride          string
 	chunkSize             int64

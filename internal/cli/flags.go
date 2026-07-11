@@ -182,6 +182,9 @@ func parseFlags(args []string) (options, string, error) {
 		if opts.stdin {
 			return options{}, "", errors.New("--download cannot be combined with --stdin")
 		}
+		if opts.archive {
+			return options{}, "", errors.New("--download cannot be combined with --archive/-z")
+		}
 		if opts.stdinSize > 0 {
 			return options{}, "", errors.New("--stdin-size can only be used with --stdin")
 		}
@@ -201,6 +204,9 @@ func parseFlags(args []string) (options, string, error) {
 	}
 	if strings.TrimSpace(opts.downloadOutput) != "" {
 		return options{}, "", errors.New("--download-output requires --download")
+	}
+	if opts.archive && opts.stdin {
+		return options{}, "", errors.New("--archive/-z cannot be combined with --stdin")
 	}
 
 	if opts.stdin {
@@ -282,6 +288,8 @@ func registerFlags(fs *flag.FlagSet, opts *options, chunkSizeRaw, stdinSizeRaw, 
 	fs.StringVar(&opts.serverURL, "s", defaultServerURL, "alias for --server")
 	fs.BoolVar(&opts.stdin, "stdin", false, "read file data from stdin")
 	fs.BoolVar(&opts.stdin, "S", false, "alias for --stdin")
+	fs.BoolVar(&opts.archive, "archive", false, "stream a path as a tar archive compressed with LZ4")
+	fs.BoolVar(&opts.archive, "z", false, "alias for --archive")
 	fs.StringVar(stdinSizeRaw, "stdin-size", "", "stdin size hint for stdin uploads")
 	fs.StringVar(&opts.nameOverride, "name", "", "upload file name override")
 	fs.StringVar(&opts.nameOverride, "n", "", "alias for --name")
@@ -364,17 +372,22 @@ func usageText() string {
 USAGE
   %[2]s [flags] <file>
   %[2]s <file> [flags]
+  %[2]s -z <path> [flags]
   %[2]s --stdin [--name <filename> | <filename>] [flags]
   %[2]s --download <url-or-file-id> [--download-output <path>] [flags]
 
 QUICK START
   %[2]s archive.zip
+  %[2]s -z .
   %[2]s archive.zip --password 55551230
   cat archive.zip | %[2]s --stdin --name archive.zip
   %[2]s --server https://s1.example,https://s2.example archive.zip
   %[2]s --download https://idoud.cc/AbC123/archive.zip
 
 INPUT
+  -z, --archive
+      Stream a file or directory as <path>.tar.lz4 without a temporary archive.
+      LZ4 compression uses available CPU capacity for maximum throughput.
   -S, --stdin
       Read payload from stdin instead of a file path.
   --stdin-size <size>
@@ -388,7 +401,7 @@ CONNECTION
 
 UPLOAD
   -p, --parallel <n>
-      Parallel non-final chunk uploads (default: 32).
+      Parallel non-final chunk uploads (default: 384; server plans may cap it).
   -r, --retries <n>
       Retries per failed chunk (default: 6).
   --hedge-delay <dur>
