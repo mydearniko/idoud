@@ -14,5 +14,5 @@ func main() {
 		fmt.Printf("idoud %s\n", version)
 		return
 	}
-	os.Exit(cli.Run(os.Args[1:]))
+	os.Exit(cli.RunWithVersion(os.Args[1:], version))
 }

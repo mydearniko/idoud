@@ -10,6 +10,19 @@ import (
 
 // Run executes the CLI flow and returns an exit code.
 func Run(args []string) int {
+	return runTransfer(args)
+}
+
+// RunWithVersion executes the CLI flow with the build version available to
+// commands such as self-update. Run remains available for embedders and tests.
+func RunWithVersion(args []string, currentVersion string) int {
+	if isUpdateCommand(args) {
+		return runSelfUpdate(context.Background(), currentVersion)
+	}
+	return runTransfer(args)
+}
+
+func runTransfer(args []string) int {
 	out := newPrimaryOutput(args)
 
 	if len(args) == 0 {

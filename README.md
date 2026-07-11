@@ -41,6 +41,9 @@ idoud archive.zip --password secret --download-limit 3
 # Download by public URL or file ID.
 idoud --download https://idoud.cc/AbC123/archive.zip
 idoud --download AbC123 --download-output ./archive.zip
+
+# Install the newest release for this operating system and CPU.
+idoud update
 ```
 
 Run `idoud --help` for user-facing options and `idoud --version` for build
@@ -75,6 +78,10 @@ identification.
   LZ4 compression runs concurrently across the available CPU capacity.
 - Diagnostics go to stderr. Successful machine-readable output stays isolated
   on stdout.
+- `idoud update` discovers the latest release without using the rate-limited
+  GitHub API, verifies the selected platform binary against the published
+  SHA-256 checksums, runs its version check, and atomically replaces the current
+  executable. Linux, macOS, and Windows release targets are supported.
 
 ## Automation
 

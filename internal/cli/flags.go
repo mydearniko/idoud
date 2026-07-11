@@ -375,6 +375,7 @@ USAGE
   %[2]s -z <path> [flags]
   %[2]s --stdin [--name <filename> | <filename>] [flags]
   %[2]s --download <url-or-file-id> [--download-output <path>] [flags]
+  %[2]s update
 
 QUICK START
   %[2]s archive.zip
@@ -383,6 +384,7 @@ QUICK START
   cat archive.zip | %[2]s --stdin --name archive.zip
   %[2]s --server https://s1.example,https://s2.example archive.zip
   %[2]s --download https://idoud.cc/AbC123/archive.zip
+  %[2]s update
 
 INPUT
   -z, --archive
@@ -445,6 +447,11 @@ DIAGNOSTICS
       Print retry/finalization logs to stderr.
   -d, --debug
       Print live chunk concurrency and throughput stats to stderr.
+
+UPDATE
+  update
+      Install the latest release for this OS and CPU in place. The downloaded
+      executable is SHA-256 verified and validated before atomic replacement.
 
 HELP
   -h, --help
