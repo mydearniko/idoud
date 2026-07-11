@@ -516,6 +516,35 @@ func TestDownloadPlanProbesDeadPrimariesAndUsesDirectStandby(t *testing.T) {
 	}
 }
 
+func TestDownloadProgressRollsBackPartialRange(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-7/8")
+		w.Header().Set("Content-Length", "8")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("half"))
+	}))
+	defer server.Close()
+
+	output, err := os.Create(filepath.Join(t.TempDir(), "partial.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer output.Close()
+	ui := newTransferUI(transferUIConfig{})
+	d := &downloader{
+		opts:   options{requestTimeout: time.Second},
+		client: server.Client(),
+		ui:     ui,
+	}
+	err = d.downloadRangeOnce(context.Background(), output, protocol.DownloadMirror{URL: server.URL}, protocol.DownloadRange{Offset: 0, End: 7, Size: 8})
+	if err == nil {
+		t.Fatal("partial range unexpectedly succeeded")
+	}
+	if got := ui.transferred.Load(); got != 0 {
+		t.Fatalf("partial failed range left progress at %d bytes, want 0", got)
+	}
+}
+
 func parseTestRange(value string) (int, int, bool) {
 	value = strings.TrimSpace(value)
 	if !strings.HasPrefix(value, "bytes=") {

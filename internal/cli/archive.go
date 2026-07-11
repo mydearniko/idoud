@@ -65,6 +65,7 @@ func openArchiveSource(sourcePath string, opts options) (*sourceFile, func(), er
 		uploadURLs:              uploadURLs,
 		uploadURLParsedByServer: uploadParsed,
 		displayName:             sourcePath,
+		archive:                 true,
 	}
 
 	var cleanupOnce sync.Once

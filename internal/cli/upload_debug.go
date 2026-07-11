@@ -338,7 +338,7 @@ func (d *uploadDebugStats) printLine(
 	)
 }
 
-func (u *uploader) upload(ctx context.Context, src *sourceFile) (string, error) {
+func (u *uploader) upload(ctx context.Context, src *sourceFile) (finalURL string, retErr error) {
 	if src == nil {
 		return "", errors.New("invalid source")
 	}
@@ -348,10 +348,20 @@ func (u *uploader) upload(ctx context.Context, src *sourceFile) (string, error) 
 	if !src.knownSize && src.stream == nil {
 		return "", errors.New("invalid source")
 	}
+	progress := u.startUploadProgress(src)
+	if progress != nil {
+		defer func() {
+			progress.stop(retErr == nil)
+			if u.ui == progress {
+				u.ui = nil
+			}
+		}()
+	}
 
 	if err := u.prepareUpload(ctx, src); err != nil {
 		return "", err
 	}
+	u.configureUploadProgress(src)
 	parallel := u.effectiveUploadParallel()
 
 	stopDebug := u.startDebug(src)
@@ -359,7 +369,13 @@ func (u *uploader) upload(ctx context.Context, src *sourceFile) (string, error) 
 	defer u.logChunkOriginIPs()
 
 	if hasAnyNonLoopbackServer(u.opts) {
+		if u.ui != nil {
+			u.ui.setPhase(transferPhaseConnecting)
+		}
 		u.warmConnections(ctx, src, parallel)
+	}
+	if u.ui != nil {
+		u.ui.setPhase(transferPhaseTransferring)
 	}
 
 	if !src.knownSize {
@@ -402,7 +418,7 @@ func (u *uploader) upload(ctx context.Context, src *sourceFile) (string, error) 
 		}
 	}
 
-	finalURL := urls.get()
+	finalURL = urls.get()
 	if err := u.finalizeIfNeeded(ctx, finalURL); err != nil {
 		return "", err
 	}
@@ -440,9 +456,15 @@ func (u *uploader) debugAddRead(n int64) {
 		atomic.AddInt64(&dbg.readBytes, n)
 		dbg.markRead(time.Now())
 	}
+	if ui := u.ui; ui != nil {
+		ui.addRead(n)
+	}
 }
 
 func (u *uploader) debugMarkStdinClosed(eof bool) {
+	if ui := u.ui; ui != nil {
+		ui.markInputClosed()
+	}
 	if dbg := u.dbg; dbg != nil {
 		dbg.markStdinClosed(eof)
 	}
@@ -451,6 +473,9 @@ func (u *uploader) debugMarkStdinClosed(eof bool) {
 func (u *uploader) debugChunkStart(size int64, finalChunk bool) {
 	if size <= 0 {
 		return
+	}
+	if ui := u.ui; ui != nil {
+		ui.chunkStarted()
 	}
 	dbg := u.dbg
 	if dbg == nil {
@@ -472,6 +497,12 @@ func (u *uploader) debugChunkStart(size int64, finalChunk bool) {
 func (u *uploader) debugChunkDone(size int64, finalChunk bool, success bool) {
 	if size <= 0 {
 		return
+	}
+	if ui := u.ui; ui != nil {
+		if success {
+			ui.addTransferred(size)
+		}
+		ui.chunkFinished(success)
 	}
 	dbg := u.dbg
 	if dbg == nil {
@@ -495,6 +526,9 @@ func (u *uploader) debugChunkDone(size int64, finalChunk bool, success bool) {
 }
 
 func (u *uploader) debugRetry() {
+	if ui := u.ui; ui != nil {
+		ui.retried()
+	}
 	if dbg := u.dbg; dbg != nil {
 		atomic.AddInt64(&dbg.retries, 1)
 	}
@@ -590,6 +624,9 @@ func (u *uploader) debugRequestBuild(d time.Duration) {
 }
 
 func (u *uploader) debugHTTPRoundTrip(d time.Duration) {
+	if ui := u.ui; ui != nil {
+		ui.recordRequestDuration(d)
+	}
 	if dbg := u.dbg; dbg != nil {
 		debugRecordDuration(&dbg.httpNanos, &dbg.httpCount, &dbg.httpMaxNanos, d)
 	}

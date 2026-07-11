@@ -628,6 +628,9 @@ func (u *uploader) finalizeIfNeeded(ctx context.Context, finalURL string) error 
 }
 
 func (u *uploader) waitForReady(ctx context.Context, publicURL string, timeout time.Duration) error {
+	if u.ui != nil {
+		u.ui.setPhase(transferPhaseFinalizing)
+	}
 	if u.dbg != nil {
 		atomic.StoreInt64(&u.dbg.serverWaitStartUnix, time.Now().UnixNano())
 	}

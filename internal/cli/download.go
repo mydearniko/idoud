@@ -21,6 +21,7 @@ import (
 type downloader struct {
 	opts        options
 	client      *http.Client
+	ui          *transferUI
 	routeInit   sync.Once
 	routes      *routeCircuitSet
 	routeLimits *routeLimiterSet
@@ -48,8 +49,9 @@ type downloadRef struct {
 }
 
 type fileRangeWriter struct {
-	file   *os.File
-	offset int64
+	file    *os.File
+	offset  int64
+	onWrite func(int)
 }
 
 type downloadResumeState struct {
@@ -110,24 +112,51 @@ func (w *fileRangeWriter) Write(p []byte) (int, error) {
 	}
 	n, err := w.file.WriteAt(p, w.offset)
 	w.offset += int64(n)
+	if n > 0 && w.onWrite != nil {
+		w.onWrite(n)
+	}
 	return n, err
 }
 
-func (d *downloader) download(ctx context.Context, raw string) (string, error) {
+func (d *downloader) download(ctx context.Context, raw string) (output string, retErr error) {
 	ref, err := parseDownloadRef(raw, d.opts.serverBase)
 	if err != nil {
 		return "", err
+	}
+	displayName := ref.name
+	if strings.TrimSpace(displayName) == "" {
+		displayName = ref.fileID
+	}
+	progress := newTransferUI(terminalTransferUIConfig(d.opts, "download", "destination", displayName, -1, -1))
+	if progress.enabled {
+		d.ui = progress
+		progress.start()
+		defer func() {
+			progress.stop(retErr == nil)
+			if d.ui == progress {
+				d.ui = nil
+			}
+		}()
 	}
 	startedAt := time.Now()
 	var outputPath string
 	var lastErr error
 	for {
+		if d.ui != nil {
+			d.ui.setPhase(transferPhasePlanning)
+		}
 		plan, planErr := d.fetchDownloadPlan(ctx, ref)
 		if planErr == nil {
 			planErr = validateDownloadPlan(plan)
 		}
+		if planErr == nil {
+			d.configureDownloadProgress(plan)
+		}
 		if planErr == nil && outputPath == "" {
 			outputPath, planErr = resolveDownloadOutputPath(d.opts.downloadOutput, plan.FileName, ref.fileID)
+			if planErr == nil && d.ui != nil {
+				d.ui.setDestination(outputPath)
+			}
 		}
 		if planErr == nil {
 			if downloadErr := d.downloadPlanToFile(ctx, plan, outputPath); downloadErr == nil {
@@ -145,6 +174,9 @@ func (d *downloader) download(ctx context.Context, raw string) (string, error) {
 		}
 		if d.opts.verbose {
 			stderrLogf("download interrupted; refreshing plan and resuming in 10s: %v", lastErr)
+		}
+		if d.ui != nil {
+			d.ui.retried()
 		}
 		delay := 10 * time.Second
 		if d.opts.resumeTimeout > 0 {
@@ -230,6 +262,9 @@ func validateDownloadPlan(plan protocol.DownloadPlan) error {
 
 func (d *downloader) downloadPlanToFile(ctx context.Context, plan protocol.DownloadPlan, outputPath string) error {
 	if plan.Size > 0 {
+		if d.ui != nil {
+			d.ui.setPhase(transferPhaseConnecting)
+		}
 		d.prepareDownloadRoutes(ctx, plan)
 	}
 	partPath := outputPath + ".idoud.part"
@@ -259,6 +294,10 @@ func (d *downloader) downloadPlanToFile(ctx context.Context, plan protocol.Downl
 		}
 	}
 	if plan.Size == 0 {
+		if d.ui != nil {
+			d.ui.setBaseline(0, 0)
+			d.ui.setPhase(transferPhaseSaving)
+		}
 		if err := out.Close(); err != nil {
 			return err
 		}
@@ -273,10 +312,19 @@ func (d *downloader) downloadPlanToFile(ctx context.Context, plan protocol.Downl
 		return fmt.Errorf("save download checkpoint: %w", err)
 	}
 	pendingRanges := make([]protocol.DownloadRange, 0, len(plan.Ranges))
+	completedBytes := int64(0)
+	completedRanges := int64(0)
 	for _, r := range plan.Ranges {
 		if !state.Completed[downloadRangeKey(r)] {
 			pendingRanges = append(pendingRanges, r)
+		} else {
+			completedBytes += r.Size
+			completedRanges++
 		}
+	}
+	if d.ui != nil {
+		d.ui.setBaseline(completedBytes, completedRanges)
+		d.ui.setPhase(transferPhaseTransferring)
 	}
 
 	workers := d.opts.parallel
@@ -341,6 +389,9 @@ sendJobs:
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if d.ui != nil {
+		d.ui.setPhase(transferPhaseSaving)
+	}
 	if err := out.Sync(); err != nil {
 		return fmt.Errorf("sync output: %w", err)
 	}
@@ -382,6 +433,15 @@ func saveDownloadResumeState(path string, state downloadResumeState) error {
 
 func (d *downloader) downloadRangeWithRetry(ctx context.Context, out *os.File, plan protocol.DownloadPlan, r protocol.DownloadRange) error {
 	d.ensureRouteState()
+	if d.ui != nil {
+		d.ui.chunkStarted()
+	}
+	success := false
+	defer func() {
+		if d.ui != nil {
+			d.ui.chunkFinished(success)
+		}
+	}()
 	mirrorIndexes := orderedDownloadMirrorIndexes(plan, r)
 	var lastErr error
 	for attempt := 0; attempt <= d.opts.retries; attempt++ {
@@ -415,6 +475,7 @@ func (d *downloader) downloadRangeWithRetry(ctx context.Context, out *os.File, p
 			release()
 			if err == nil {
 				d.routes.success(mirror.URL)
+				success = true
 				return nil
 			}
 			lastErr = err
@@ -427,6 +488,9 @@ func (d *downloader) downloadRangeWithRetry(ctx context.Context, out *os.File, p
 		}
 		if attempt >= d.opts.retries {
 			break
+		}
+		if d.ui != nil {
+			d.ui.retried()
 		}
 		delay := retryBackoff(attempt + 1)
 		if d.opts.verbose {
@@ -521,7 +585,20 @@ func (d *downloader) downloadRangeOnce(ctx context.Context, out *os.File, mirror
 	if resp.ContentLength >= 0 && resp.ContentLength != r.Size {
 		return fmt.Errorf("mirror returned %d bytes for %d-byte range", resp.ContentLength, r.Size)
 	}
+	attemptBytes := int64(0)
+	success := false
 	writer := &fileRangeWriter{file: out, offset: r.Offset}
+	if d.ui != nil {
+		defer func() {
+			if !success && attemptBytes > 0 {
+				d.ui.addTransferred(-attemptBytes)
+			}
+		}()
+		writer.onWrite = func(n int) {
+			attemptBytes += int64(n)
+			d.ui.addTransferred(int64(n))
+		}
+	}
 	n, err := io.CopyN(writer, resp.Body, r.Size)
 	if err != nil {
 		return err
@@ -529,7 +606,30 @@ func (d *downloader) downloadRangeOnce(ctx context.Context, out *os.File, mirror
 	if n != r.Size {
 		return fmt.Errorf("mirror returned %d bytes for %d-byte range", n, r.Size)
 	}
+	success = true
 	return nil
+}
+
+func (d *downloader) configureDownloadProgress(plan protocol.DownloadPlan) {
+	if d == nil || d.ui == nil {
+		return
+	}
+	d.ui.configure(plan.FileName, plan.Size, int64(len(plan.Ranges)))
+	workers := d.opts.parallel
+	if workers < 1 {
+		workers = 1
+	}
+	if len(plan.Ranges) > 0 && workers > len(plan.Ranges) {
+		workers = len(plan.Ranges)
+	}
+	detail := fmt.Sprintf("%d %s · %d workers · %d %s",
+		len(plan.Mirrors),
+		pluralizeProgress(len(plan.Mirrors), "mirror", "mirrors"),
+		workers,
+		len(plan.Ranges),
+		pluralizeProgress(len(plan.Ranges), "part", "parts"),
+	)
+	d.ui.setPlan(detail)
 }
 
 func orderedDownloadMirrorIndexes(plan protocol.DownloadPlan, r protocol.DownloadRange) []int {

@@ -78,6 +78,15 @@ identification.
   LZ4 compression runs concurrently across the available CPU capacity.
 - Diagnostics go to stderr. Successful machine-readable output stays isolated
   on stdout.
+- Interactive terminals get a compact idoud-styled transfer display on stderr.
+  Upload progress counts only provider-confirmed bytes; download progress counts
+  bytes written to the resumable part file. Rates use a rolling confirmed-byte
+  window, known-size ETAs include slow stdin input, and finalization/file sync
+  are shown as separate phases instead of a fake completed bar.
+- Unknown-size stdin and `-z` streams show read/packed bytes, confirmed stored
+  bytes, rate, activity, and retries without inventing a percentage or ETA.
+  Redirected stderr remains quiet, `--no-progress` disables the display, and
+  `NO_COLOR` preserves the layout without terminal colors.
 - `idoud update` discovers the latest release without using the rate-limited
   GitHub API, verifies the selected platform binary against the published
   SHA-256 checksums, runs its version check, and atomically replaces the current

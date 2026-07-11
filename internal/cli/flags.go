@@ -326,6 +326,7 @@ func registerFlags(fs *flag.FlagSet, opts *options, chunkSizeRaw, stdinSizeRaw, 
 	fs.StringVar(outputRaw, "output", unsetOutputModeValue, "stdout mode: url, json, none")
 	fs.StringVar(outputRaw, "o", unsetOutputModeValue, "alias for --output")
 	fs.BoolVar(jsonOutput, "json", false, "shorthand for --output json")
+	fs.BoolVar(&opts.noProgress, "no-progress", false, "disable interactive transfer progress")
 	fs.BoolVar(&opts.speedtest, "speedtest", false, "run a transfer benchmark without creating a downloadable file")
 	fs.BoolVar(&opts.speedtest, "T", false, "alias for --speedtest")
 	fs.BoolVar(&opts.download, "download", false, "download a public URL or file id using a download plan")
@@ -441,6 +442,9 @@ OUTPUT
       none suppresses success stdout entirely.
   --json
       Shorthand for --output json.
+  --no-progress
+      Disable the interactive terminal progress display. Progress is already
+      disabled automatically when stderr is redirected or piped.
 
 DIAGNOSTICS
   -v, --verbose

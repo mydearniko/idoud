@@ -183,6 +183,16 @@ func TestParseFlagsNoIPv6(t *testing.T) {
 	}
 }
 
+func TestParseFlagsNoProgress(t *testing.T) {
+	opts, _, err := parseFlags([]string{"--no-progress", "file.bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opts.noProgress {
+		t.Fatal("opts.noProgress=false, want true")
+	}
+}
+
 func TestParseFlagsStdinAutoTuneDefaults(t *testing.T) {
 	opts, _, err := parseFlags([]string{"--stdin"})
 	if err != nil {

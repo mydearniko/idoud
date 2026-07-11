@@ -39,6 +39,9 @@ func (u *uploader) prepareUpload(ctx context.Context, src *sourceFile) error {
 			delay = 10 * time.Second
 		}
 		u.logf("upload prepare retry attempt=%d status=%d delay=%s err=%v", attempt+1, reqErr.status, delay, err)
+		if u.ui != nil {
+			u.ui.retried()
+		}
 		if err := sleepContext(ctx, delay); err != nil {
 			return err
 		}

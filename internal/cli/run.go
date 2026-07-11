@@ -6,6 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"os"
+	"os/signal"
 )
 
 // Run executes the CLI flow and returns an exit code.
@@ -40,6 +42,8 @@ func runTransfer(args []string) int {
 		return 2
 	}
 	out.mode = opts.outputMode
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stopSignals()
 
 	bind, err := resolveBindAddr(opts.bindInterface)
 	if err != nil {
@@ -53,7 +57,7 @@ func runTransfer(args []string) int {
 			Timeout:   downloadTimeout(opts),
 		}
 		d := &downloader{opts: opts, client: client}
-		outputPath, err := d.download(context.Background(), filePath)
+		outputPath, err := d.download(ctx, filePath)
 		if err != nil {
 			out.printDownloadError(err)
 			return 1
@@ -106,7 +110,7 @@ func runTransfer(args []string) int {
 		u.subdomains = newUploadSubdomainPool(opts.parallel)
 	}
 
-	finalURL, err := u.upload(context.Background(), src)
+	finalURL, err := u.upload(ctx, src)
 	if err != nil {
 		out.printUploadError(err)
 		return 1

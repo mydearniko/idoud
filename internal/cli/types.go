@@ -117,6 +117,7 @@ type options struct {
 	noSubdomains          bool
 	bindInterface         string
 	outputMode            outputMode
+	noProgress            bool
 	speedtest             bool
 	download              bool
 	downloadOutput        string
@@ -141,6 +142,7 @@ type sourceFile struct {
 	preparedPublicURL       string
 	displayName             string
 	fromStdin               bool
+	archive                 bool
 	modTimeUnixNano         int64
 	committedChunks         map[int64]struct{}
 	committedMu             sync.Mutex
@@ -232,6 +234,7 @@ type uploader struct {
 	uploadBodies    chan struct{}
 	chunkBodyLanes  chan int
 	dbg             *uploadDebugStats
+	ui              *transferUI
 	subdomains      *uploadSubdomainPool
 	chunkIPs        *chunkOriginIPSet
 	planMaxParallel int
