@@ -75,9 +75,11 @@ its existing `--verbose` meaning.
 - Transfers retry interruptions for 24 hours by default; individual CLI chunk
   requests allow two minutes for durable provider confirmation. Change these
   windows with `--resume-timeout` and `--request-timeout`.
-- Standard-input uploads use at most 256 MiB of complete retryable chunk
-  buffers at the production chunk size and work with either known or unknown
-  input size.
+- Standard-input and `-z` uploads keep complete retryable chunks in RAM only.
+  Their window starts at the proven 24-request level, allocates buffers lazily,
+  and grows after real confirmations when the source, route plan, and live
+  host/container memory headroom permit it. Low-memory machines automatically
+  use a smaller bounded window; `-M`/`--stream-memory` can set an explicit cap.
 - Piped stdin is an automatic upload input, so `producer | idoud` needs no
   stdin flag or filename. When the name is automatic—or `-n`/`--name` is
   extensionless—the CLI incrementally inspects a replayable in-memory prefix,

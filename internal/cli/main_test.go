@@ -596,6 +596,23 @@ func TestParseFlagsUsesSeparateAutomaticParallelism(t *testing.T) {
 	}
 }
 
+func TestParseFlagsStreamMemory(t *testing.T) {
+	opts, _, err := parseFlags([]string{"-M", "2GiB", "file.bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.streamMemory != 2*1024*1024*1024 {
+		t.Fatalf("streamMemory=%d", opts.streamMemory)
+	}
+	opts, _, err = parseFlags([]string{"--stream-memory", "auto", "file.bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.streamMemory != 0 {
+		t.Fatalf("auto streamMemory=%d, want 0", opts.streamMemory)
+	}
+}
+
 func TestRequestErrorUnwrap(t *testing.T) {
 	cause := errors.New("inner")
 	err := &requestError{cause: cause}

@@ -46,12 +46,17 @@ func (u *uploader) uploadKnownSizeStreamChunked(ctx context.Context, src *source
 		workers = int(nonFinal)
 	}
 
-	bufferCount := streamBufferPoolCount(workers, u.opts.chunkSize)
 	streamReader := src.stream
 
-	pool := make(chan []byte, bufferCount)
-	for i := 0; i < bufferCount; i++ {
-		pool <- make([]byte, int(u.opts.chunkSize))
+	var adaptive *adaptiveStreamController
+	var pool *streamBufferPool
+	if workers > 0 {
+		adaptive = newAdaptiveStreamController(u, workers, u.opts.chunkSize)
+		pool = adaptive.pool
+		u.streamAdaptive = adaptive
+		defer func() { u.streamAdaptive = nil }()
+	} else {
+		pool = newStreamBufferPool(int(u.opts.chunkSize), 1, 1)
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -65,17 +70,13 @@ func (u *uploader) uploadKnownSizeStreamChunked(ctx context.Context, src *source
 		defer wg.Done()
 		for task := range jobs {
 			if ctx.Err() != nil {
-				select {
-				case pool <- task.buf:
-				case <-ctx.Done():
-				}
+				pool.release(task.buf)
 				return
 			}
+			started := adaptive.beginChunk()
 			err := u.uploadPreparedChunkWithRetry(ctx, src, task, false, urls)
-			select {
-			case pool <- task.buf:
-			case <-ctx.Done():
-			}
+			adaptive.finishChunk(int64(task.size), started, err == nil)
+			pool.release(task.buf)
 			if err != nil {
 				select {
 				case errCh <- err:
@@ -113,17 +114,14 @@ readLoop:
 
 		var buf []byte
 		poolWaitStart := time.Now()
-		select {
-		case <-ctx.Done():
+		var acquireErr error
+		buf, acquireErr = pool.acquire(ctx)
+		if acquireErr != nil {
 			break readLoop
-		case buf = <-pool:
-			u.debugPoolWait(time.Since(poolWaitStart))
 		}
+		u.debugPoolWait(time.Since(poolWaitStart))
 		if len(buf) < int(expected) {
-			select {
-			case pool <- buf:
-			case <-ctx.Done():
-			}
+			pool.release(buf)
 			cancel()
 			break readLoop
 		}
@@ -132,10 +130,7 @@ readLoop:
 		_, readErr := io.ReadFull(streamReader, buf[:int(expected)])
 		u.debugReadWait(time.Since(readStart))
 		if readErr != nil {
-			select {
-			case pool <- buf:
-			case <-ctx.Done():
-			}
+			pool.release(buf)
 			cancel()
 			if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
 				select {
@@ -165,10 +160,7 @@ readLoop:
 			queueWaitStart := time.Now()
 			select {
 			case <-ctx.Done():
-				select {
-				case pool <- buf:
-				case <-ctx.Done():
-				}
+				pool.release(buf)
 				break readLoop
 			case jobs <- task:
 				u.debugQueueWait(time.Since(queueWaitStart))
@@ -197,10 +189,7 @@ readLoop:
 	u.debugMarkStdinClosed(false)
 
 	finalErr := u.uploadPreparedChunkWithRetry(ctx, src, *finalTask, true, urls)
-	select {
-	case pool <- finalTask.buf:
-	default:
-	}
+	pool.release(finalTask.buf)
 	if finalErr != nil {
 		return "", finalErr
 	}
@@ -290,7 +279,7 @@ func (u *uploader) scatterReadStdin(
 	ctx context.Context,
 	src io.Reader,
 	chunkSize int,
-	pool chan []byte,
+	pool *streamBufferPool,
 	out chan stdinScatterResult,
 ) {
 	defer close(out)
@@ -306,10 +295,7 @@ func (u *uploader) scatterReadStdin(
 			select {
 			case out <- *pending:
 			case <-ctx.Done():
-				select {
-				case pool <- pending.chunk.buf:
-				default:
-				}
+				pool.release(pending.chunk.buf)
 			}
 			pending = nil
 		}
@@ -319,10 +305,7 @@ func (u *uploader) scatterReadStdin(
 		if b == nil {
 			return
 		}
-		select {
-		case pool <- b:
-		default:
-		}
+		pool.release(b)
 	}
 
 	for {
@@ -336,15 +319,14 @@ func (u *uploader) scatterReadStdin(
 		// Acquire a chunk buffer from pool.
 		var buf []byte
 		poolStart := time.Now()
-		select {
-		case <-ctx.Done():
+		buf, err := pool.acquire(ctx)
+		if err != nil {
 			if pending != nil {
 				putBuf(pending.chunk.buf)
 			}
 			return
-		case buf = <-pool:
-			u.debugPoolWait(time.Since(poolStart))
 		}
+		u.debugPoolWait(time.Since(poolStart))
 
 		// Read directly into the chunk buffer without an intermediate copy.
 		readStart := time.Now()
@@ -426,21 +408,16 @@ func (u *uploader) uploadUnknownSizeStreamChunked(ctx context.Context, src *sour
 	if workers < 1 {
 		workers = 1
 	}
-	bufferCount := streamBufferPoolCount(workers, u.opts.chunkSize)
-
-	pool := make(chan []byte, bufferCount)
-	for i := 0; i < bufferCount; i++ {
-		pool <- make([]byte, chunkCap)
-	}
+	adaptive := newAdaptiveStreamController(u, workers, u.opts.chunkSize)
+	pool := adaptive.pool
+	u.streamAdaptive = adaptive
+	defer func() { u.streamAdaptive = nil }()
 
 	putBuf := func(buf []byte) {
 		if buf == nil {
 			return
 		}
-		select {
-		case pool <- buf:
-		default:
-		}
+		pool.release(buf)
 	}
 
 	urls := newURLCapture(src)
@@ -463,7 +440,9 @@ func (u *uploader) uploadUnknownSizeStreamChunked(ctx context.Context, src *sour
 				putBuf(task.buf)
 				return
 			}
+			started := adaptive.beginChunk()
 			err := u.uploadPreparedChunkUnknownWithRetry(ctx, src, task, false, urls)
+			adaptive.finishChunk(int64(task.size), started, err == nil)
 			putBuf(task.buf)
 			if err != nil {
 				select {
@@ -572,31 +551,4 @@ drainLoop:
 	}
 	u.logf("upload(stream-unknown) complete url=%s", finalURL)
 	return finalURL, nil
-}
-
-func streamBufferPoolCount(workers int, chunkSize int64) int {
-	if workers < 0 {
-		workers = 0
-	}
-	// Enough buffers for all in-flight workers plus moderate readahead.
-	n := workers + workers/3 + 8
-	if n < 4 {
-		n = 4
-	}
-	if chunkSize <= 0 {
-		chunkSize = defaultChunkSize
-	}
-	// Keep stdin lightweight and predictable: at the production chunk size the
-	// 256 MiB ceiling holds 25 complete, independently retryable chunks. That
-	// fully feeds the automatic 24-worker stdin window without coupling a node
-	// request to the speed of the incoming stream.
-	const maxStreamBufferBytes = int64(256 * 1024 * 1024)
-	maxByBytes := int(maxStreamBufferBytes / chunkSize)
-	if maxByBytes < 4 {
-		maxByBytes = 4
-	}
-	if n > maxByBytes {
-		n = maxByBytes
-	}
-	return n
 }

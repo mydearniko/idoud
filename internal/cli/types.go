@@ -104,6 +104,7 @@ type options struct {
 	chunkSizeExplicit     bool
 	parallel              int
 	parallelExplicit      bool
+	streamMemory          int64
 	http2Connections      int
 	uploadBodyConcurrency int
 	uploadRampRPS         int
@@ -253,6 +254,7 @@ type uploader struct {
 	routeInit       sync.Once
 	routes          *routeCircuitSet
 	routeLimits     *routeLimiterSet
+	streamAdaptive  *adaptiveStreamController
 }
 
 type fileMetadataPayload struct {

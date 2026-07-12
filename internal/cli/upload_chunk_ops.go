@@ -340,6 +340,9 @@ func (u *uploader) retryChunkUpload(
 		if !isRetryableStatus(ctx, status, err) {
 			break
 		}
+		if u != nil && u.streamAdaptive != nil {
+			u.streamAdaptive.observeRetry(status)
+		}
 		if u.opts.resumeTimeout > 0 && time.Since(retryStartedAt) >= u.opts.resumeTimeout {
 			break
 		}

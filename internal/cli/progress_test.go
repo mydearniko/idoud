@@ -562,14 +562,14 @@ func TestNoProgressOptionDisablesRendererBeforeTTYProbe(t *testing.T) {
 }
 
 func TestUploadProgressParallelReportsUsefulWindow(t *testing.T) {
-	uploader := &uploader{opts: options{parallel: 384, chunkSize: browserChunkSize}}
+	uploader := &uploader{opts: options{parallel: 384, chunkSize: browserChunkSize, streamMemory: 256 * 1024 * 1024}}
 	regular := &sourceFile{knownSize: true, size: browserChunkSize}
 	if got := uploadProgressParallel(uploader, regular, 1); got != 1 {
 		t.Fatalf("single-part parallel=%d, want 1", got)
 	}
 	stream := &sourceFile{knownSize: false, stream: strings.NewReader("stream")}
 	got := uploadProgressParallel(uploader, stream, -1)
-	if got >= uploader.opts.parallel || got > 24 {
+	if got != 24 {
 		t.Fatalf("unknown-stream parallel=%d, want bounded useful window", got)
 	}
 }

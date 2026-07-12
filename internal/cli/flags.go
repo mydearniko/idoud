@@ -342,6 +342,24 @@ func registerFlags(fs *flag.FlagSet, opts *options, chunkSizeRaw, stdinSizeRaw, 
 	fs.StringVar(chunkSizeRaw, "c", strconv.FormatInt(defaultChunkSize, 10), "alias for --chunk-size")
 	fs.IntVar(&opts.parallel, "parallel", defaultParallel, "maximum parallel chunk uploads")
 	fs.IntVar(&opts.parallel, "p", defaultParallel, "alias for --parallel")
+	setStreamMemory := func(raw string) error {
+		raw = strings.TrimSpace(raw)
+		if strings.EqualFold(raw, "auto") {
+			opts.streamMemory = 0
+			return nil
+		}
+		value, err := parseByteSize(raw)
+		if err != nil {
+			return fmt.Errorf("invalid stream memory: %w", err)
+		}
+		if value <= 0 {
+			return errors.New("stream memory must be greater than zero or auto")
+		}
+		opts.streamMemory = value
+		return nil
+	}
+	fs.Func("stream-memory", "maximum RAM for stdin/archive chunk buffers (default auto)", setStreamMemory)
+	fs.Func("M", "alias for --stream-memory", setStreamMemory)
 	fs.IntVar(&opts.http2Connections, "http2-connections", 0, "HTTP/2 connection pool for chunk uploads (0 disables)")
 	fs.IntVar(&opts.http2Connections, "H", 0, "alias for --http2-connections")
 	fs.IntVar(&opts.uploadBodyConcurrency, "upload-body-concurrency", 0, "maximum concurrently written chunk bodies (0 auto-caps large uploads)")
@@ -516,6 +534,7 @@ func usageAllText() string {
 	return compactUsageText() + "\n\n" + strings.TrimSpace(`
 ADVANCED
   -c, --chunk-size SIZE      Fallback part size when no plan selects one
+  -M, --stream-memory SIZE   Maximum stdin/archive buffer RAM (default auto)
   -H, --http2-connections N  Fixed HTTP/2 connection pool (0 disables)
   -b, --upload-body-concurrency N
                              Maximum concurrent request bodies (0 auto)

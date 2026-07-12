@@ -1603,7 +1603,7 @@ func uploadProgressParallel(u *uploader, src *sourceFile, totalChunks int64) int
 		parallel = 1
 	}
 	if !src.knownSize {
-		bufferWindow := streamBufferPoolCount(parallel, u.opts.chunkSize) - 1
+		bufferWindow := u.streamParallelLimit(parallel)
 		if bufferWindow < 1 {
 			bufferWindow = 1
 		}
@@ -1623,7 +1623,7 @@ func uploadProgressParallel(u *uploader, src *sourceFile, totalChunks int64) int
 		parallel = int(concurrentChunks)
 	}
 	if src.stream != nil && src.readerAt == nil {
-		bufferWindow := streamBufferPoolCount(parallel, u.opts.chunkSize)
+		bufferWindow := u.streamBufferCountLimit(parallel, 0)
 		if parallel > bufferWindow {
 			parallel = bufferWindow
 		}
