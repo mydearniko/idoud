@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"flag"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -383,6 +384,21 @@ func TestBuildTransportResponseHeaderTimeoutDisabled(t *testing.T) {
 	}
 	if len(tr.TLSNextProto) != 0 {
 		t.Fatalf("TLSNextProto has %d entries, want 0", len(tr.TLSNextProto))
+	}
+}
+
+func TestAutomaticUploadSubdomainsAreDisabledForSpeedtest(t *testing.T) {
+	base, err := normalizeServerURL("https://idoud.cc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := options{serverBase: base, serverBases: []*url.URL{base}}
+	if !shouldCreateAutomaticUploadSubdomains(opts) {
+		t.Fatal("ordinary idoud.cc upload should retain automatic subdomains")
+	}
+	opts.speedtest = true
+	if shouldCreateAutomaticUploadSubdomains(opts) {
+		t.Fatal("speedtest must not generate unconfigured numbered DNS names")
 	}
 }
 

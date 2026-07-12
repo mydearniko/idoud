@@ -141,7 +141,7 @@ func runTransfer(args []string) int {
 	}
 	if opts.subdomains > 0 {
 		u.subdomains = newUploadSubdomainPoolRange(0, opts.subdomains)
-	} else if len(opts.serverBases) == 1 && len(opts.forcedIPs) == 0 && shouldUseBrowserSubdomains(opts.serverBase, opts.noSubdomains) {
+	} else if shouldCreateAutomaticUploadSubdomains(opts) {
 		u.subdomains = newUploadSubdomainPool(opts.parallel)
 	}
 
@@ -160,6 +160,17 @@ func runTransfer(args []string) int {
 
 	out.printSuccess(src, finalURL)
 	return 0
+}
+
+func shouldCreateAutomaticUploadSubdomains(opts options) bool {
+	// The speed-test endpoint does not return an upload plan that replaces this
+	// pool. Generating 1.idoud.cc..N.idoud.cc there therefore turns a benchmark
+	// into DNS failures once the small historical DNS set is exhausted. An
+	// explicitly requested --subdomains value is still handled by the caller.
+	return !opts.speedtest &&
+		len(opts.serverBases) == 1 &&
+		len(opts.forcedIPs) == 0 &&
+		shouldUseBrowserSubdomains(opts.serverBase, opts.noSubdomains)
 }
 
 func newInterruptContext() (context.Context, context.CancelFunc) {
