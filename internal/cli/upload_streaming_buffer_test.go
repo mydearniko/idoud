@@ -60,25 +60,25 @@ func TestAdaptiveStreamControllerRampsAndBacksOff(t *testing.T) {
 		streamMemory: 1024 * 1024,
 	}}
 	controller := newAdaptiveStreamController(u, 128, 1024)
-	starts := make([]time.Time, 24)
+	starts := make([]time.Time, 64)
 	for i := range starts {
 		starts[i] = controller.beginChunk()
 	}
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 8; i++ {
 		controller.finishChunk(1024, starts[i], true)
 	}
 	controller.mu.Lock()
 	grown := controller.activeTarget
 	controller.mu.Unlock()
-	if grown != 48 {
-		t.Fatalf("grown target=%d, want 48", grown)
+	if grown != 128 {
+		t.Fatalf("grown target=%d, want 128", grown)
 	}
 
 	controller.observeRetry(429)
 	controller.mu.Lock()
 	reduced := controller.activeTarget
 	controller.mu.Unlock()
-	if reduced != 24 {
-		t.Fatalf("reduced target=%d, want 24", reduced)
+	if reduced != 64 {
+		t.Fatalf("reduced target=%d, want 64", reduced)
 	}
 }

@@ -36,7 +36,8 @@ const (
 	// per-chunk latency through Cloudflare and saturate high-bandwidth links.
 	defaultParallel              = 384
 	defaultStdinChunkSize        = defaultParallelChunkSize
-	defaultStreamInitialParallel = 24
+	defaultStreamInitialParallel = 64
+	defaultStreamBodyWrites      = 64
 	defaultDownloadParallel      = 32
 	defaultRetries               = browserChunkRetryLimit
 	defaultHedgeDelay            = 0 * time.Second

@@ -76,10 +76,11 @@ its existing `--verbose` meaning.
   requests allow two minutes for durable provider confirmation. Change these
   windows with `--resume-timeout` and `--request-timeout`.
 - Standard-input and `-z` uploads keep complete retryable chunks in RAM only.
-  Their window starts at the proven 24-request level, allocates buffers lazily,
-  and grows after real confirmations when the source, route plan, and live
-  host/container memory headroom permit it. Low-memory machines automatically
-  use a smaller bounded window; `-M`/`--stream-memory` can set an explicit cap.
+  Their window starts at up to 64 requests on machines with ample headroom,
+  allocates buffers lazily, and grows after real confirmations when the source,
+  route plan, and live host/container memory permit it. A 256 MiB cap resolves
+  to the established 24-request window; smaller machines automatically use a
+  still smaller bounded window. `-M`/`--stream-memory` sets an explicit cap.
 - Piped stdin is an automatic upload input, so `producer | idoud` needs no
   stdin flag or filename. When the name is automatic—or `-n`/`--name` is
   extensionless—the CLI incrementally inspects a replayable in-memory prefix,

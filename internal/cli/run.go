@@ -128,7 +128,8 @@ func runTransfer(args []string) int {
 			seen: make(map[string]struct{}),
 		},
 	}
-	bodyConcurrency := effectiveUploadBodyConcurrency(opts.parallel, opts.uploadBodyConcurrency)
+	streamingInput := src.stream != nil && src.readerAt == nil
+	bodyConcurrency := effectiveUploadBodyConcurrency(opts.parallel, opts.uploadBodyConcurrency, streamingInput)
 	if bodyConcurrency > 0 && bodyConcurrency < opts.parallel {
 		u.uploadBodies = make(chan struct{}, bodyConcurrency)
 	}
@@ -175,9 +176,12 @@ func newInterruptContext() (context.Context, context.CancelFunc) {
 	return ctx, stop
 }
 
-func effectiveUploadBodyConcurrency(parallel int, configured int) int {
+func effectiveUploadBodyConcurrency(parallel int, configured int, streaming ...bool) int {
 	if configured > 0 {
 		return configured
+	}
+	if len(streaming) > 0 && streaming[0] && parallel > defaultStreamBodyWrites {
+		return defaultStreamBodyWrites
 	}
 	if parallel > defaultMaxUploadBodyWrites {
 		return defaultMaxUploadBodyWrites

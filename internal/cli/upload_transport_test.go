@@ -133,6 +133,9 @@ func TestEffectiveUploadBodyConcurrencyAutoCapsOnlyLargeWindows(t *testing.T) {
 	if got := effectiveUploadBodyConcurrency(512, 96); got != 96 {
 		t.Fatalf("configured body concurrency=%d, want 96", got)
 	}
+	if got := effectiveUploadBodyConcurrency(512, 0, true); got != defaultStreamBodyWrites {
+		t.Fatalf("stream body concurrency=%d, want %d", got, defaultStreamBodyWrites)
+	}
 }
 
 func TestUploadNonFinalChunksPacesStartsAfterBurst(t *testing.T) {
