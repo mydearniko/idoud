@@ -43,13 +43,14 @@ func isVersionCommand(args []string) bool {
 
 func runTransfer(args []string) int {
 	out := newPrimaryOutput(args)
+	automaticStdin := canReadAutomaticStdin(os.Stdin)
 
-	if len(args) == 0 {
+	if len(args) == 0 && !automaticStdin {
 		out.printHelp(usageText())
 		return 0
 	}
 
-	opts, filePath, err := parseFlags(args)
+	opts, filePath, err := parseFlagsWithAutomaticStdin(args, automaticStdin)
 	if err != nil {
 		if errors.Is(err, errHelpAll) {
 			out.printHelp(usageAllText())

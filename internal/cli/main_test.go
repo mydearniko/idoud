@@ -24,6 +24,43 @@ func TestParseFlagsStdinPositionalName(t *testing.T) {
 	}
 }
 
+func TestParseFlagsAutomaticPipedStdin(t *testing.T) {
+	for _, args := range [][]string{nil, {"--name", "hello"}, {"--password", "secret"}} {
+		opts, filePath, err := parseFlagsWithAutomaticStdin(args, true)
+		if err != nil {
+			t.Fatalf("parseFlagsWithAutomaticStdin(%q) returned error: %v", args, err)
+		}
+		if !opts.stdin || filePath != "" {
+			t.Fatalf("args=%q stdin=%t filePath=%q, want automatic stdin", args, opts.stdin, filePath)
+		}
+		if opts.parallel != defaultStdinParallel {
+			t.Fatalf("args=%q parallel=%d, want stdin default %d", args, opts.parallel, defaultStdinParallel)
+		}
+	}
+}
+
+func TestParseFlagsAutomaticStdinDoesNotReplaceExplicitInputMode(t *testing.T) {
+	tests := []struct {
+		args         []string
+		wantPath     string
+		wantArchive  bool
+		wantDownload bool
+	}{
+		{args: []string{"file.bin"}, wantPath: "file.bin"},
+		{args: []string{"-z", "."}, wantPath: ".", wantArchive: true},
+		{args: []string{"-D", "AbC123"}, wantPath: "AbC123", wantDownload: true},
+	}
+	for _, test := range tests {
+		opts, filePath, err := parseFlagsWithAutomaticStdin(test.args, true)
+		if err != nil {
+			t.Fatalf("args=%q returned error: %v", test.args, err)
+		}
+		if opts.stdin || filePath != test.wantPath || opts.archive != test.wantArchive || opts.download != test.wantDownload {
+			t.Fatalf("args=%q stdin=%t path=%q archive=%t download=%t", test.args, opts.stdin, filePath, opts.archive, opts.download)
+		}
+	}
+}
+
 func TestParseFlagsServerList(t *testing.T) {
 	opts, _, err := parseFlags([]string{
 		"--server",

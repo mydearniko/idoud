@@ -38,6 +38,11 @@ func openArchiveSource(sourcePath string, opts options) (*sourceFile, func(), er
 	uploadName := opts.nameOverride
 	if strings.TrimSpace(uploadName) == "" {
 		uploadName = sanitizeFilename(rootName) + ".tar.lz4"
+	} else {
+		uploadName = sanitizeFilename(uploadName)
+		if !filenameHasExtension(uploadName) {
+			uploadName = appendDetectedExtension(uploadName, ".tar.lz4")
+		}
 	}
 	uploadName = sanitizeFilename(uploadName)
 

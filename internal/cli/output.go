@@ -287,7 +287,7 @@ func usageHint(err error) string {
 	name := cliCommandName()
 	switch {
 	case errors.Is(err, errMissingInput):
-		return fmt.Sprintf("pass a file path (%s <file>) or use stdin mode (cat <file> | %s --stdin --name <filename>)", name, name)
+		return fmt.Sprintf("pass a file path (%s <file>) or pipe data directly (cat <file> | %s)", name, name)
 	default:
 		return fmt.Sprintf("run `%s --help` for usage (`%s --help-all` shows advanced options)", name, name)
 	}

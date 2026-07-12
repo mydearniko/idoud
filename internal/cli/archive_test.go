@@ -182,6 +182,30 @@ func TestArchiveSourceHonorsExplicitName(t *testing.T) {
 	cleanup()
 }
 
+func TestArchiveSourceCompletesExtensionlessExplicitName(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "payload.txt")
+	if err := os.WriteFile(sourcePath, []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts, _, err := parseFlags([]string{"-z", "--name", "hello", sourcePath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, cleanup, err := openSource(sourcePath, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src.uploadName != "hello.tar.lz4" {
+		cleanup()
+		t.Fatalf("uploadName=%q, want hello.tar.lz4", src.uploadName)
+	}
+	if _, err := io.Copy(io.Discard, src.stream); err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	cleanup()
+}
+
 func TestArchiveSourceCleanupCancelsBlockedStream(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "large.bin")
 	file, err := os.Create(sourcePath)

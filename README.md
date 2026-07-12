@@ -32,8 +32,12 @@ idoud archive.zip
 # This names the upload after the selected path, for example project.tar.lz4.
 idoud -z ./project
 
-# Upload standard input with an explicit filename.
-cat archive.zip | idoud --stdin --name archive.zip
+# Piped stdin is detected automatically, including its file extension.
+cat archive.zip | idoud
+
+# An extensionless override keeps your name and adds the detected suffix.
+# For tar data compressed with LZ4, this uploads as backup.tar.lz4.
+cat archive.tar.lz4 | idoud --name backup
 
 # Protect an upload and limit downloads.
 idoud archive.zip --password secret --download-limit 3
@@ -74,6 +78,13 @@ its existing `--verbose` meaning.
 - Standard-input uploads use at most 256 MiB of complete retryable chunk
   buffers at the production chunk size and work with either known or unknown
   input size.
+- Piped stdin is an automatic upload input, so `producer | idoud` needs no
+  stdin flag or filename. When the name is automatic—or `-n`/`--name` is
+  extensionless—the CLI incrementally inspects a replayable in-memory prefix,
+  normally only 512 bytes, and appends the detected extension without changing
+  or dropping stream bytes. Compound tar compression is recognized for Gzip,
+  Bzip2, and LZ4 (for example `.tar.lz4`); unknown binary data safely falls
+  back to `.bin`. Supplying an extension skips inspection entirely.
 - `-z`/`--archive` streams a standards-compatible `.tar.lz4` archive directly
   into the uploader without creating a temporary archive. Absolute source paths
   are never stored in the tar, symlinks are preserved rather than followed, and
@@ -126,7 +137,7 @@ URL or JSON written to stdout:
 ```sh
 idoud -g lines archive.bin 2>idoud-pretty.log
 idoud --non-interactive archive.bin 2>idoud-transfer.log
-cat archive.bin | idoud --stdin --name archive.bin --progress=plain \
+cat archive.bin | idoud --name archive.bin --progress=plain \
   2>idoud-transfer.log
 ```
 

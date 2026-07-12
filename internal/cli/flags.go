@@ -12,11 +12,15 @@ import (
 )
 
 var (
-	errMissingInput = errors.New("missing input: pass a file path or use --stdin")
+	errMissingInput = errors.New("missing input: pass a file path or pipe data to stdin")
 	errHelpAll      = errors.New("full help requested")
 )
 
 func parseFlags(args []string) (options, string, error) {
+	return parseFlagsWithAutomaticStdin(args, false)
+}
+
+func parseFlagsWithAutomaticStdin(args []string, automaticStdin bool) (options, string, error) {
 	opts := options{}
 
 	fs := flag.NewFlagSet(cliCommandName(), flag.ContinueOnError)
@@ -41,11 +45,14 @@ func parseFlags(args []string) (options, string, error) {
 		return options{}, "", errHelpAll
 	}
 	progressExplicit := false
+	stdinExplicit := false
 	fs.Visit(func(f *flag.Flag) {
 		if f == nil {
 			return
 		}
 		switch f.Name {
+		case "stdin", "S":
+			stdinExplicit = true
 		case "chunk-size", "c":
 			opts.chunkSizeExplicit = true
 		case "parallel", "p":
@@ -56,6 +63,9 @@ func parseFlags(args []string) (options, string, error) {
 			progressExplicit = true
 		}
 	})
+	if automaticStdin && !stdinExplicit && !opts.download && !opts.archive && fs.NArg() == 0 {
+		opts.stdin = true
+	}
 	if opts.stdin && !opts.parallelExplicit {
 		opts.parallel = defaultStdinParallel
 	}
@@ -446,6 +456,7 @@ func compactUsageText() string {
 
 USAGE
   %[1]s [options] FILE
+  command | %[1]s [-n NAME] [options]
   %[1]s -S [-n NAME] [options]
   %[1]s -z PATH [options]
   %[1]s -D URL_OR_ID [options]
@@ -453,8 +464,8 @@ USAGE
 
 INPUT
   -z, --archive              Stream PATH as a .tar.lz4 archive
-  -S, --stdin                Read upload data from stdin
-  -n, --name NAME            Override the uploaded filename
+  -S, --stdin                Read stdin explicitly (piped stdin is automatic)
+  -n, --name NAME            Override name; detect extension when missing
   -L, --stdin-size SIZE      Provide the expected stdin size
 
 TRANSFER
@@ -492,7 +503,8 @@ OTHER
 EXAMPLES
   %[1]s movie.mkv
   %[1]s -z .
-  cat movie.mkv | %[1]s -S -n movie.mkv
+  cat movie.mkv | %[1]s
+  cat archive.tar.lz4 | %[1]s -n backup
   %[1]s -g lines movie.mkv 2>pretty.log
   %[1]s -N movie.mkv 2>transfer.log
   %[1]s -D https://idoud.cc/AbC123/movie.mkv

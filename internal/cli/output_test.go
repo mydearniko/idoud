@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -68,7 +69,14 @@ func TestRunTextHelpDoesNotExposePrivateBoundaryTerms(t *testing.T) {
 			if stderr != "" {
 				t.Fatalf("stderr=%q, want empty", stderr)
 			}
-			for _, want := range []string{"-a, --update", "update                 Update, or upload file ./update", "-v, -V, --version"} {
+			for _, want := range []string{
+				"command | idoud [-n NAME]",
+				"piped stdin is automatic",
+				"detect extension when missing",
+				"-a, --update",
+				"update                 Update, or upload file ./update",
+				"-v, -V, --version",
+			} {
 				if !strings.Contains(stdout, want) {
 					t.Fatalf("text help missing %q in %q", want, stdout)
 				}
@@ -263,6 +271,43 @@ func TestRunJSONSuccess(t *testing.T) {
 	}
 	if !payload.Result.KnownSize || payload.Result.Size == nil || *payload.Result.Size != int64(len("hello, automation")) {
 		t.Fatalf("result size fields=%+v, want known size %d", payload.Result, len("hello, automation"))
+	}
+}
+
+func TestRunAutomaticallyUploadsPipedStdin(t *testing.T) {
+	server := newUploadSuccessServer(t)
+	defer server.Close()
+
+	oldStdin := os.Stdin
+	stdinReader, stdinWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdin = stdinReader
+	t.Cleanup(func() {
+		os.Stdin = oldStdin
+		_ = stdinReader.Close()
+	})
+	payload := append([]byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a}, []byte("automatic stdin")...)
+	writeDone := make(chan error, 1)
+	go func() {
+		_, writeErr := stdinWriter.Write(payload)
+		writeDone <- errors.Join(writeErr, stdinWriter.Close())
+	}()
+
+	exitCode, stdout, stderr := captureRunOutput(t, []string{"--json", "--server", server.URL})
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+	if exitCode != 0 || stderr != "" {
+		t.Fatalf("Run exitCode=%d stderr=%q, want successful automatic stdin upload", exitCode, stderr)
+	}
+	var result jsonEnvelope
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Result == nil || result.Result.Source != "stdin" || result.Result.Name != "stdin.png" || result.Result.KnownSize {
+		t.Fatalf("result=%+v, want unknown-size stdin.png upload", result.Result)
 	}
 }
 

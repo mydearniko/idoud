@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -14,54 +16,7 @@ func openSource(filePath string, opts options) (*sourceFile, func(), error) {
 		return openArchiveSource(filePath, opts)
 	}
 	if opts.stdin {
-		stat, err := os.Stdin.Stat()
-		if err != nil {
-			return nil, nil, fmt.Errorf("stdin stat failed: %w", err)
-		}
-		if stat.Mode()&os.ModeCharDevice != 0 {
-			return nil, nil, errors.New("stdin is a TTY; pipe data or pass a file path")
-		}
-		if before, after, changed := tuneStdinPipeBuffer(os.Stdin); changed && opts.debug {
-			stderrLogf("debug stdin_pipe_size before=%d after=%d", before, after)
-		}
-
-		name := opts.nameOverride
-		if strings.TrimSpace(name) == "" {
-			name = "stdin.bin"
-		}
-		name = sanitizeFilename(name)
-
-		uploadURLs, uploadParsed, parseErr := buildUploadTargets(opts, name)
-		if parseErr != nil {
-			return nil, nil, parseErr
-		}
-		src := &sourceFile{
-			stream:                  os.Stdin,
-			size:                    -1,
-			knownSize:               false,
-			uploadName:              name,
-			uploadURL:               uploadURLs[0],
-			uploadURLParsed:         uploadParsed[0],
-			uploadURLs:              uploadURLs,
-			uploadURLParsedByServer: uploadParsed,
-			displayName:             "stdin",
-			fromStdin:               true,
-		}
-
-		if opts.stdinSize > 0 {
-			src.size = opts.stdinSize
-			src.knownSize = true
-			return src, func() {}, nil
-		}
-
-		if stat.Mode().IsRegular() {
-			src.readerAt = os.Stdin
-			src.stream = nil
-			src.size = stat.Size()
-			src.knownSize = src.size >= 0
-		}
-
-		return src, func() {}, nil
+		return openStdinSource(os.Stdin, opts)
 	}
 
 	file, err := os.Open(filePath)
@@ -78,9 +33,16 @@ func openSource(filePath string, opts options) (*sourceFile, func(), error) {
 		return nil, nil, errors.New("path is a directory")
 	}
 
-	name := opts.nameOverride
-	if strings.TrimSpace(name) == "" {
+	name := sanitizeFilename(opts.nameOverride)
+	if strings.TrimSpace(opts.nameOverride) == "" {
 		name = filepath.Base(filePath)
+	} else if !filenameHasExtension(name) && stat.Mode().IsRegular() {
+		_, extension, detectErr := sniffFileExtension(io.NewSectionReader(file, 0, stat.Size()))
+		if detectErr != nil {
+			_ = file.Close()
+			return nil, nil, fmt.Errorf("detect file type failed: %w", detectErr)
+		}
+		name = appendDetectedExtension(name, extension)
 	}
 	name = sanitizeFilename(name)
 	uploadURLs, uploadParsed, parseErr := buildUploadTargets(opts, name)
@@ -108,6 +70,92 @@ func openSource(filePath string, opts options) (*sourceFile, func(), error) {
 		}
 	}
 	return src, cleanup, nil
+}
+
+func canReadAutomaticStdin(stdin *os.File) bool {
+	if stdin == nil {
+		return false
+	}
+	stat, err := stdin.Stat()
+	return err == nil && stat.Mode()&os.ModeCharDevice == 0
+}
+
+func openStdinSource(stdin *os.File, opts options) (*sourceFile, func(), error) {
+	if stdin == nil {
+		return nil, nil, errors.New("stdin is unavailable")
+	}
+	stat, err := stdin.Stat()
+	if err != nil {
+		return nil, nil, fmt.Errorf("stdin stat failed: %w", err)
+	}
+	if stat.Mode()&os.ModeCharDevice != 0 {
+		return nil, nil, errors.New("stdin is a TTY; pipe data or pass a file path")
+	}
+	if before, after, changed := tuneStdinPipeBuffer(stdin); changed && opts.debug {
+		stderrLogf("debug stdin_pipe_size before=%d after=%d", before, after)
+	}
+
+	name := sanitizeFilename(opts.nameOverride)
+	needsExtension := strings.TrimSpace(opts.nameOverride) == "" || !filenameHasExtension(name)
+	stream := io.Reader(stdin)
+	if needsExtension {
+		var prefix []byte
+		var extension string
+		if stat.Mode().IsRegular() {
+			sniffSize := stat.Size()
+			if opts.stdinSize > 0 && opts.stdinSize < sniffSize {
+				sniffSize = opts.stdinSize
+			}
+			_, extension, err = sniffFileExtension(io.NewSectionReader(stdin, 0, sniffSize))
+		} else {
+			sniffReader := io.Reader(stdin)
+			if opts.stdinSize > 0 {
+				sniffReader = io.LimitReader(stdin, opts.stdinSize)
+			}
+			prefix, extension, err = sniffFileExtension(sniffReader)
+			stream = io.MultiReader(bytes.NewReader(prefix), stdin)
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("detect stdin file type failed: %w", err)
+		}
+		if strings.TrimSpace(opts.nameOverride) == "" {
+			name = "stdin"
+		}
+		name = appendDetectedExtension(name, extension)
+	}
+	name = sanitizeFilename(name)
+
+	uploadURLs, uploadParsed, parseErr := buildUploadTargets(opts, name)
+	if parseErr != nil {
+		return nil, nil, parseErr
+	}
+	src := &sourceFile{
+		stream:                  stream,
+		size:                    -1,
+		knownSize:               false,
+		uploadName:              name,
+		uploadURL:               uploadURLs[0],
+		uploadURLParsed:         uploadParsed[0],
+		uploadURLs:              uploadURLs,
+		uploadURLParsedByServer: uploadParsed,
+		displayName:             "stdin",
+		fromStdin:               true,
+	}
+
+	if opts.stdinSize > 0 {
+		src.size = opts.stdinSize
+		src.knownSize = true
+		return src, func() {}, nil
+	}
+
+	if stat.Mode().IsRegular() {
+		src.readerAt = stdin
+		src.stream = nil
+		src.size = stat.Size()
+		src.knownSize = src.size >= 0
+	}
+
+	return src, func() {}, nil
 }
 
 func buildUploadTargets(opts options, name string) ([]string, []*url.URL, error) {
