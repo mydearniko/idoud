@@ -181,7 +181,7 @@ func newAdaptiveStreamController(u *uploader, workers int, chunkSize int64) *ada
 	if allowed > workers {
 		allowed = workers
 	}
-	initial := defaultStdinParallel
+	initial := defaultStreamInitialParallel
 	if initial > allowed {
 		initial = allowed
 	}

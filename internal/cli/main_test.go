@@ -33,8 +33,8 @@ func TestParseFlagsAutomaticPipedStdin(t *testing.T) {
 		if !opts.stdin || filePath != "" {
 			t.Fatalf("args=%q stdin=%t filePath=%q, want automatic stdin", args, opts.stdin, filePath)
 		}
-		if opts.parallel != defaultStdinParallel {
-			t.Fatalf("args=%q parallel=%d, want stdin default %d", args, opts.parallel, defaultStdinParallel)
+		if opts.parallel != defaultParallel {
+			t.Fatalf("args=%q parallel=%d, want adaptive upper bound %d", args, opts.parallel, defaultParallel)
 		}
 	}
 }
@@ -471,8 +471,8 @@ func TestParseFlagsStdinAutoTuneDefaults(t *testing.T) {
 	if opts.chunkSize != defaultStdinChunkSize {
 		t.Fatalf("stdin chunkSize = %d, want %d", opts.chunkSize, defaultStdinChunkSize)
 	}
-	if opts.parallel != defaultStdinParallel {
-		t.Fatalf("stdin parallel = %d, want %d", opts.parallel, defaultStdinParallel)
+	if opts.parallel != defaultParallel {
+		t.Fatalf("stdin parallel = %d, want adaptive upper bound %d", opts.parallel, defaultParallel)
 	}
 }
 
@@ -553,8 +553,8 @@ func TestChunkPolicyMatchesBrowserDefaults(t *testing.T) {
 	if defaultParallel < browserDefaultChunkParallel {
 		t.Fatalf("defaultParallel=%d, want >= browserDefaultChunkParallel=%d", defaultParallel, browserDefaultChunkParallel)
 	}
-	if defaultStdinParallel >= defaultParallel {
-		t.Fatalf("defaultStdinParallel=%d, want lower than regular-file parallel=%d", defaultStdinParallel, defaultParallel)
+	if defaultStreamInitialParallel >= defaultParallel {
+		t.Fatalf("defaultStreamInitialParallel=%d, want lower than adaptive upper bound=%d", defaultStreamInitialParallel, defaultParallel)
 	}
 	if defaultChunkTimeout <= browserChunkRequestTimeout {
 		t.Fatalf("defaultChunkTimeout=%s, want longer than browserChunkRequestTimeout=%s", defaultChunkTimeout, browserChunkRequestTimeout)

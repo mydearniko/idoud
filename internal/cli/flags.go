@@ -66,9 +66,6 @@ func parseFlagsWithAutomaticStdin(args []string, automaticStdin bool) (options, 
 	if automaticStdin && !stdinExplicit && !opts.download && !opts.archive && fs.NArg() == 0 {
 		opts.stdin = true
 	}
-	if opts.stdin && !opts.parallelExplicit {
-		opts.parallel = defaultStdinParallel
-	}
 	if opts.download && !opts.parallelExplicit {
 		opts.parallel = defaultDownloadParallel
 	}

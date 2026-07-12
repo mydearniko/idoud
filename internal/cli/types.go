@@ -34,12 +34,12 @@ const (
 	defaultChunkSize         = defaultParallelChunkSize
 	// CLI uses much higher parallelism than browsers to compensate for
 	// per-chunk latency through Cloudflare and saturate high-bandwidth links.
-	defaultParallel         = 384
-	defaultStdinChunkSize   = defaultParallelChunkSize
-	defaultStdinParallel    = 24
-	defaultDownloadParallel = 32
-	defaultRetries          = browserChunkRetryLimit
-	defaultHedgeDelay       = 0 * time.Second
+	defaultParallel              = 384
+	defaultStdinChunkSize        = defaultParallelChunkSize
+	defaultStreamInitialParallel = 24
+	defaultDownloadParallel      = 32
+	defaultRetries               = browserChunkRetryLimit
+	defaultHedgeDelay            = 0 * time.Second
 	// CLI uploads wait for provider durability. Live production traces include
 	// rare healthy confirmations around one minute, so the browser's shorter
 	// interaction deadline would cause needless duplicate range retries here.
