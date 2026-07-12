@@ -34,6 +34,10 @@ func runTransfer(args []string) int {
 
 	opts, filePath, err := parseFlags(args)
 	if err != nil {
+		if errors.Is(err, errHelpAll) {
+			out.printHelp(usageAllText())
+			return 0
+		}
 		if errors.Is(err, flag.ErrHelp) {
 			out.printHelp(usageText())
 			return 0

@@ -73,9 +73,10 @@ func detectRequestedOutputMode(args []string) outputMode {
 	progressRaw := string(progressModeAuto)
 	jsonOutput := false
 	nonInteractive := false
+	helpAll := false
 	fs := flag.NewFlagSet(cliCommandName(), flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	registerFlags(fs, &opts, &chunkSizeRaw, &stdinSizeRaw, &ipsRaw, &outputRaw, &progressRaw, &jsonOutput, &nonInteractive)
+	registerFlags(fs, &opts, &chunkSizeRaw, &stdinSizeRaw, &ipsRaw, &outputRaw, &progressRaw, &jsonOutput, &nonInteractive, &helpAll)
 	valueFlags := flagValueNames(fs)
 
 	mode := outputModeURL
@@ -90,10 +91,16 @@ func detectRequestedOutputMode(args []string) outputMode {
 		switch {
 		case token == "--":
 			stopParsingFlags = true
-		case token == "--json":
+		case token == "--json" || token == "-j":
 			forceJSON = true
 		case strings.HasPrefix(token, "-"):
 			name, hasInlineValue := splitFlagToken(token)
+			if (name == "json" || name == "j") && hasInlineValue {
+				if enabled, err := strconv.ParseBool(token[strings.IndexByte(token, '=')+1:]); err == nil && enabled {
+					forceJSON = true
+				}
+				continue
+			}
 			if name == "output" && hasInlineValue {
 				if parsed, err := parseOutputMode(strings.TrimPrefix(token, "--output=")); err == nil {
 					mode = parsed
@@ -282,6 +289,6 @@ func usageHint(err error) string {
 	case errors.Is(err, errMissingInput):
 		return fmt.Sprintf("pass a file path (%s <file>) or use stdin mode (cat <file> | %s --stdin --name <filename>)", name, name)
 	default:
-		return fmt.Sprintf("run `%s --help` for full usage", name)
+		return fmt.Sprintf("run `%s --help` for usage (`%s --help-all` shows advanced options)", name, name)
 	}
 }

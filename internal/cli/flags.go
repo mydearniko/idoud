@@ -11,7 +11,10 @@ import (
 	"strings"
 )
 
-var errMissingInput = errors.New("missing input: pass a file path or use --stdin")
+var (
+	errMissingInput = errors.New("missing input: pass a file path or use --stdin")
+	errHelpAll      = errors.New("full help requested")
+)
 
 func parseFlags(args []string) (options, string, error) {
 	opts := options{}
@@ -26,12 +29,16 @@ func parseFlags(args []string) (options, string, error) {
 	progressRaw := string(progressModeAuto)
 	jsonOutput := false
 	nonInteractive := false
+	helpAll := false
 
-	registerFlags(fs, &opts, &chunkSizeRaw, &stdinSizeRaw, &ipsRaw, &outputRaw, &progressRaw, &jsonOutput, &nonInteractive)
+	registerFlags(fs, &opts, &chunkSizeRaw, &stdinSizeRaw, &ipsRaw, &outputRaw, &progressRaw, &jsonOutput, &nonInteractive, &helpAll)
 
 	normalizedArgs := normalizeInterspersedArgs(fs, args)
 	if err := fs.Parse(normalizedArgs); err != nil {
 		return options{}, "", err
+	}
+	if helpAll {
+		return options{}, "", errHelpAll
 	}
 	progressExplicit := false
 	fs.Visit(func(f *flag.Flag) {
@@ -39,13 +46,13 @@ func parseFlags(args []string) (options, string, error) {
 			return
 		}
 		switch f.Name {
-		case "chunk-size":
+		case "chunk-size", "c":
 			opts.chunkSizeExplicit = true
 		case "parallel", "p":
 			opts.parallelExplicit = true
 		case "upload-key", "k":
 			opts.uploadKeyExplicit = true
-		case "progress":
+		case "progress", "g":
 			progressExplicit = true
 		}
 	})
@@ -310,7 +317,7 @@ func normalizeInterspersedArgs(fs *flag.FlagSet, args []string) []string {
 	return normalized
 }
 
-func registerFlags(fs *flag.FlagSet, opts *options, chunkSizeRaw, stdinSizeRaw, ipsRaw, outputRaw, progressRaw *string, jsonOutput, nonInteractive *bool) {
+func registerFlags(fs *flag.FlagSet, opts *options, chunkSizeRaw, stdinSizeRaw, ipsRaw, outputRaw, progressRaw *string, jsonOutput, nonInteractive, helpAll *bool) {
 	fs.StringVar(&opts.serverURL, "server", defaultServerURL, "idoud server origin (or comma-separated origins)")
 	fs.StringVar(&opts.serverURL, "s", defaultServerURL, "alias for --server")
 	fs.BoolVar(&opts.stdin, "stdin", false, "read file data from stdin")
@@ -318,24 +325,33 @@ func registerFlags(fs *flag.FlagSet, opts *options, chunkSizeRaw, stdinSizeRaw, 
 	fs.BoolVar(&opts.archive, "archive", false, "stream a path as a tar archive compressed with LZ4")
 	fs.BoolVar(&opts.archive, "z", false, "alias for --archive")
 	fs.StringVar(stdinSizeRaw, "stdin-size", "", "stdin size hint for stdin uploads")
+	fs.StringVar(stdinSizeRaw, "L", "", "alias for --stdin-size")
 	fs.StringVar(&opts.nameOverride, "name", "", "upload file name override")
 	fs.StringVar(&opts.nameOverride, "n", "", "alias for --name")
 	fs.StringVar(chunkSizeRaw, "chunk-size", strconv.FormatInt(defaultChunkSize, 10), "chunk size for Content-Range uploads")
+	fs.StringVar(chunkSizeRaw, "c", strconv.FormatInt(defaultChunkSize, 10), "alias for --chunk-size")
 	fs.IntVar(&opts.parallel, "parallel", defaultParallel, "maximum parallel chunk uploads")
 	fs.IntVar(&opts.parallel, "p", defaultParallel, "alias for --parallel")
 	fs.IntVar(&opts.http2Connections, "http2-connections", 0, "HTTP/2 connection pool for chunk uploads (0 disables)")
+	fs.IntVar(&opts.http2Connections, "H", 0, "alias for --http2-connections")
 	fs.IntVar(&opts.uploadBodyConcurrency, "upload-body-concurrency", 0, "maximum concurrently written chunk bodies (0 auto-caps large uploads)")
+	fs.IntVar(&opts.uploadBodyConcurrency, "b", 0, "alias for --upload-body-concurrency")
 	fs.IntVar(&opts.uploadRampRPS, "upload-ramp-rps", 0, "pace new requests after half the initial burst confirms (0 disables)")
 	fs.IntVar(&opts.uploadRampBurst, "upload-ramp-burst", 0, "initial chunk request burst when upload pacing is enabled")
 	fs.IntVar(&opts.retries, "retries", defaultRetries, "retry count per chunk")
 	fs.IntVar(&opts.retries, "r", defaultRetries, "alias for --retries")
 	fs.DurationVar(&opts.hedgeDelay, "hedge-delay", defaultHedgeDelay, "delay before speculative duplicate upload for slow non-final chunks (0 disables)")
+	fs.DurationVar(&opts.hedgeDelay, "e", defaultHedgeDelay, "alias for --hedge-delay")
 	fs.DurationVar(&opts.requestTimeout, "request-timeout", defaultChunkTimeout, "timeout per non-final chunk request")
+	fs.DurationVar(&opts.requestTimeout, "t", defaultChunkTimeout, "alias for --request-timeout")
 	fs.DurationVar(&opts.finalChunkTimeout, "final-request-timeout", defaultFinalChunkTimeout, "timeout for final chunk request")
+	fs.DurationVar(&opts.finalChunkTimeout, "F", defaultFinalChunkTimeout, "alias for --final-request-timeout")
 	fs.DurationVar(&opts.finalizeRecover, "finalize-recovery-timeout", defaultFinalizeRecover, "readiness wait after uncertain final chunk result")
 	fs.DurationVar(&opts.finalizeTimeout, "finalize-timeout", defaultFinalizeTimeout, "max total wait for server finalization")
+	fs.DurationVar(&opts.finalizeTimeout, "w", defaultFinalizeTimeout, "alias for --finalize-timeout")
 	fs.DurationVar(&opts.finalizePollInterval, "finalize-poll-interval", defaultFinalizePollInterval, "readiness poll interval")
 	fs.DurationVar(&opts.resumeTimeout, "resume-timeout", defaultResumeTimeout, "time to keep retrying an interrupted transfer")
+	fs.DurationVar(&opts.resumeTimeout, "R", defaultResumeTimeout, "alias for --resume-timeout")
 	fs.StringVar(&opts.password, "password", "", "upload password (sets X-Upload-Password)")
 	fs.StringVar(&opts.password, "P", "", "alias for --password")
 	fs.Int64Var(&opts.downloadLimit, "download-limit", 0, "download limit (sets X-Upload-Download-Limit)")
@@ -343,28 +359,41 @@ func registerFlags(fs *flag.FlagSet, opts *options, chunkSizeRaw, stdinSizeRaw, 
 	fs.StringVar(&opts.uploadKey, "upload-key", "", "explicit upload key (default: random)")
 	fs.StringVar(&opts.uploadKey, "k", "", "alias for --upload-key")
 	fs.BoolVar(&opts.insecureTLS, "insecure", false, "skip TLS certificate verification")
+	fs.BoolVar(&opts.insecureTLS, "x", false, "alias for --insecure")
 	fs.StringVar(ipsRaw, "ips", "", "force chunk upload destination IPs (comma-separated)")
+	fs.StringVar(ipsRaw, "i", "", "alias for --ips")
 	fs.BoolVar(&opts.noIPv6, "no-ipv6", false, "disable IPv6 and force IPv4-only connections")
+	fs.BoolVar(&opts.noIPv6, "4", false, "alias for --no-ipv6")
 	fs.IntVar(&opts.subdomains, "subdomains", 0, "force upload subdomain pool size (uses 0..N-1 on idoud domains)")
+	fs.IntVar(&opts.subdomains, "u", 0, "alias for --subdomains")
 	fs.BoolVar(&opts.noSubdomains, "no-subdomains", false, "disable numbered subdomain upload routing")
 	fs.BoolVar(&opts.noSubdomains, "nosub", false, "alias for --no-subdomains")
+	fs.BoolVar(&opts.noSubdomains, "U", false, "alias for --no-subdomains")
 	fs.StringVar(&opts.bindInterface, "interface", "", "bind outgoing connections to a local address (IP or interface name)")
 	fs.StringVar(&opts.bindInterface, "I", "", "alias for --interface")
 	fs.StringVar(outputRaw, "output", unsetOutputModeValue, "stdout mode: url, json, none")
 	fs.StringVar(outputRaw, "o", unsetOutputModeValue, "alias for --output")
 	fs.BoolVar(jsonOutput, "json", false, "shorthand for --output json")
+	fs.BoolVar(jsonOutput, "j", false, "alias for --json")
 	fs.StringVar(progressRaw, "progress", string(progressModeAuto), "progress mode: auto, plain, none")
+	fs.StringVar(progressRaw, "g", string(progressModeAuto), "alias for --progress")
 	fs.BoolVar(nonInteractive, "non-interactive", false, "emit ANSI-free line-oriented progress to stderr")
 	fs.BoolVar(nonInteractive, "plain-progress", false, "alias for --non-interactive")
+	fs.BoolVar(nonInteractive, "N", false, "alias for --non-interactive")
 	fs.BoolVar(&opts.noProgress, "no-progress", false, "disable transfer progress (alias for --progress=none)")
+	fs.BoolVar(&opts.noProgress, "q", false, "alias for --no-progress")
 	fs.BoolVar(&opts.speedtest, "speedtest", false, "run a transfer benchmark without creating a downloadable file")
 	fs.BoolVar(&opts.speedtest, "T", false, "alias for --speedtest")
 	fs.BoolVar(&opts.download, "download", false, "download a public URL or file id using a download plan")
+	fs.BoolVar(&opts.download, "D", false, "alias for --download")
 	fs.StringVar(&opts.downloadOutput, "download-output", "", "output file path or directory for --download")
+	fs.StringVar(&opts.downloadOutput, "O", "", "alias for --download-output")
 	fs.BoolVar(&opts.verbose, "verbose", false, "print retry and finalization logs")
 	fs.BoolVar(&opts.verbose, "v", false, "alias for --verbose")
 	fs.BoolVar(&opts.debug, "debug", false, "enable verbose live upload debug stats")
 	fs.BoolVar(&opts.debug, "d", false, "alias for --debug")
+	fs.BoolVar(helpAll, "help-all", false, "show every advanced option")
+	fs.BoolVar(helpAll, "A", false, "alias for --help-all")
 }
 
 func parseProgressMode(raw string) (progressMode, error) {
@@ -404,141 +433,96 @@ func cliCommandName() string {
 }
 
 func usageText() string {
+	if strings.TrimSpace(os.Getenv("IDOUD_SHOW_OPERATOR_FLAGS")) != "" {
+		return usageAllText()
+	}
+	return compactUsageText()
+}
+
+func compactUsageText() string {
 	name := cliCommandName()
-	title := strings.ToUpper(name)
-	public := strings.TrimSpace(fmt.Sprintf(`
-%s CLI
-  Fast chunked uploader and planned downloader using idoud.cc metadata APIs.
+	return strings.TrimSpace(fmt.Sprintf(`
+%[1]s — fast, resumable file transfers
 
 USAGE
-  %[2]s [flags] <file>
-  %[2]s <file> [flags]
-  %[2]s -z <path> [flags]
-  %[2]s --stdin [--name <filename> | <filename>] [flags]
-  %[2]s --download <url-or-file-id> [--download-output <path>] [flags]
-  %[2]s update
-
-QUICK START
-  %[2]s archive.zip
-  %[2]s -z .
-  %[2]s archive.zip --password 55551230
-  cat archive.zip | %[2]s --stdin --name archive.zip
-  %[2]s --server https://s1.example,https://s2.example archive.zip
-  %[2]s --download https://idoud.cc/AbC123/archive.zip
-  %[2]s update
+  %[1]s [options] FILE
+  %[1]s -S [-n NAME] [options]
+  %[1]s -z PATH [options]
+  %[1]s -D URL_OR_ID [options]
+  %[1]s update
 
 INPUT
-  -z, --archive
-      Stream a file or directory as <path>.tar.lz4 without a temporary archive.
-      LZ4 compression uses available CPU capacity for maximum throughput.
-  -S, --stdin
-      Read payload from stdin instead of a file path.
-  --stdin-size <size>
-      Known stdin size hint (only valid with --stdin).
-  -n, --name <filename>
-      Override upload filename.
+  -z, --archive              Stream PATH as a .tar.lz4 archive
+  -S, --stdin                Read upload data from stdin
+  -n, --name NAME            Override the uploaded filename
+  -L, --stdin-size SIZE      Provide the expected stdin size
 
-CONNECTION
-  -s, --server <url[,url...]>
-      One origin or a comma-separated origin list.
-
-UPLOAD
-  -p, --parallel <n>
-      Maximum parallel chunk uploads (default: 384; server plans may cap it).
-  -r, --retries <n>
-      Retries per failed chunk (default: 6).
-  --hedge-delay <dur>
-      Delay before speculative duplicate upload for slow chunks.
-  --request-timeout <dur>
-      Timeout for non-final chunk requests.
-  --final-request-timeout <dur>
-      Timeout for the final chunk request.
-  --finalize-recovery-timeout <dur>
-      Readiness wait after uncertain final chunk result.
-  --finalize-poll-interval <dur>
-      Poll interval while waiting for finalization.
-  --finalize-timeout <dur>
-      Maximum total finalization wait.
-  --resume-timeout <dur>
-      Keep retrying and resuming an interrupted transfer (default: 24h).
-
-SECURITY AND LIMITS
-  -P, --password <value>
-      Set upload and download password.
-  -l, --download-limit <n>
-      Set download limit.
+TRANSFER
+  -s, --server URLS          Server or comma-separated origins
+  -p, --parallel N           Maximum parallel parts
+  -r, --retries N            Retries per failed part
+  -R, --resume-timeout TIME  Resume/retry window (default 24h)
+  -P, --password VALUE       Protect the uploaded file
+  -l, --download-limit N     Limit successful downloads
+  -k, --upload-key VALUE     Explicit resumable-upload key
 
 DOWNLOAD
-  --download
-      Download a public file URL or file id.
-  --download-output <path>
-      Output file path or directory. Defaults to the server file name.
-      Interrupted downloads keep a verified .idoud.part checkpoint.
+  -D, --download             Download a URL or public file ID
+  -O, --download-output PATH Destination file or directory
 
 OUTPUT
-  -o, --output <mode>
-      Success stdout mode: url (default), json, none.
-      json emits exactly one JSON document on stdout.
-      none suppresses success stdout entirely.
-  --json
-      Shorthand for --output json.
-  --progress <mode>
-      Progress mode: auto (interactive terminal only), plain (timestamped,
-      ANSI-free line records), or none. IDOUD_PROGRESS sets the default.
-  --non-interactive
-      Alias for --progress=plain. Emits bounded event/heartbeat records to
-      stderr and remains compatible with stdin uploads and stdout piping.
-  --no-progress
-      Legacy alias for --progress=none.
+  -o, --output MODE          Success output: url, json, none
+  -j, --json                 Alias for --output=json
+  -g, --progress MODE        Progress: auto, plain, none
+  -N, --non-interactive      Timestamped ANSI-free progress
+  -q, --no-progress          Disable progress output
 
 DIAGNOSTICS
-  -v, --verbose
-      Print retry/finalization logs to stderr.
-  -d, --debug
-      Print live chunk concurrency and throughput stats to stderr.
+  -v, --verbose              Print retry and finalization events
+  -d, --debug                Print detailed transfer diagnostics
+  -T, --speedtest            Benchmark without creating a file
 
-UPDATE
-  update
-      Install the latest release for this OS and CPU in place. The downloaded
-      executable is SHA-256 verified and validated before atomic replacement.
+OTHER
+  -V, --version              Print version
+  -A, --help-all             Show every advanced option
+  -h, --help                 Show this help
 
-HELP
-  -h, --help
-      Show this help and exit.
-  -V, --version
-      Print the build version and exit.
-`, title, name))
-	if strings.TrimSpace(os.Getenv("IDOUD_SHOW_OPERATOR_FLAGS")) == "" {
-		return public
-	}
-	return public + "\n\n" + strings.TrimSpace(`
-OPERATOR FLAGS
-  --http2-connections <n>
-      Use a fixed pool of HTTP/2 connections for chunk bodies.
-  --upload-body-concurrency <n>
-      Limit simultaneously written request bodies (0 selects a safe default).
-  --upload-ramp-rps <n>
-      Pace request starts after the initial burst.
-  --upload-ramp-burst <n>
-      Initial requests allowed before upload pacing begins.
-  --chunk-size <size>
-      Deprecated fallback; public uploads use the server-selected chunk size.
-  --subdomains <n>
-      Force upload subdomains 0..N-1 on idoud domains.
-  --no-subdomains, --nosub
-      Disable numbered subdomain routing.
-  --ips <ip[,ip...]>
-      Pin chunk uploads to destination IPs (round-robin).
-  -I, --interface <addr>
-      Bind outgoing connections to a local IP or interface name.
-  --no-ipv6
-      Force IPv4-only networking.
-  -k, --upload-key <value>
-      Explicit upload key (default: random).
-  --insecure
-      Skip TLS certificate verification.
-  -T, --speedtest
-      Run a transfer benchmark without creating a downloadable file.
+EXAMPLES
+  %[1]s movie.mkv
+  %[1]s -z .
+  cat movie.mkv | %[1]s -S -n movie.mkv
+  %[1]s -N movie.mkv 2>transfer.log
+  %[1]s -D https://idoud.cc/AbC123/movie.mkv
+`, name))
+}
+
+func usageAllText() string {
+	return compactUsageText() + "\n\n" + strings.TrimSpace(`
+ADVANCED
+  -c, --chunk-size SIZE      Fallback part size when no plan selects one
+  -H, --http2-connections N  Fixed HTTP/2 connection pool (0 disables)
+  -b, --upload-body-concurrency N
+                             Maximum concurrent request bodies (0 auto)
+      --upload-ramp-rps N    Pace starts after the initial request burst
+      --upload-ramp-burst N  Initial requests before pacing begins
+  -e, --hedge-delay TIME     Delay before a speculative retry (0 disables)
+  -t, --request-timeout TIME Timeout for each non-final request
+  -F, --final-request-timeout TIME
+                             Timeout for the final part request
+      --finalize-recovery-timeout TIME
+                             Recovery wait after an uncertain final request
+  -w, --finalize-timeout TIME
+                             Maximum total finalization wait
+      --finalize-poll-interval TIME
+                             Finalization readiness poll interval
+  -i, --ips LIST             Pin transfer destinations to comma-separated IPs
+  -I, --interface ADDR       Bind outgoing connections to an address/interface
+  -4, --no-ipv6              Use IPv4 only
+  -x, --insecure             Skip TLS certificate verification
+  -u, --subdomains N         Force a numbered upload-origin pool
+  -U, --no-subdomains        Disable numbered upload-origin routing
+      --nosub                Alias for --no-subdomains
+      --plain-progress       Alias for --non-interactive
 `)
 }
 

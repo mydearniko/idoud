@@ -28,7 +28,7 @@ func TestRunJSONHelp(t *testing.T) {
 	if !payload.OK || payload.Type != "help" {
 		t.Fatalf("payload=%+v, want ok help", payload)
 	}
-	if payload.Help == nil || !strings.Contains(payload.Help.Text, "IDOUD CLI") {
+	if payload.Help == nil || !strings.Contains(payload.Help.Text, "idoud — fast, resumable file transfers") {
 		t.Fatalf("help payload=%+v, want usage text", payload.Help)
 	}
 	assertNoPublicPrivateBoundaryTerms(t, "JSON help text", payload.Help.Text)
@@ -47,19 +47,87 @@ func TestRunTextHelpDoesNotExposePrivateBoundaryTerms(t *testing.T) {
 			if exitCode != 0 {
 				t.Fatalf("Run exitCode=%d, want 0", exitCode)
 			}
-			if stdout == "" || !strings.Contains(stdout, "IDOUD CLI") {
+			if stdout == "" || !strings.Contains(stdout, "idoud — fast, resumable file transfers") {
 				t.Fatalf("stdout=%q, want public help text", stdout)
 			}
 			if stderr != "" {
 				t.Fatalf("stderr=%q, want empty", stderr)
 			}
 			assertNoPublicPrivateBoundaryTerms(t, "text help", stdout)
-			for _, hiddenFlag := range []string{"--chunk-size", "--subdomains", "--ips", "--interface", "--no-ipv6", "--speedtest"} {
+			for _, hiddenFlag := range []string{"--chunk-size", "--subdomains", "--ips", "--interface", "--no-ipv6"} {
 				if strings.Contains(stdout, hiddenFlag) {
 					t.Fatalf("text help exposed operator compatibility flag %q in %q", hiddenFlag, stdout)
 				}
 			}
 		})
+	}
+}
+
+func TestRunHelpAllIncludesEveryAdvancedOption(t *testing.T) {
+	t.Setenv("IDOUD_SHOW_OPERATOR_FLAGS", "")
+
+	for _, args := range [][]string{
+		{"--help-all"},
+		{"-A"},
+		{"file.bin", "-A"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			exitCode, stdout, stderr := captureRunOutput(t, args)
+			if exitCode != 0 {
+				t.Fatalf("Run exitCode=%d, want 0", exitCode)
+			}
+			if stderr != "" {
+				t.Fatalf("stderr=%q, want empty", stderr)
+			}
+			for _, want := range []string{
+				"ADVANCED",
+				"-c, --chunk-size",
+				"-H, --http2-connections",
+				"-b, --upload-body-concurrency",
+				"--upload-ramp-rps",
+				"-F, --final-request-timeout",
+				"--finalize-recovery-timeout",
+				"-i, --ips",
+				"-4, --no-ipv6",
+				"-U, --no-subdomains",
+			} {
+				if !strings.Contains(stdout, want) {
+					t.Fatalf("full help missing %q in %q", want, stdout)
+				}
+			}
+		})
+	}
+}
+
+func TestRunJSONHelpAllWithShortAliases(t *testing.T) {
+	exitCode, stdout, stderr := captureRunOutput(t, []string{"-j", "-A"})
+	if exitCode != 0 {
+		t.Fatalf("Run exitCode=%d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr=%q, want empty", stderr)
+	}
+
+	var payload jsonEnvelope
+	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v", err)
+	}
+	if !payload.OK || payload.Type != "help" || payload.Help == nil {
+		t.Fatalf("payload=%+v, want JSON help", payload)
+	}
+	if !strings.Contains(payload.Help.Text, "ADVANCED") || !strings.Contains(payload.Help.Text, "--chunk-size") {
+		t.Fatalf("help payload=%+v, want full help", payload.Help)
+	}
+}
+
+func TestRunHelpOperatorEnvironmentRemainsCompatible(t *testing.T) {
+	t.Setenv("IDOUD_SHOW_OPERATOR_FLAGS", "1")
+	exitCode, stdout, stderr := captureRunOutput(t, []string{"--help"})
+	if exitCode != 0 || stderr != "" {
+		t.Fatalf("Run exitCode=%d stderr=%q, want clean help", exitCode, stderr)
+	}
+	if !strings.Contains(stdout, "ADVANCED") || !strings.Contains(stdout, "--chunk-size") {
+		t.Fatalf("stdout=%q, want full compatibility help", stdout)
 	}
 }
 

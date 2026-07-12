@@ -46,8 +46,8 @@ idoud --download AbC123 --download-output ./archive.zip
 idoud update
 ```
 
-Run `idoud --help` for user-facing options and `idoud --version` for build
-identification.
+Run `idoud --help` for the compact command reference, `idoud --help-all` for
+every advanced option, and `idoud --version` for build identification.
 
 ## Behavior
 
@@ -126,10 +126,10 @@ Stable JSON error codes are:
 
 ## Operator diagnostics
 
-Set `IDOUD_SHOW_OPERATOR_FLAGS=1` before `idoud --help` to show transport,
-address-pinning, and speed-test controls. These flags are intentionally hidden
-from normal help because server-provided plans are the production source of
-truth.
+Run `idoud --help-all` (or `idoud -A`) to show transport tuning and
+address-pinning controls. `IDOUD_SHOW_OPERATOR_FLAGS=1 idoud --help` remains a
+compatibility alias. Advanced controls stay out of compact help because
+server-provided plans are the production source of truth.
 
 ## Development
 

@@ -5,6 +5,7 @@ import (
 	"flag"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseFlagsStdinPositionalName(t *testing.T) {
@@ -136,6 +137,158 @@ func TestParseFlagsHelpAfterFilePath(t *testing.T) {
 	if !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("err=%v, want flag.ErrHelp", err)
 	}
+}
+
+func TestParseFlagsHelpAllAfterFilePath(t *testing.T) {
+	_, _, err := parseFlags([]string{"file.bin", "-A"})
+	if !errors.Is(err, errHelpAll) {
+		t.Fatalf("err=%v, want errHelpAll", err)
+	}
+}
+
+func TestParseFlagsCaseSensitiveShortAliases(t *testing.T) {
+	opts, filePath, err := parseFlags([]string{
+		"-s", "https://idoud.cc",
+		"-S",
+		"-L", "12MiB",
+		"-n", "payload.bin",
+		"-p", "7",
+		"-P", "secret",
+		"-r", "2",
+		"-R", "3h",
+		"-N",
+		"-i", "192.0.2.10",
+		"-I", "127.0.0.1",
+		"-t", "4s",
+		"-T",
+	})
+	if err != nil {
+		t.Fatalf("parseFlags returned error: %v", err)
+	}
+	if filePath != "" || !opts.stdin || opts.stdinSize != 12*1024*1024 || opts.nameOverride != "payload.bin" {
+		t.Fatalf("stdin fields: filePath=%q stdin=%t size=%d name=%q", filePath, opts.stdin, opts.stdinSize, opts.nameOverride)
+	}
+	if opts.serverBase == nil || opts.serverBase.String() != "https://idoud.cc" {
+		t.Fatalf("serverBase=%v, want https://idoud.cc", opts.serverBase)
+	}
+	if opts.parallel != 7 || !opts.parallelExplicit || opts.password != "secret" {
+		t.Fatalf("parallel/password fields: parallel=%d explicit=%t password=%q", opts.parallel, opts.parallelExplicit, opts.password)
+	}
+	if opts.retries != 2 || opts.resumeTimeout != 3*time.Hour {
+		t.Fatalf("retry fields: retries=%d resumeTimeout=%s", opts.retries, opts.resumeTimeout)
+	}
+	if opts.progressMode != progressModePlain {
+		t.Fatalf("progressMode=%q, want plain", opts.progressMode)
+	}
+	if len(opts.forcedIPs) != 1 || opts.forcedIPs[0] != "192.0.2.10" || opts.bindInterface != "127.0.0.1" {
+		t.Fatalf("network fields: ips=%v interface=%q", opts.forcedIPs, opts.bindInterface)
+	}
+	if opts.requestTimeout != 4*time.Second || !opts.speedtest {
+		t.Fatalf("diagnostic fields: requestTimeout=%s speedtest=%t", opts.requestTimeout, opts.speedtest)
+	}
+}
+
+func TestParseFlagsNewAdvancedShortAliases(t *testing.T) {
+	opts, filePath, err := parseFlags([]string{
+		"-c", "1MiB",
+		"-H", "2",
+		"-b", "2",
+		"-e", "3s",
+		"-F", "5s",
+		"-w", "6s",
+		"-4",
+		"-x",
+		"-u", "3",
+		"file.bin",
+	})
+	if err != nil {
+		t.Fatalf("parseFlags returned error: %v", err)
+	}
+	if filePath != "file.bin" {
+		t.Fatalf("filePath=%q, want file.bin", filePath)
+	}
+	if opts.chunkSize != 1024*1024 || !opts.chunkSizeExplicit {
+		t.Fatalf("chunkSize=%d explicit=%t, want 1MiB explicit", opts.chunkSize, opts.chunkSizeExplicit)
+	}
+	if opts.http2Connections != 2 || opts.uploadBodyConcurrency != 2 {
+		t.Fatalf("body controls: h2=%d concurrency=%d", opts.http2Connections, opts.uploadBodyConcurrency)
+	}
+	if opts.hedgeDelay != 3*time.Second || opts.finalChunkTimeout != 5*time.Second || opts.finalizeTimeout != 6*time.Second {
+		t.Fatalf("timeouts: hedge=%s final=%s finalize=%s", opts.hedgeDelay, opts.finalChunkTimeout, opts.finalizeTimeout)
+	}
+	if !opts.noIPv6 || !opts.insecureTLS || opts.subdomains != 3 {
+		t.Fatalf("network controls: noIPv6=%t insecure=%t subdomains=%d", opts.noIPv6, opts.insecureTLS, opts.subdomains)
+	}
+}
+
+func TestParseFlagsNewOutputAndDownloadShortAliases(t *testing.T) {
+	opts, filePath, err := parseFlags([]string{"-d", "-D", "-O", "downloads/", "-o", "none", "AbC123"})
+	if err != nil {
+		t.Fatalf("parseFlags returned error: %v", err)
+	}
+	if !opts.debug || !opts.download || opts.downloadOutput != "downloads/" || opts.outputMode != outputModeNone || filePath != "AbC123" {
+		t.Fatalf("download fields: debug=%t download=%t output=%q mode=%q input=%q", opts.debug, opts.download, opts.downloadOutput, opts.outputMode, filePath)
+	}
+
+	jsonOpts, _, err := parseFlags([]string{"-j", "file.bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jsonOpts.outputMode != outputModeJSON {
+		t.Fatalf("-j outputMode=%q, want json", jsonOpts.outputMode)
+	}
+
+	quietOpts, _, err := parseFlags([]string{"-q", "file.bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !quietOpts.noProgress || quietOpts.progressMode != progressModeNone {
+		t.Fatalf("-q noProgress=%t progressMode=%q", quietOpts.noProgress, quietOpts.progressMode)
+	}
+
+	noSubOpts, _, err := parseFlags([]string{"-U", "file.bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !noSubOpts.noSubdomains {
+		t.Fatal("-U noSubdomains=false, want true")
+	}
+}
+
+func TestParseFlagsShortProgressIsExplicit(t *testing.T) {
+	t.Setenv("IDOUD_PROGRESS", "none")
+	opts, _, err := parseFlags([]string{"-g", "plain", "file.bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.progressMode != progressModePlain {
+		t.Fatalf("progressMode=%q, want explicit plain", opts.progressMode)
+	}
+}
+
+func TestUsageAllDocumentsEveryRegisteredOption(t *testing.T) {
+	fs := flag.NewFlagSet("help-coverage", flag.ContinueOnError)
+	opts := options{}
+	chunkSizeRaw := ""
+	stdinSizeRaw := ""
+	ipsRaw := ""
+	outputRaw := ""
+	progressRaw := ""
+	jsonOutput := false
+	nonInteractive := false
+	helpAll := false
+	registerFlags(fs, &opts, &chunkSizeRaw, &stdinSizeRaw, &ipsRaw, &outputRaw, &progressRaw, &jsonOutput, &nonInteractive, &helpAll)
+
+	help := usageAllText()
+	fs.VisitAll(func(f *flag.Flag) {
+		prefix := "--"
+		if len(f.Name) == 1 {
+			prefix = "-"
+		}
+		if !strings.Contains(help, prefix+f.Name) {
+			t.Errorf("full help does not document %s%s", prefix, f.Name)
+		}
+	})
 }
 
 func TestParseFlagsMissingInput(t *testing.T) {
