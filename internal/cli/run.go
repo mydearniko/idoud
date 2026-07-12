@@ -9,7 +9,10 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 )
+
+const interruptExitCode = 130
 
 // Run executes the CLI flow and returns an exit code.
 func Run(args []string) int {
@@ -64,7 +67,7 @@ func runTransfer(args []string) int {
 		return 2
 	}
 	out.mode = opts.outputMode
-	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stopSignals := newInterruptContext()
 	defer stopSignals()
 
 	bind, err := resolveBindAddr(opts.bindInterface)
@@ -81,6 +84,10 @@ func runTransfer(args []string) int {
 		d := &downloader{opts: opts, client: client}
 		outputPath, err := d.download(ctx, filePath)
 		if err != nil {
+			if errors.Is(ctx.Err(), context.Canceled) {
+				out.printTransferCanceled("download")
+				return interruptExitCode
+			}
 			out.printDownloadError(err)
 			return 1
 		}
@@ -93,7 +100,11 @@ func runTransfer(args []string) int {
 		out.printInputError(err)
 		return 1
 	}
-	defer cleanup()
+	var cleanupOnce sync.Once
+	safeCleanup := func() { cleanupOnce.Do(cleanup) }
+	defer safeCleanup()
+	stopCancellationCleanup := context.AfterFunc(ctx, safeCleanup)
+	defer stopCancellationCleanup()
 
 	resumeID, err := configureUploadResume(&opts, src)
 	if err != nil {
@@ -135,6 +146,10 @@ func runTransfer(args []string) int {
 
 	finalURL, err := u.upload(ctx, src)
 	if err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			out.printTransferCanceled("upload")
+			return interruptExitCode
+		}
 		out.printUploadError(err)
 		return 1
 	}
@@ -144,6 +159,20 @@ func runTransfer(args []string) int {
 
 	out.printSuccess(src, finalURL)
 	return 0
+}
+
+func newInterruptContext() (context.Context, context.CancelFunc) {
+	ctx, rawStop := signal.NotifyContext(context.Background(), os.Interrupt)
+	var stopOnce sync.Once
+	stop := func() { stopOnce.Do(rawStop) }
+	// Restore the operating system's default interrupt behavior immediately
+	// after the first Ctrl+C. The first press performs graceful cancellation;
+	// a second press can then force termination instead of being swallowed.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
+	return ctx, stop
 }
 
 func effectiveUploadBodyConcurrency(parallel int, configured int) int {

@@ -219,6 +219,38 @@ func TestRequestFinalizeUploadPropagatesCallerCancel(t *testing.T) {
 	}
 }
 
+func TestFinalChunkRecoversFromCompletedTargetReplayResponse(t *testing.T) {
+	finalizeRequests := 0
+	u := newFinalizeTestUploader(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost || req.URL.Path != "/v1/uploads/AbC123/finalize" {
+			t.Fatalf("unexpected recovery request %s %s", req.Method, req.URL.Path)
+		}
+		finalizeRequests++
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("https://idoud.cc/AbC123/file.bin\n")),
+		}, nil
+	})
+	u.opts.finalizeRecover = time.Second
+	u.opts.finalizeTimeout = time.Second
+	u.opts.resumeTimeout = time.Second
+	u.opts.retries = 0
+	urls := &urlCapture{}
+	urls.set("https://idoud.cc/AbC123/file.bin")
+	uploadAttempts := 0
+	err := u.retryChunkUpload(context.Background(), 36, 4, true, urls, "stream-unknown", func(context.Context, int) (string, int, error) {
+		uploadAttempts++
+		requestErr := &requestError{status: http.StatusBadRequest, body: uploadPrepareTargetAlreadyExists}
+		return "", http.StatusBadRequest, requestErr
+	})
+	if err != nil {
+		t.Fatalf("retryChunkUpload returned error: %v", err)
+	}
+	if uploadAttempts != 1 || finalizeRequests != 1 {
+		t.Fatalf("uploadAttempts=%d finalizeRequests=%d, want one upload and one recovery probe", uploadAttempts, finalizeRequests)
+	}
+}
+
 func TestWaitForReadyAttemptTreatsProbeTimeoutAsTransient(t *testing.T) {
 	u := newFinalizeTestUploader(func(*http.Request) (*http.Response, error) {
 		return nil, context.DeadlineExceeded

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"archive/tar"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -11,11 +12,15 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pierrec/lz4/v4"
 )
 
-const archiveCopyBufferSize = 1024 * 1024
+const (
+	archiveCopyBufferSize = 1024 * 1024
+	archiveCleanupGrace   = 250 * time.Millisecond
+)
 
 // openArchiveSource starts a backpressured tar+LZ4 stream. The pipe means no
 // temporary archive is created: compression advances only while the upload
@@ -52,10 +57,11 @@ func openArchiveSource(sourcePath string, opts options) (*sourceFile, func(), er
 	}
 
 	reader, writer := io.Pipe()
+	archiveCtx, cancelArchive := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		err := writeTarLZ4(writer, absPath, rootName)
+		err := writeTarLZ4(archiveCtx, writer, absPath, rootName)
 		_ = writer.CloseWithError(err)
 	}()
 
@@ -76,8 +82,9 @@ func openArchiveSource(sourcePath string, opts options) (*sourceFile, func(), er
 	var cleanupOnce sync.Once
 	cleanup := func() {
 		cleanupOnce.Do(func() {
+			cancelArchive()
 			_ = reader.Close()
-			<-done
+			waitForArchiveProducer(done, archiveCleanupGrace)
 		})
 	}
 	return src, cleanup, nil
@@ -106,7 +113,29 @@ func archiveRootName(absPath string) string {
 	return name
 }
 
-func writeTarLZ4(dst io.Writer, sourcePath, rootName string) error {
+func waitForArchiveProducer(done <-chan struct{}, grace time.Duration) {
+	if done == nil {
+		return
+	}
+	if grace <= 0 {
+		select {
+		case <-done:
+		default:
+		}
+		return
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
+}
+
+func writeTarLZ4(ctx context.Context, dst io.Writer, sourcePath, rootName string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	lz4Writer := lz4.NewWriter(dst)
 	if err := lz4Writer.Apply(
 		lz4.BlockSizeOption(lz4.Block4Mb),
@@ -119,18 +148,32 @@ func writeTarLZ4(dst io.Writer, sourcePath, rootName string) error {
 	}
 
 	tarWriter := tar.NewWriter(lz4Writer)
-	walkErr := writeTarPath(tarWriter, sourcePath, rootName)
+	walkErr := writeTarPath(ctx, tarWriter, sourcePath, rootName)
+	if walkErr != nil {
+		// Concurrent LZ4 may still have compressed blocks queued. Drain those
+		// asynchronously after cancellation so CLI shutdown never waits for the
+		// whole abandoned pipeline; closing the pipe makes every write fail fast.
+		go func() { _ = lz4Writer.Close() }()
+		return fmt.Errorf("create tar.lz4 archive: %w", walkErr)
+	}
 	tarCloseErr := tarWriter.Close()
+	if tarCloseErr != nil {
+		go func() { _ = lz4Writer.Close() }()
+		return fmt.Errorf("create tar.lz4 archive: %w", tarCloseErr)
+	}
 	lz4CloseErr := lz4Writer.Close()
-	if err := errors.Join(walkErr, tarCloseErr, lz4CloseErr); err != nil {
-		return fmt.Errorf("create tar.lz4 archive: %w", err)
+	if lz4CloseErr != nil {
+		return fmt.Errorf("create tar.lz4 archive: %w", lz4CloseErr)
 	}
 	return nil
 }
 
-func writeTarPath(tarWriter *tar.Writer, sourcePath, rootName string) error {
+func writeTarPath(ctx context.Context, tarWriter *tar.Writer, sourcePath, rootName string) error {
 	copyBuffer := make([]byte, archiveCopyBufferSize)
 	return filepath.WalkDir(sourcePath, func(filePath string, entry fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if walkErr != nil {
 			return fmt.Errorf("walk %q: %w", filePath, walkErr)
 		}
@@ -179,7 +222,10 @@ func writeTarPath(tarWriter *tar.Writer, sourcePath, rootName string) error {
 		if err != nil {
 			return fmt.Errorf("open %q while archiving: %w", filePath, err)
 		}
-		written, copyErr := io.CopyBuffer(tarWriter, io.LimitReader(file, header.Size), copyBuffer)
+		written, copyErr := io.CopyBuffer(tarWriter, &archiveContextReader{
+			ctx:    ctx,
+			reader: io.LimitReader(file, header.Size),
+		}, copyBuffer)
 		closeErr := file.Close()
 		if copyErr != nil {
 			return fmt.Errorf("read %q while archiving: %w", filePath, copyErr)
@@ -192,4 +238,23 @@ func writeTarPath(tarWriter *tar.Writer, sourcePath, rootName string) error {
 		}
 		return nil
 	})
+}
+
+type archiveContextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r *archiveContextReader) Read(p []byte) (int, error) {
+	if r == nil || r.reader == nil {
+		return 0, io.EOF
+	}
+	if r.ctx != nil {
+		select {
+		case <-r.ctx.Done():
+			return 0, r.ctx.Err()
+		default:
+		}
+	}
+	return r.reader.Read(p)
 }

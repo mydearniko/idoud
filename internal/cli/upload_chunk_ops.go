@@ -329,7 +329,7 @@ func (u *uploader) retryChunkUpload(
 		lastStatus = status
 
 		if finalChunk {
-			if ready, waitErr := u.tryRecoverFinalization(ctx, urls, status, u.opts.finalizeRecover); waitErr == nil && ready {
+			if ready, waitErr := u.tryRecoverFinalization(ctx, urls, status, err, u.opts.finalizeRecover); waitErr == nil && ready {
 				success = true
 				return nil
 			} else if waitErr != nil && isContextErr(waitErr) {
@@ -363,7 +363,7 @@ func (u *uploader) retryChunkUpload(
 	}
 
 	if finalChunk {
-		if ready, waitErr := u.tryRecoverFinalization(ctx, urls, lastStatus, u.opts.finalizeTimeout); waitErr == nil && ready {
+		if ready, waitErr := u.tryRecoverFinalization(ctx, urls, lastStatus, lastErr, u.opts.finalizeTimeout); waitErr == nil && ready {
 			success = true
 			return nil
 		} else if waitErr != nil && isContextErr(waitErr) {

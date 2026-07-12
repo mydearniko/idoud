@@ -3,6 +3,7 @@ package cli
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -237,6 +238,28 @@ func TestArchiveSourceCleanupCancelsBlockedStream(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("archive cleanup did not stop the blocked compressor")
+	}
+}
+
+func TestArchiveProducerCleanupWaitIsBounded(t *testing.T) {
+	done := make(chan struct{})
+	started := time.Now()
+	waitForArchiveProducer(done, 20*time.Millisecond)
+	elapsed := time.Since(started)
+	if elapsed < 10*time.Millisecond {
+		t.Fatalf("cleanup wait returned too early: %s", elapsed)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("cleanup wait was not bounded: %s", elapsed)
+	}
+}
+
+func TestArchiveContextReaderStopsBeforeAnotherRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	reader := &archiveContextReader{ctx: ctx, reader: strings.NewReader("data")}
+	if _, err := reader.Read(make([]byte, 4)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Read error=%v, want context.Canceled", err)
 	}
 }
 

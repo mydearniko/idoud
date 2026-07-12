@@ -754,8 +754,17 @@ func finalizationUncertainStatus(status int) bool {
 	}
 }
 
-func (u *uploader) tryRecoverFinalization(ctx context.Context, urls *urlCapture, status int, wait time.Duration) (bool, error) {
-	if !finalizationUncertainStatus(status) || wait <= 0 || urls == nil {
+func finalizationAlreadyCompletedResponse(status int, err error) bool {
+	if status != http.StatusBadRequest || err == nil {
+		return false
+	}
+	var requestErr *requestError
+	return errors.As(err, &requestErr) && requestErr != nil &&
+		strings.TrimSpace(requestErr.body) == uploadPrepareTargetAlreadyExists
+}
+
+func (u *uploader) tryRecoverFinalization(ctx context.Context, urls *urlCapture, status int, requestErr error, wait time.Duration) (bool, error) {
+	if (!finalizationUncertainStatus(status) && !finalizationAlreadyCompletedResponse(status, requestErr)) || wait <= 0 || urls == nil {
 		return false, nil
 	}
 	publicURL := urls.get()

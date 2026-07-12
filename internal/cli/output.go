@@ -251,6 +251,27 @@ func (o primaryOutput) printUploadError(err error) {
 	stderrLogf("upload failed: %v", err)
 }
 
+func (o primaryOutput) printTransferCanceled(operation string) {
+	operation = strings.TrimSpace(operation)
+	if operation == "" {
+		operation = "transfer"
+	}
+	if o.mode == outputModeJSON {
+		o.writeJSON(jsonEnvelope{
+			SchemaVersion: outputJSONSchemaVersion,
+			OK:            false,
+			Type:          "error",
+			ExitCode:      interruptExitCode,
+			Error: &jsonError{
+				Code:   "transfer_canceled",
+				Detail: operation + " canceled by interrupt",
+			},
+		})
+		return
+	}
+	stderrLogf("%s canceled", operation)
+}
+
 func (o primaryOutput) writeJSON(payload jsonEnvelope) {
 	if err := encodeJSON(os.Stdout, payload); err != nil {
 		stderrWritef("error: failed to encode JSON output: %v", err)
