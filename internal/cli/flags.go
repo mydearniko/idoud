@@ -449,7 +449,7 @@ USAGE
   %[1]s -S [-n NAME] [options]
   %[1]s -z PATH [options]
   %[1]s -D URL_OR_ID [options]
-  %[1]s update
+  %[1]s --update
 
 INPUT
   -z, --archive              Stream PATH as a .tar.lz4 archive
@@ -478,12 +478,14 @@ OUTPUT
   -q, --no-progress          Disable progress output
 
 DIAGNOSTICS
-  -v, --verbose              Print retry and finalization events
+  -v, --verbose              Print transfer retry/finalization events
   -d, --debug                Print detailed transfer diagnostics
   -T, --speedtest            Benchmark without creating a file
 
 OTHER
-  -V, --version              Print version
+  -a, --update               Install the latest idoud release
+      update                 Update, or upload file ./update when it exists
+  -v, -V, --version          Print version when used alone
   -A, --help-all             Show every advanced option
   -h, --help                 Show this help
 
@@ -494,6 +496,7 @@ EXAMPLES
   %[1]s -g lines movie.mkv 2>pretty.log
   %[1]s -N movie.mkv 2>transfer.log
   %[1]s -D https://idoud.cc/AbC123/movie.mkv
+  %[1]s --update
 `, name))
 }
 

@@ -36,6 +36,20 @@ func TestRunJSONHelp(t *testing.T) {
 	assertNoPublicPrivateBoundaryTerms(t, "JSON help envelope", stdout)
 }
 
+func TestRunStandaloneVersionAliases(t *testing.T) {
+	for _, arg := range []string{"-v", "-V", "--version"} {
+		t.Run(arg, func(t *testing.T) {
+			exitCode, stdout, stderr := captureRunOutput(t, []string{arg})
+			if exitCode != 0 {
+				t.Fatalf("Run exitCode=%d, want 0", exitCode)
+			}
+			if stdout != "idoud dev\n" || stderr != "" {
+				t.Fatalf("stdout=%q stderr=%q, want standalone version", stdout, stderr)
+			}
+		})
+	}
+}
+
 func TestRunTextHelpDoesNotExposePrivateBoundaryTerms(t *testing.T) {
 	t.Setenv("IDOUD_SHOW_OPERATOR_FLAGS", "")
 
@@ -53,6 +67,11 @@ func TestRunTextHelpDoesNotExposePrivateBoundaryTerms(t *testing.T) {
 			}
 			if stderr != "" {
 				t.Fatalf("stderr=%q, want empty", stderr)
+			}
+			for _, want := range []string{"-a, --update", "update                 Update, or upload file ./update", "-v, -V, --version"} {
+				if !strings.Contains(stdout, want) {
+					t.Fatalf("text help missing %q in %q", want, stdout)
+				}
 			}
 			assertNoPublicPrivateBoundaryTerms(t, "text help", stdout)
 			for _, hiddenFlag := range []string{"--chunk-size", "--subdomains", "--ips", "--interface", "--no-ipv6"} {

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"os"
 
 	"github.com/mydearniko/idoud/internal/cli"
@@ -10,9 +9,5 @@ import (
 var version = "dev"
 
 func main() {
-	if len(os.Args) == 2 && (os.Args[1] == "--version" || os.Args[1] == "-V") {
-		fmt.Printf("idoud %s\n", version)
-		return
-	}
 	os.Exit(cli.RunWithVersion(os.Args[1:], version))
 }

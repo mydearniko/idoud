@@ -43,11 +43,13 @@ idoud --download https://idoud.cc/AbC123/archive.zip
 idoud --download AbC123 --download-output ./archive.zip
 
 # Install the newest release for this operating system and CPU.
-idoud update
+idoud --update
 ```
 
 Run `idoud --help` for the compact command reference, `idoud --help-all` for
-every advanced option, and `idoud --version` for build identification.
+every advanced option, and standalone `idoud -v`, `idoud -V`, or
+`idoud --version` for build identification. With a transfer input, `-v` retains
+its existing `--verbose` meaning.
 
 ## Behavior
 
@@ -104,10 +106,12 @@ every advanced option, and `idoud --version` for build identification.
 - Known random-access files start their final range inside the initial bounded
   concurrency window. This avoids a cold serial final request while preserving
   the server-advertised concurrency ceiling and durable-confirmation semantics.
-- `idoud update` discovers the latest release without using the rate-limited
-  GitHub API, verifies the selected platform binary against the published
-  SHA-256 checksums, runs its version check, and atomically replaces the current
-  executable. Linux, macOS, and Windows release targets are supported.
+- `idoud --update` (or `idoud -a`) discovers the latest release without using
+  the rate-limited GitHub API, verifies the selected platform binary against the
+  published SHA-256 checksums, runs its version check, and atomically replaces
+  the current executable. The legacy positional `idoud update` remains
+  available, but uploads a local regular file named `update` when one exists.
+  Linux, macOS, and Windows release targets are supported.
 
 ## Automation
 

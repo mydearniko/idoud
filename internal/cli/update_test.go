@@ -19,7 +19,8 @@ import (
 )
 
 func TestIsUpdateCommand(t *testing.T) {
-	for _, args := range [][]string{{"update"}, {"UPDATE"}, {" update "}} {
+	t.Chdir(t.TempDir())
+	for _, args := range [][]string{{"update"}, {"UPDATE"}, {" update "}, {"--update"}, {shortUpdateFlag}} {
 		if !isUpdateCommand(args) {
 			t.Fatalf("isUpdateCommand(%q)=false, want true", args)
 		}
@@ -28,6 +29,34 @@ func TestIsUpdateCommand(t *testing.T) {
 		if isUpdateCommand(args) {
 			t.Fatalf("isUpdateCommand(%q)=true, want false", args)
 		}
+	}
+
+	if err := os.WriteFile("update", []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if isUpdateCommand([]string{"update"}) {
+		t.Fatal("positional update command stole an existing local file")
+	}
+	for _, args := range [][]string{{"--update"}, {shortUpdateFlag}} {
+		if !isUpdateCommand(args) {
+			t.Fatalf("explicit update command %q was shadowed by a local file", args)
+		}
+	}
+	opts, filePath, err := parseFlags([]string{"update"})
+	if err != nil {
+		t.Fatalf("parse existing update file: %v", err)
+	}
+	if filePath != "update" || opts.stdin || opts.download {
+		t.Fatalf("existing update parsed as filePath=%q opts=%+v", filePath, opts)
+	}
+	if err := os.Remove("update"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir("update", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if !isUpdateCommand([]string{"update"}) {
+		t.Fatal("a directory named update incorrectly shadowed the update command")
 	}
 }
 

@@ -139,6 +139,29 @@ func TestParseFlagsHelpAfterFilePath(t *testing.T) {
 	}
 }
 
+func TestVersionAliasesAreStandaloneOnly(t *testing.T) {
+	for _, arg := range []string{"-v", "-V", "--version"} {
+		if !isVersionCommand([]string{arg}) {
+			t.Fatalf("isVersionCommand(%q)=false, want true", arg)
+		}
+	}
+	for _, args := range [][]string{nil, {"file.bin", "-v"}, {"-V", "file.bin"}, {"--version", "file.bin"}} {
+		if isVersionCommand(args) {
+			t.Fatalf("isVersionCommand(%q)=true, want standalone-only", args)
+		}
+	}
+}
+
+func TestParseFlagsLowerVRemainsVerboseWithTransfer(t *testing.T) {
+	opts, filePath, err := parseFlags([]string{"file.bin", "-v"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filePath != "file.bin" || !opts.verbose {
+		t.Fatalf("filePath=%q verbose=%t, want verbose file transfer", filePath, opts.verbose)
+	}
+}
+
 func TestParseFlagsHelpAllAfterFilePath(t *testing.T) {
 	_, _, err := parseFlags([]string{"file.bin", "-A"})
 	if !errors.Is(err, errHelpAll) {

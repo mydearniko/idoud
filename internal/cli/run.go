@@ -8,20 +8,37 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 )
 
 // Run executes the CLI flow and returns an exit code.
 func Run(args []string) int {
-	return runTransfer(args)
+	return RunWithVersion(args, "dev")
 }
 
 // RunWithVersion executes the CLI flow with the build version available to
 // commands such as self-update. Run remains available for embedders and tests.
 func RunWithVersion(args []string, currentVersion string) int {
+	if isVersionCommand(args) {
+		fmt.Fprintf(os.Stdout, "idoud %s\n", currentVersion)
+		return 0
+	}
 	if isUpdateCommand(args) {
 		return runSelfUpdate(context.Background(), currentVersion)
 	}
 	return runTransfer(args)
+}
+
+func isVersionCommand(args []string) bool {
+	if len(args) != 1 {
+		return false
+	}
+	switch strings.TrimSpace(args[0]) {
+	case "-v", "-V", "--version":
+		return true
+	default:
+		return false
+	}
 }
 
 func runTransfer(args []string) int {

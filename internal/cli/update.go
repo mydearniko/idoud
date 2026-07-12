@@ -27,6 +27,7 @@ const (
 	maxUpdateExecutableBytes   = 256 * 1024 * 1024
 	defaultUpdateTimeout       = 5 * time.Minute
 	updateRequestRetryAttempts = 3
+	shortUpdateFlag            = "-a"
 )
 
 type updateRelease struct {
@@ -92,7 +93,24 @@ func runSelfUpdate(parent context.Context, currentVersion string) int {
 }
 
 func isUpdateCommand(args []string) bool {
-	return len(args) == 1 && strings.EqualFold(strings.TrimSpace(args[0]), "update")
+	if len(args) != 1 {
+		return false
+	}
+	token := strings.TrimSpace(args[0])
+	if token == "--update" || token == shortUpdateFlag {
+		return true
+	}
+	if !strings.EqualFold(token, "update") {
+		return false
+	}
+	// Preserve the convenient positional command without stealing a real local
+	// file. An explicit --update/-a always updates, even when ./update exists.
+	if info, err := os.Stat(token); err == nil {
+		return !info.Mode().IsRegular()
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	return true
 }
 
 func (u releaseUpdater) update(ctx context.Context, currentVersion string) (updateResult, error) {
