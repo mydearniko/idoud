@@ -56,10 +56,12 @@ type transferUI struct {
 	source  string
 	started time.Time
 
-	detailsMu  sync.RWMutex
-	name       string
-	phase      transferPhase
-	phaseSince time.Time
+	detailsMu        sync.RWMutex
+	name             string
+	planDetail       string
+	phase            transferPhase
+	phaseSince       time.Time
+	summaryFinalized bool
 
 	total           atomic.Int64
 	totalChunks     atomic.Int64
@@ -243,25 +245,6 @@ func (ui *transferUI) start() {
 		go ui.loop()
 		return
 	}
-	ui.outputMu.Lock()
-	ui.writeStyledLineLocked(now, ui.accent("idoud")+" "+ui.dim("· "+ui.kind))
-	source := ui.source
-	if source == "" {
-		source = "file"
-	}
-	name := ui.currentName()
-	total := ui.total.Load()
-	detail := name
-	if total >= 0 {
-		detail += " · " + formatByteSize(total)
-	} else if ui.kind == "download" {
-		detail += " · size pending plan"
-	} else {
-		detail += " · size discovered while streaming"
-	}
-	ui.writeStyledLineLocked(now, ui.dim(source)+"  "+ui.trimVisible(detail, ui.currentWidth()-utf8.RuneCountInString(source)-3))
-	ui.outputMu.Unlock()
-
 	go ui.loop()
 }
 
@@ -410,6 +393,7 @@ func (ui *transferUI) setPhase(phase transferPhase) {
 	ui.detailsMu.Unlock()
 	if phase == transferPhaseTransferring {
 		ui.transferStart.CompareAndSwap(0, now.UnixNano())
+		ui.finalizeSummary(now)
 	}
 }
 
@@ -430,7 +414,17 @@ func (ui *transferUI) setPlan(detail string) {
 	if ui == nil || !ui.enabled || strings.TrimSpace(detail) == "" {
 		return
 	}
-	ui.planOnce.Do(func() { ui.emitInfo("plan", detail) })
+	ui.planOnce.Do(func() {
+		detail = strings.TrimSpace(detail)
+		ui.detailsMu.Lock()
+		ui.planDetail = detail
+		ui.detailsMu.Unlock()
+		if ui.plain {
+			ui.emitInfo("plan", detail)
+			return
+		}
+		ui.renderDynamic(time.Now(), ui.formatTransferSummary(ui.currentWidth()))
+	})
 }
 
 func (ui *transferUI) setDestination(path string) {
@@ -603,6 +597,88 @@ func (ui *transferUI) emitInfo(label, detail string) {
 		ui.lastRenderedLine = ""
 	}
 	ui.writeStyledLineLocked(now, ui.dim(label)+"  "+ui.trimVisible(detail, ui.currentWidth()-utf8.RuneCountInString(label)-3))
+}
+
+func (ui *transferUI) formatTransferSummary(width int) string {
+	if ui == nil {
+		return ""
+	}
+	ui.detailsMu.RLock()
+	name := strings.TrimSpace(ui.name)
+	plan := strings.TrimSpace(ui.planDetail)
+	ui.detailsMu.RUnlock()
+	if name == "" {
+		name = "unnamed"
+	}
+
+	plain := "idoud"
+	kind := strings.TrimSpace(ui.kind)
+	if kind != "" {
+		plain += " · " + kind
+	}
+	source := strings.TrimSpace(ui.source)
+	if source == "stdin" || source == "archive" {
+		name = source + " " + name
+	}
+	plain += " · " + name
+	if total := ui.total.Load(); total >= 0 {
+		plain += " · " + formatByteSize(total)
+	}
+	if plan != "" {
+		plain += " · " + plan
+	}
+	plain = ui.trimVisible(plain, width)
+
+	base := "idoud"
+	if kind != "" {
+		base += " · " + kind
+	}
+	if strings.HasPrefix(plain, base) {
+		styled := ui.accent("idoud")
+		if kind != "" {
+			styled += ui.dim(" · " + kind)
+		}
+		return styled + strings.TrimPrefix(plain, base)
+	}
+	return plain
+}
+
+func (ui *transferUI) formatTransferSummaryStatus(status string) string {
+	status = strings.TrimSpace(status)
+	if status == "" {
+		return ui.formatTransferSummary(ui.currentWidth())
+	}
+	available := ui.currentWidth() - visibleTerminalWidth(status) - 3
+	if available < 20 {
+		return "  " + status
+	}
+	return ui.formatTransferSummary(available) + ui.dim(" · ") + status
+}
+
+func (ui *transferUI) finalizeSummary(now time.Time) {
+	if ui == nil || !ui.enabled || ui.plain {
+		return
+	}
+	ui.detailsMu.Lock()
+	if ui.summaryFinalized {
+		ui.detailsMu.Unlock()
+		return
+	}
+	ui.summaryFinalized = true
+	ui.detailsMu.Unlock()
+
+	line := ui.formatTransferSummary(ui.currentWidth())
+	ui.outputMu.Lock()
+	defer ui.outputMu.Unlock()
+	if ui.lines {
+		if line != ui.lastRenderedLine {
+			ui.writeStyledLineLocked(now, line)
+		}
+		ui.lastRenderedLine = ""
+		return
+	}
+	ui.clearDynamicLocked()
+	ui.writeStyledLineLocked(now, line)
 }
 
 func (ui *transferUI) snapshot(now time.Time, rate, readRate, sendRate float64, stalled bool, tick int) transferProgressSnapshot {
@@ -842,13 +918,14 @@ func (ui *transferUI) formatProgress(snapshot transferProgressSnapshot) string {
 	width := ui.currentWidth()
 	switch snapshot.phase {
 	case transferPhasePlanning:
-		line := "  " + ui.spinner(snapshot.tick) + " " + ui.accentLight("preparing "+snapshot.kind+" plan") + ui.dim(" · "+formatProgressElapsed(snapshot.phaseElapsed))
+		status := ui.spinner(snapshot.tick) + " " + ui.accentLight("preparing plan") + ui.dim(" · "+formatProgressElapsed(snapshot.phaseElapsed))
 		if snapshot.retries > 0 {
-			line += ui.link(fmt.Sprintf(" · retry %d", snapshot.retries))
+			status += ui.link(fmt.Sprintf(" · retry %d", snapshot.retries))
 		}
-		return line
+		return ui.formatTransferSummaryStatus(status)
 	case transferPhaseConnecting:
-		return "  " + ui.spinner(snapshot.tick) + " " + ui.accentLight("connecting transfer routes") + ui.dim(" · "+formatProgressElapsed(snapshot.phaseElapsed))
+		status := ui.spinner(snapshot.tick) + " " + ui.accentLight("connecting routes") + ui.dim(" · "+formatProgressElapsed(snapshot.phaseElapsed))
+		return ui.formatTransferSummaryStatus(status)
 	case transferPhaseFinalizing:
 		label := "committing provider data"
 		if snapshot.kind == "download" {
@@ -1092,6 +1169,7 @@ func progressETA(snapshot transferProgressSnapshot) time.Duration {
 }
 
 func (ui *transferUI) finishLine(success bool, lastRate float64, now time.Time) {
+	ui.finalizeSummary(now)
 	snapshot := ui.snapshot(now, lastRate, 0, 0, false, 0)
 	averageRate := confirmedAverageRate(snapshot)
 	if ui.plain {

@@ -79,6 +79,8 @@ every advanced option, and `idoud --version` for build identification.
 - Diagnostics go to stderr. Successful machine-readable output stays isolated
   on stdout.
 - Interactive terminals get a compact idoud-styled transfer display on stderr.
+  One progressive heading gains the name, size, and route plan as they become
+  available, then remains as the single summary above the progress bar.
   Uploads show smooth, retry-safe request-body progress as `sent` and separately
   show provider-confirmed `stored` bytes, so retry traffic is never double
   counted or mistaken for durability. Download progress counts bytes written to

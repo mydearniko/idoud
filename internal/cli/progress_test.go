@@ -290,13 +290,42 @@ func TestTransferUIWritesStyledInformationAndCompletion(t *testing.T) {
 	ui.stop(true)
 
 	got := output.String()
-	for _, want := range []string{"idoud · upload", "stdin  stream.bin · 1.00KiB", "plan  2 routes", "save  /tmp/stream.bin", "complete", "1.00KiB stored"} {
+	for _, want := range []string{"idoud · upload · stdin stream.bin · 1.00KiB · 2 routes", "save  /tmp/stream.bin", "complete", "1.00KiB stored"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("UI output %q does not contain %q", got, want)
 		}
 	}
+	if strings.Contains(got, "\nstdin  ") || strings.Contains(got, "\nplan  ") {
+		t.Fatalf("UI emitted separate source or plan headings: %q", got)
+	}
 	if strings.Contains(got, "\x1b[") {
 		t.Fatalf("color-disabled UI emitted ANSI styling: %q", got)
+	}
+}
+
+func TestTransferSummaryGainsPlanOnTheSameLine(t *testing.T) {
+	var output bytes.Buffer
+	ui := newTransferUI(transferUIConfig{
+		enabled: true,
+		writer:  &output,
+		width:   func() int { return 140 },
+		kind:    "upload",
+		source:  "file",
+		name:    "fixture.bin",
+		total:   100 * 1024 * 1024,
+	})
+	before := ui.formatTransferSummary(140)
+	ui.setPlan("1 route · up to 10 parallel · 10 × 10.00MiB")
+	after := ui.formatTransferSummary(140)
+
+	if before != "idoud · upload · fixture.bin · 100.00MiB" {
+		t.Fatalf("initial summary=%q", before)
+	}
+	if !strings.HasPrefix(after, before+" · ") || !strings.Contains(after, "1 route · up to 10 parallel") {
+		t.Fatalf("expanded summary=%q does not extend %q", after, before)
+	}
+	if strings.Contains(after, "\n") {
+		t.Fatalf("expanded summary contains a newline: %q", after)
 	}
 }
 
@@ -327,9 +356,7 @@ func TestLineProgressKeepsInteractiveLayoutWithTimestampedNewlines(t *testing.T)
 
 	got := output.String()
 	for _, want := range []string{
-		"idoud · upload",
-		"file  fixture.bin · 10.00MiB",
-		"plan  1 route · up to 1 parallel",
+		"idoud · upload · fixture.bin · 10.00MiB · 1 route · up to 1 parallel",
 		"◆ [",
 		"100.0%",
 		"10.00MiB/10.00MiB",
@@ -344,7 +371,7 @@ func TestLineProgressKeepsInteractiveLayoutWithTimestampedNewlines(t *testing.T)
 		t.Fatalf("line progress used dynamic, diagnostic, or ANSI output: %q", got)
 	}
 	lines := strings.Split(strings.TrimSpace(got), "\n")
-	if len(lines) < 5 {
+	if len(lines) < 3 {
 		t.Fatalf("line progress emitted only %d lines: %q", len(lines), got)
 	}
 	for _, line := range lines {

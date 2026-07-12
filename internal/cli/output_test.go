@@ -308,7 +308,7 @@ func TestRunLineProgressPreservesURLStdout(t *testing.T) {
 	if stdout != server.URL+"/AbC123\n" {
 		t.Fatalf("stdout=%q, want only URL", stdout)
 	}
-	for _, want := range []string{"idoud · upload", "file  archive.zip", "plan  ", "complete"} {
+	for _, want := range []string{"idoud · upload · archive.zip", "1 route · up to 1 parallel", "complete"} {
 		if !strings.Contains(stderr, want) {
 			t.Fatalf("line stderr=%q, want %q", stderr, want)
 		}
