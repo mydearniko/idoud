@@ -55,30 +55,30 @@ func TestStreamBufferPoolAllocatesLazilyAndShrinks(t *testing.T) {
 
 func TestAdaptiveStreamControllerRampsAndBacksOff(t *testing.T) {
 	u := &uploader{opts: options{
-		parallel:     128,
+		parallel:     384,
 		chunkSize:    1024,
 		streamMemory: 1024 * 1024,
 	}}
-	controller := newAdaptiveStreamController(u, 128, 1024)
-	starts := make([]time.Time, 64)
+	controller := newAdaptiveStreamController(u, 384, 1024)
+	starts := make([]time.Time, 96)
 	for i := range starts {
 		starts[i] = controller.beginChunk()
 	}
-	for i := 0; i < 8; i++ {
+	for i := 0; i < 12; i++ {
 		controller.finishChunk(1024, starts[i], true)
 	}
 	controller.mu.Lock()
 	grown := controller.activeTarget
 	controller.mu.Unlock()
-	if grown != 128 {
-		t.Fatalf("grown target=%d, want 128", grown)
+	if grown != 192 {
+		t.Fatalf("grown target=%d, want 192", grown)
 	}
 
 	controller.observeRetry(429)
 	controller.mu.Lock()
 	reduced := controller.activeTarget
 	controller.mu.Unlock()
-	if reduced != 64 {
-		t.Fatalf("reduced target=%d, want 64", reduced)
+	if reduced != 96 {
+		t.Fatalf("reduced target=%d, want 96", reduced)
 	}
 }
