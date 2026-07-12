@@ -30,7 +30,12 @@ func openSource(filePath string, opts options) (*sourceFile, func(), error) {
 	}
 	if stat.IsDir() {
 		_ = file.Close()
-		return nil, nil, errors.New("path is a directory")
+		archivePath, absErr := filepath.Abs(filePath)
+		if absErr != nil {
+			archivePath = filePath
+		}
+		archiveName := sanitizeFilename(archiveRootName(archivePath)) + ".tar.lz4"
+		return nil, nil, fmt.Errorf("%s is a directory; use `idoud -z %s` to upload it as %s", filePath, filePath, archiveName)
 	}
 
 	name := sanitizeFilename(opts.nameOverride)

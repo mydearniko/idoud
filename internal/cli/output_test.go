@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -446,6 +447,26 @@ func TestRunJSONInputError(t *testing.T) {
 	}
 	if payload.Error.Code != "input_error" {
 		t.Fatalf("error.Code=%q, want input_error", payload.Error.Code)
+	}
+}
+
+func TestRunDirectoryInputSuggestsArchiveOnOneLine(t *testing.T) {
+	parent := t.TempDir()
+	directory := filepath.Join(parent, "mihomo")
+	if err := os.Mkdir(directory, 0o755); err != nil {
+		t.Fatalf("Mkdir(%q): %v", directory, err)
+	}
+
+	exitCode, stdout, stderr := captureRunOutput(t, []string{directory})
+	if exitCode != 1 {
+		t.Fatalf("Run exitCode=%d, want 1", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout=%q, want empty", stdout)
+	}
+	want := fmt.Sprintf("error: %s is a directory; use `idoud -z %s` to upload it as mihomo.tar.lz4\n", directory, directory)
+	if stderr != want {
+		t.Fatalf("stderr=%q, want %q", stderr, want)
 	}
 }
 
