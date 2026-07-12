@@ -203,3 +203,60 @@ func TestUploadNonFinalChunksPacesStartsAfterBurst(t *testing.T) {
 		t.Fatalf("elapsed=%s, want paced duration of at least 250ms", elapsed)
 	}
 }
+
+func TestUploadKnownFileStartsFinalChunkInsideInitialConcurrencyWindow(t *testing.T) {
+	target, err := url.Parse("https://node.example/file.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan bool, 4)
+	release := make(chan struct{})
+	u := &uploader{
+		opts: options{
+			parallel: 2, chunkSize: 1, uploadKey: "key",
+			requestTimeout: time.Second, finalChunkTimeout: time.Second,
+		},
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			started <- req.Header.Get(headerUploadFinalChunk) == "1"
+			<-release
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, ContentLength: 0}, nil
+		})},
+	}
+	src := &sourceFile{
+		readerAt:        bytes.NewReader(make([]byte, 4)),
+		size:            4,
+		knownSize:       true,
+		uploadURL:       target.String(),
+		uploadURLParsed: target,
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- u.uploadKnownFileChunks(context.Background(), src, 3, newURLCapture(src))
+	}()
+	first := <-started
+	second := <-started
+	if first == second {
+		close(release)
+		t.Fatalf("initial requests final flags=%t/%t, want one final and one non-final", first, second)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("uploadKnownFileChunks: %v", err)
+	}
+	finalCount := 0
+	if first {
+		finalCount++
+	}
+	if second {
+		finalCount++
+	}
+	for i := 0; i < 2; i++ {
+		if <-started {
+			finalCount++
+		}
+	}
+	if finalCount != 1 {
+		t.Fatalf("final request count=%d, want 1", finalCount)
+	}
+}

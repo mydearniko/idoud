@@ -23,14 +23,17 @@ func parseFlags(args []string) (options, string, error) {
 	stdinSizeRaw := ""
 	ipsRaw := ""
 	outputRaw := unsetOutputModeValue
+	progressRaw := string(progressModeAuto)
 	jsonOutput := false
+	nonInteractive := false
 
-	registerFlags(fs, &opts, &chunkSizeRaw, &stdinSizeRaw, &ipsRaw, &outputRaw, &jsonOutput)
+	registerFlags(fs, &opts, &chunkSizeRaw, &stdinSizeRaw, &ipsRaw, &outputRaw, &progressRaw, &jsonOutput, &nonInteractive)
 
 	normalizedArgs := normalizeInterspersedArgs(fs, args)
 	if err := fs.Parse(normalizedArgs); err != nil {
 		return options{}, "", err
 	}
+	progressExplicit := false
 	fs.Visit(func(f *flag.Flag) {
 		if f == nil {
 			return
@@ -42,6 +45,8 @@ func parseFlags(args []string) (options, string, error) {
 			opts.parallelExplicit = true
 		case "upload-key", "k":
 			opts.uploadKeyExplicit = true
+		case "progress":
+			progressExplicit = true
 		}
 	})
 	if opts.stdin && !opts.parallelExplicit {
@@ -171,6 +176,28 @@ func parseFlags(args []string) (options, string, error) {
 		}
 		opts.outputMode = outputModeJSON
 	}
+	if !progressExplicit {
+		if envMode := strings.TrimSpace(os.Getenv("IDOUD_PROGRESS")); envMode != "" {
+			progressRaw = envMode
+		}
+	}
+	progress, parseErr := parseProgressMode(progressRaw)
+	if parseErr != nil {
+		return options{}, "", parseErr
+	}
+	if nonInteractive {
+		if progressExplicit && progress != progressModePlain {
+			return options{}, "", errors.New("--non-interactive requires --progress=plain when both are specified")
+		}
+		progress = progressModePlain
+	}
+	if opts.noProgress {
+		if nonInteractive || (progressExplicit && progress != progressModeNone) {
+			return options{}, "", errors.New("--no-progress cannot be combined with plain progress")
+		}
+		progress = progressModeNone
+	}
+	opts.progressMode = progress
 	if opts.uploadKey == "" {
 		opts.uploadKey = randomUploadKey()
 	}
@@ -283,7 +310,7 @@ func normalizeInterspersedArgs(fs *flag.FlagSet, args []string) []string {
 	return normalized
 }
 
-func registerFlags(fs *flag.FlagSet, opts *options, chunkSizeRaw, stdinSizeRaw, ipsRaw, outputRaw *string, jsonOutput *bool) {
+func registerFlags(fs *flag.FlagSet, opts *options, chunkSizeRaw, stdinSizeRaw, ipsRaw, outputRaw, progressRaw *string, jsonOutput, nonInteractive *bool) {
 	fs.StringVar(&opts.serverURL, "server", defaultServerURL, "idoud server origin (or comma-separated origins)")
 	fs.StringVar(&opts.serverURL, "s", defaultServerURL, "alias for --server")
 	fs.BoolVar(&opts.stdin, "stdin", false, "read file data from stdin")
@@ -294,7 +321,7 @@ func registerFlags(fs *flag.FlagSet, opts *options, chunkSizeRaw, stdinSizeRaw, 
 	fs.StringVar(&opts.nameOverride, "name", "", "upload file name override")
 	fs.StringVar(&opts.nameOverride, "n", "", "alias for --name")
 	fs.StringVar(chunkSizeRaw, "chunk-size", strconv.FormatInt(defaultChunkSize, 10), "chunk size for Content-Range uploads")
-	fs.IntVar(&opts.parallel, "parallel", defaultParallel, "parallel chunk uploads (non-final chunks)")
+	fs.IntVar(&opts.parallel, "parallel", defaultParallel, "maximum parallel chunk uploads")
 	fs.IntVar(&opts.parallel, "p", defaultParallel, "alias for --parallel")
 	fs.IntVar(&opts.http2Connections, "http2-connections", 0, "HTTP/2 connection pool for chunk uploads (0 disables)")
 	fs.IntVar(&opts.uploadBodyConcurrency, "upload-body-concurrency", 0, "maximum concurrently written chunk bodies (0 auto-caps large uploads)")
@@ -326,7 +353,10 @@ func registerFlags(fs *flag.FlagSet, opts *options, chunkSizeRaw, stdinSizeRaw, 
 	fs.StringVar(outputRaw, "output", unsetOutputModeValue, "stdout mode: url, json, none")
 	fs.StringVar(outputRaw, "o", unsetOutputModeValue, "alias for --output")
 	fs.BoolVar(jsonOutput, "json", false, "shorthand for --output json")
-	fs.BoolVar(&opts.noProgress, "no-progress", false, "disable interactive transfer progress")
+	fs.StringVar(progressRaw, "progress", string(progressModeAuto), "progress mode: auto, plain, none")
+	fs.BoolVar(nonInteractive, "non-interactive", false, "emit ANSI-free line-oriented progress to stderr")
+	fs.BoolVar(nonInteractive, "plain-progress", false, "alias for --non-interactive")
+	fs.BoolVar(&opts.noProgress, "no-progress", false, "disable transfer progress (alias for --progress=none)")
 	fs.BoolVar(&opts.speedtest, "speedtest", false, "run a transfer benchmark without creating a downloadable file")
 	fs.BoolVar(&opts.speedtest, "T", false, "alias for --speedtest")
 	fs.BoolVar(&opts.download, "download", false, "download a public URL or file id using a download plan")
@@ -335,6 +365,16 @@ func registerFlags(fs *flag.FlagSet, opts *options, chunkSizeRaw, stdinSizeRaw, 
 	fs.BoolVar(&opts.verbose, "v", false, "alias for --verbose")
 	fs.BoolVar(&opts.debug, "debug", false, "enable verbose live upload debug stats")
 	fs.BoolVar(&opts.debug, "d", false, "alias for --debug")
+}
+
+func parseProgressMode(raw string) (progressMode, error) {
+	mode := progressMode(strings.ToLower(strings.TrimSpace(raw)))
+	switch mode {
+	case progressModeAuto, progressModePlain, progressModeNone:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("invalid --progress %q: expected auto, plain, or none", raw)
+	}
 }
 
 func flagValueNames(fs *flag.FlagSet) map[string]struct{} {
@@ -404,7 +444,7 @@ CONNECTION
 
 UPLOAD
   -p, --parallel <n>
-      Parallel non-final chunk uploads (default: 384; server plans may cap it).
+      Maximum parallel chunk uploads (default: 384; server plans may cap it).
   -r, --retries <n>
       Retries per failed chunk (default: 6).
   --hedge-delay <dur>
@@ -442,9 +482,14 @@ OUTPUT
       none suppresses success stdout entirely.
   --json
       Shorthand for --output json.
+  --progress <mode>
+      Progress mode: auto (interactive terminal only), plain (timestamped,
+      ANSI-free line records), or none. IDOUD_PROGRESS sets the default.
+  --non-interactive
+      Alias for --progress=plain. Emits bounded event/heartbeat records to
+      stderr and remains compatible with stdin uploads and stdout piping.
   --no-progress
-      Disable the interactive terminal progress display. Progress is already
-      disabled automatically when stderr is redirected or piped.
+      Legacy alias for --progress=none.
 
 DIAGNOSTICS
   -v, --verbose

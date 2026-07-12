@@ -82,6 +82,14 @@ const (
 	outputModeNone outputMode = "none"
 )
 
+type progressMode string
+
+const (
+	progressModeAuto  progressMode = "auto"
+	progressModePlain progressMode = "plain"
+	progressModeNone  progressMode = "none"
+)
+
 type options struct {
 	serverURL             string
 	serverBase            *url.URL
@@ -117,6 +125,7 @@ type options struct {
 	noSubdomains          bool
 	bindInterface         string
 	outputMode            outputMode
+	progressMode          progressMode
 	noProgress            bool
 	speedtest             bool
 	download              bool

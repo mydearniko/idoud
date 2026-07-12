@@ -196,6 +196,35 @@ func TestRunURLSuccessPrintsOnlyURL(t *testing.T) {
 	}
 }
 
+func TestRunPlainProgressPreservesURLStdout(t *testing.T) {
+	server := newUploadSuccessServer(t)
+	defer server.Close()
+
+	filePath := writeUploadFixture(t, "archive.zip", []byte("plain progress"))
+	exitCode, stdout, stderr := captureRunOutput(t, []string{
+		"--non-interactive", "--server", server.URL, filePath,
+	})
+	if exitCode != 0 {
+		t.Fatalf("Run exitCode=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if stdout != server.URL+"/AbC123\n" {
+		t.Fatalf("stdout=%q, want only URL", stdout)
+	}
+	for _, want := range []string{
+		"idoud transfer=upload event=start",
+		"progress_semantics=provider_confirmed",
+		"event=info label=\"plan\"",
+		"event=complete result=success",
+	} {
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("plain stderr=%q, want %q", stderr, want)
+		}
+	}
+	if strings.Contains(stderr, "\r") || strings.Contains(stderr, "\x1b[") {
+		t.Fatalf("plain stderr contains terminal controls: %q", stderr)
+	}
+}
+
 func TestRunOutputNoneSuccess(t *testing.T) {
 	server := newUploadSuccessServer(t)
 	defer server.Close()

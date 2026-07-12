@@ -88,6 +88,31 @@ func TestClosedStreamShowsProviderConfirmationInsteadOfDecayingInputRate(t *test
 	}
 }
 
+func TestClosedStreamStillShowsRequestBodyWritingBeforeConfirmation(t *testing.T) {
+	ui := newProgressFormatter(100)
+	line := ui.formatProgress(transferProgressSnapshot{
+		kind:          "upload",
+		source:        "stdin",
+		phase:         transferPhaseTransferring,
+		total:         -1,
+		readBytes:     1024,
+		bodyReadBytes: 512,
+		inFlight:      1,
+		inputClosed:   true,
+	})
+	if !strings.Contains(line, "sending request bodies") || strings.Contains(line, "awaiting confirmation") {
+		t.Fatalf("closed stream progress=%q, want active body-write state", line)
+	}
+	if got := plainProgressState(transferProgressSnapshot{
+		phase:         transferPhaseTransferring,
+		bodyReadBytes: 512,
+		inFlight:      1,
+		inputClosed:   true,
+	}); got != "writing_request_bodies" {
+		t.Fatalf("plain state=%q, want writing_request_bodies", got)
+	}
+}
+
 func TestArchiveStreamLabelsCompressedOutput(t *testing.T) {
 	ui := newProgressFormatter(100)
 	snapshot := transferProgressSnapshot{
@@ -226,6 +251,124 @@ func TestTransferUIWritesStyledInformationAndCompletion(t *testing.T) {
 	}
 }
 
+func TestPlainProgressIsANSIFreeLineOrientedAndDiagnostic(t *testing.T) {
+	var output bytes.Buffer
+	ui := newTransferUI(transferUIConfig{
+		enabled:     true,
+		plain:       true,
+		writer:      &output,
+		kind:        "upload",
+		source:      "file",
+		name:        "fixture with spaces.bin",
+		total:       10 * 1024 * 1024,
+		totalChunks: 1,
+	})
+	ui.start()
+	ui.setPlan("1 route · up to 1 parallel · 1 × 10.00MiB")
+	ui.setPhase(transferPhaseTransferring)
+	ui.chunkStarted()
+	ui.addBodyRead(10 * 1024 * 1024)
+	ui.bodyRequestWritten(10 * 1024 * 1024)
+	ui.recordRequestDuration(2 * time.Second)
+	ui.addTransferred(10 * 1024 * 1024)
+	ui.chunkFinished(true)
+	ui.setPhase(transferPhaseFinalizing)
+	ui.stop(true)
+
+	got := output.String()
+	for _, want := range []string{
+		"idoud transfer=upload event=start",
+		"name=\"fixture with spaces.bin\"",
+		"event=info label=\"plan\"",
+		"event=progress phase=finalizing",
+		"completed_bytes=10485760",
+		"body_read_bytes=10485760",
+		"body_written_bytes=10485760",
+		"confirmation_average_ms=2000",
+		"event=complete result=success",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("plain progress output %q does not contain %q", got, want)
+		}
+	}
+	if strings.Contains(got, "\r") || strings.Contains(got, "\x1b[") {
+		t.Fatalf("plain progress emitted terminal control sequences: %q", got)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(got), "\n") {
+		firstField := strings.Fields(line)[0]
+		if _, err := time.Parse(time.RFC3339Nano, firstField); err != nil {
+			t.Fatalf("plain progress line has no RFC3339 timestamp: %q", line)
+		}
+	}
+}
+
+func TestPlainProgressReportsArchivePackingAndResumeBaseline(t *testing.T) {
+	var output bytes.Buffer
+	ui := newTransferUI(transferUIConfig{
+		enabled: true,
+		plain:   true,
+		writer:  &output,
+		kind:    "upload",
+		source:  "archive",
+		name:    "root.tar.lz4",
+		total:   -1,
+	})
+	ui.start()
+	ui.setBaseline(10*1024*1024, 1)
+	ui.setPhase(transferPhaseTransferring)
+	ui.addRead(24 * 1024 * 1024)
+	ui.stop(false)
+
+	got := output.String()
+	for _, want := range []string{
+		"event=info label=\"resume\"",
+		"baseline_bytes=10485760",
+		"packed_bytes=25165824",
+		"event=complete result=failure",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("plain archive progress %q does not contain %q", got, want)
+		}
+	}
+}
+
+func TestPlainDownloadStateUsesDiskSemantics(t *testing.T) {
+	state := plainProgressState(transferProgressSnapshot{
+		kind:     "download",
+		phase:    transferPhaseTransferring,
+		inFlight: 4,
+		rate:     10 * 1024 * 1024,
+	})
+	if state != "downloading" {
+		t.Fatalf("download state=%q, want downloading", state)
+	}
+}
+
+func TestCompletionUsesEndToEndAverageNotLastConfirmationBurst(t *testing.T) {
+	var output bytes.Buffer
+	ui := newTransferUI(transferUIConfig{
+		enabled: true,
+		writer:  &output,
+		width:   func() int { return 100 },
+		kind:    "upload",
+		source:  "file",
+		name:    "fixture.bin",
+		total:   100 * 1024 * 1024,
+	})
+	now := time.Unix(200, 0)
+	ui.transferStart.Store(now.Add(-10 * time.Second).UnixNano())
+	ui.transferred.Store(100 * 1024 * 1024)
+	ui.finishLine(true, 1024, now)
+
+	got := output.String()
+	if !strings.Contains(got, "10.00MiB/s avg") {
+		t.Fatalf("completion=%q, want end-to-end 10 MiB/s average", got)
+	}
+	if strings.Contains(got, "1.00KiB/s") {
+		t.Fatalf("completion used final burst rate: %q", got)
+	}
+}
+
 func TestVisibleTerminalWidthIgnoresANSI(t *testing.T) {
 	value := "\x1b[38;2;120;182;173midoud\x1b[0m · upload"
 	want := utf8.RuneCountInString("idoud · upload")
@@ -243,6 +386,9 @@ func TestNoProgressOptionDisablesRendererBeforeTTYProbe(t *testing.T) {
 	}
 	if transferProgressEnabled(options{verbose: true}) {
 		t.Fatal("verbose mode did not disable interactive progress")
+	}
+	if !transferProgressEnabled(options{debug: true, progressMode: progressModePlain}) {
+		t.Fatal("plain progress should remain enabled with debug logs")
 	}
 }
 

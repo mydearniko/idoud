@@ -167,6 +167,38 @@ func TestRunDownloadUsesPlanRanges(t *testing.T) {
 	if rangeRequests != 2 {
 		t.Fatalf("rangeRequests=%d, want 2", rangeRequests)
 	}
+
+	plainOutputPath := filepath.Join(t.TempDir(), "plain-out.bin")
+	exitCode, stdout, stderr = captureRunOutput(t, []string{
+		"--download",
+		"--non-interactive",
+		"--server", server.URL,
+		"--parallel", "2",
+		"--download-output", plainOutputPath,
+		server.URL + "/" + fileID + "/" + fileName,
+	})
+	if exitCode != 0 {
+		t.Fatalf("plain Run exitCode=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if stdout != plainOutputPath+"\n" {
+		t.Fatalf("plain stdout=%q, want output path", stdout)
+	}
+	for _, want := range []string{
+		"idoud transfer=download event=start",
+		"progress_semantics=disk_written",
+		"event=info label=\"save\"",
+		"event=complete result=success",
+	} {
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("plain download stderr=%q, want %q", stderr, want)
+		}
+	}
+	if strings.Contains(stderr, "\r") || strings.Contains(stderr, "\x1b[") {
+		t.Fatalf("plain download stderr contains terminal controls: %q", stderr)
+	}
+	if rangeRequests != 4 {
+		t.Fatalf("rangeRequests=%d after plain download, want 4", rangeRequests)
+	}
 }
 
 func TestRunDownloadFallsBackThroughMirrorsInPlanOrder(t *testing.T) {

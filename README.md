@@ -85,8 +85,17 @@ identification.
   are shown as separate phases instead of a fake completed bar.
 - Unknown-size stdin and `-z` streams show read/packed bytes, confirmed stored
   bytes, rate, activity, and retries without inventing a percentage or ETA.
-  Redirected stderr remains quiet, `--no-progress` disables the display, and
-  `NO_COLOR` preserves the layout without terminal colors.
+  Redirected stderr remains quiet in the default `auto` mode, `--no-progress`
+  disables the display, and `NO_COLOR` preserves the layout without terminal
+  colors.
+- `--non-interactive` (or `--progress=plain`) emits timestamped, ANSI-free,
+  line-oriented progress to stderr even when redirected. It separately reports
+  request-body bytes, fully written request bodies, provider-confirmed bytes,
+  rolling and end-to-end rates, active requests, retries, confirmation latency,
+  and ETA. `IDOUD_PROGRESS=plain` enables the same mode for services and scripts.
+- Known random-access files start their final range inside the initial bounded
+  concurrency window. This avoids a cold serial final request while preserving
+  the server-advertised concurrency ceiling and durable-confirmation semantics.
 - `idoud update` discovers the latest release without using the rate-limited
   GitHub API, verifies the selected platform binary against the published
   SHA-256 checksums, runs its version check, and atomically replaces the current
@@ -98,6 +107,15 @@ identification.
 (download). `--output none` suppresses success output when only the exit status
 matters. `--output json` or `--json` emits one schema-versioned JSON document
 for success, help, and errors.
+
+Capture a complete human- and AI-readable transfer log without disturbing the
+URL or JSON written to stdout:
+
+```sh
+idoud --non-interactive archive.bin 2>idoud-transfer.log
+cat archive.bin | idoud --stdin --name archive.bin --progress=plain \
+  2>idoud-transfer.log
+```
 
 Stable JSON error codes are:
 

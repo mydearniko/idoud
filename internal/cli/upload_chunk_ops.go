@@ -16,29 +16,56 @@ import (
 )
 
 func (u *uploader) uploadNonFinalChunks(ctx context.Context, src *sourceFile, lastChunk int64, urls *urlCapture) error {
-	if lastChunk <= 0 {
+	return u.uploadKnownChunkSet(ctx, src, lastChunk, false, urls)
+}
+
+func (u *uploader) uploadKnownFileChunks(ctx context.Context, src *sourceFile, lastChunk int64, urls *urlCapture) error {
+	return u.uploadKnownChunkSet(ctx, src, lastChunk, true, urls)
+}
+
+type knownUploadChunkJob struct {
+	index int64
+	final bool
+}
+
+func (u *uploader) uploadKnownChunkSet(ctx context.Context, src *sourceFile, lastChunk int64, includeFinal bool, urls *urlCapture) error {
+	if lastChunk < 0 || (!includeFinal && lastChunk == 0) {
 		return nil
 	}
 
-	// Upload prepare already allocated the canonical file ID and target. Start
-	// chunk zero with the rest of the independent ranges so one cold TCP stream
-	// cannot serialize startup on a high-bandwidth, long-RTT path. The node still
-	// buffers chunk zero completely before acknowledging it.
-	startChunk := int64(0)
+	jobsToUpload := make([]knownUploadChunkJob, 0, lastChunk+1)
+	addJob := func(index int64, final bool) {
+		if index < 0 || src.isChunkCommitted(index) {
+			return
+		}
+		jobsToUpload = append(jobsToUpload, knownUploadChunkJob{index: index, final: final})
+	}
+	// Start the first and final ranges in the initial concurrency window. The
+	// final request tells the node the exact total early and avoids opening one
+	// cold serial connection only after every other provider confirmation.
+	addJob(0, includeFinal && lastChunk == 0)
+	if includeFinal && lastChunk > 0 {
+		addJob(lastChunk, true)
+	}
+	for index := int64(1); index < lastChunk; index++ {
+		addJob(index, false)
+	}
+	if len(jobsToUpload) == 0 {
+		return nil
+	}
 
 	workers := u.effectiveUploadParallel()
 	if workers < 1 {
 		workers = 1
 	}
-	remaining := lastChunk - startChunk
-	if int64(workers) > remaining {
-		workers = int(remaining)
+	if workers > len(jobsToUpload) {
+		workers = len(jobsToUpload)
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	jobs := make(chan int64)
+	jobs := make(chan knownUploadChunkJob)
 	errCh := make(chan error, 1)
 	rampReady := make(chan struct{})
 	rampConfirmationsNeeded := int64(u.opts.uploadRampBurst / 2)
@@ -51,8 +78,8 @@ func (u *uploader) uploadNonFinalChunks(ctx context.Context, src *sourceFile, la
 	var wg sync.WaitGroup
 	worker := func() {
 		defer wg.Done()
-		for idx := range jobs {
-			if err := u.uploadChunkWithRetry(ctx, src, idx, false, urls); err != nil {
+		for job := range jobs {
+			if err := u.uploadChunkWithRetry(ctx, src, job.index, job.final, urls); err != nil {
 				select {
 				case errCh <- err:
 				default:
@@ -83,12 +110,8 @@ func (u *uploader) uploadNonFinalChunks(ctx context.Context, src *sourceFile, la
 	}
 
 sendLoop:
-	for idx := startChunk; idx < lastChunk; idx++ {
-		if src.isChunkCommitted(idx) {
-			continue
-		}
-		ordinal := idx - startChunk
-		if rampInterval > 0 && ordinal >= int64(u.opts.uploadRampBurst) {
+	for ordinal, job := range jobsToUpload {
+		if rampInterval > 0 && ordinal >= u.opts.uploadRampBurst {
 			if !rampConfirmed {
 				select {
 				case <-ctx.Done():
@@ -118,7 +141,7 @@ sendLoop:
 		select {
 		case <-ctx.Done():
 			break sendLoop
-		case jobs <- idx:
+		case jobs <- job:
 		}
 	}
 	close(jobs)
@@ -385,6 +408,9 @@ func (u *uploader) uploadPUT(
 		return "", 0, &requestError{cause: err, route: target.rawURL, fallback: target.fallback, master: target.master}
 	}
 	defer uploadBodyLease.releaseRequest()
+	if u.ui != nil && body != nil && body != http.NoBody && contentLength > 0 {
+		body = &transferBodyProgressReader{reader: body, ui: u.ui}
+	}
 	if chunkIndex >= 0 {
 		ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
 			GotConn: func(info httptrace.GotConnInfo) {
@@ -392,7 +418,10 @@ func (u *uploader) uploadPUT(
 					u.recordChunkRemoteIP(info.Conn.RemoteAddr())
 				}
 			},
-			WroteRequest: func(httptrace.WroteRequestInfo) {
+			WroteRequest: func(info httptrace.WroteRequestInfo) {
+				if info.Err == nil && u.ui != nil {
+					u.ui.bodyRequestWritten(contentLength)
+				}
 				uploadBodyLease.releaseWritten()
 			},
 		})
@@ -483,6 +512,19 @@ func (u *uploader) uploadPUT(
 		u.masterFallback.Store(true)
 	}
 	return "", resp.StatusCode, requestErr
+}
+
+type transferBodyProgressReader struct {
+	reader io.Reader
+	ui     *transferUI
+}
+
+func (r *transferBodyProgressReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 && r.ui != nil {
+		r.ui.addBodyRead(int64(n))
+	}
+	return n, err
 }
 
 type uploadBodyLease struct {

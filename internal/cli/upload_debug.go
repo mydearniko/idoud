@@ -406,16 +406,8 @@ func (u *uploader) upload(ctx context.Context, src *sourceFile) (finalURL string
 	}
 
 	lastChunk := totalChunks - 1
-	if totalChunks > 1 {
-		if err := u.uploadNonFinalChunks(ctx, src, lastChunk, urls); err != nil {
-			return "", err
-		}
-	}
-
-	if !src.isChunkCommitted(lastChunk) {
-		if err := u.uploadChunkWithRetry(ctx, src, lastChunk, true, urls); err != nil {
-			return "", err
-		}
+	if err := u.uploadKnownFileChunks(ctx, src, lastChunk, urls); err != nil {
+		return "", err
 	}
 
 	finalURL = urls.get()

@@ -70,10 +70,12 @@ func detectRequestedOutputMode(args []string) outputMode {
 	stdinSizeRaw := ""
 	ipsRaw := ""
 	outputRaw := unsetOutputModeValue
+	progressRaw := string(progressModeAuto)
 	jsonOutput := false
+	nonInteractive := false
 	fs := flag.NewFlagSet(cliCommandName(), flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	registerFlags(fs, &opts, &chunkSizeRaw, &stdinSizeRaw, &ipsRaw, &outputRaw, &jsonOutput)
+	registerFlags(fs, &opts, &chunkSizeRaw, &stdinSizeRaw, &ipsRaw, &outputRaw, &progressRaw, &jsonOutput, &nonInteractive)
 	valueFlags := flagValueNames(fs)
 
 	mode := outputModeURL

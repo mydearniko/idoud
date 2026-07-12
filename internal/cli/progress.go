@@ -27,6 +27,7 @@ const (
 
 type transferUIConfig struct {
 	enabled     bool
+	plain       bool
 	color       bool
 	unicode     bool
 	writer      io.Writer
@@ -44,6 +45,7 @@ type transferUIConfig struct {
 // chunk.
 type transferUI struct {
 	enabled bool
+	plain   bool
 	color   bool
 	unicode bool
 	writer  io.Writer
@@ -60,7 +62,11 @@ type transferUI struct {
 	total           atomic.Int64
 	totalChunks     atomic.Int64
 	transferred     atomic.Int64
+	baselineBytes   atomic.Int64
 	readBytes       atomic.Int64
+	bodyReadBytes   atomic.Int64
+	bodyWritten     atomic.Int64
+	bodyRequests    atomic.Int64
 	completedChunks atomic.Int64
 	inFlight        atomic.Int64
 	retries         atomic.Int64
@@ -98,6 +104,11 @@ type transferProgressSnapshot struct {
 	inputClosed         bool
 	confirmationLatency time.Duration
 	phaseElapsed        time.Duration
+	elapsed             time.Duration
+	baselineBytes       int64
+	bodyReadBytes       int64
+	bodyWritten         int64
+	bodyRequests        int64
 	tick                int
 }
 
@@ -115,10 +126,13 @@ type progressRateEstimator struct {
 }
 
 func terminalTransferUIConfig(opts options, kind, source, name string, total, totalChunks int64) transferUIConfig {
-	enabled := transferProgressEnabled(opts)
+	mode := resolvedTransferProgressMode(opts)
+	enabled := mode != progressModeNone
+	plain := mode == progressModePlain
 	return transferUIConfig{
 		enabled:     enabled,
-		color:       enabled && colorOutputEnabled(),
+		plain:       plain,
+		color:       enabled && !plain && colorOutputEnabled(),
 		unicode:     strings.TrimSpace(os.Getenv("IDOUD_ASCII")) == "",
 		writer:      os.Stderr,
 		width:       stderrTerminalWidth,
@@ -140,6 +154,7 @@ func newTransferUI(config transferUIConfig) *transferUI {
 	}
 	ui := &transferUI{
 		enabled:    config.enabled,
+		plain:      config.plain,
 		color:      config.color,
 		unicode:    config.unicode,
 		writer:     config.writer,
@@ -159,17 +174,34 @@ func newTransferUI(config transferUIConfig) *transferUI {
 }
 
 func transferProgressEnabled(opts options) bool {
-	if opts.noProgress || opts.debug || opts.verbose {
-		return false
+	return resolvedTransferProgressMode(opts) != progressModeNone
+}
+
+func resolvedTransferProgressMode(opts options) progressMode {
+	if opts.noProgress {
+		return progressModeNone
 	}
 	if strings.TrimSpace(os.Getenv("IDOUD_NO_PROGRESS")) != "" {
-		return false
+		return progressModeNone
+	}
+	mode := opts.progressMode
+	if mode == "" {
+		mode = progressModeAuto
+	}
+	if mode == progressModePlain || mode == progressModeNone {
+		return mode
+	}
+	if opts.debug || opts.verbose {
+		return progressModeNone
 	}
 	termName := strings.ToLower(strings.TrimSpace(os.Getenv("TERM")))
 	if termName == "dumb" {
-		return false
+		return progressModeNone
 	}
-	return term.IsTerminal(int(os.Stderr.Fd()))
+	if !term.IsTerminal(int(os.Stderr.Fd())) {
+		return progressModeNone
+	}
+	return progressModeAuto
 }
 
 func stderrTerminalWidth() int {
@@ -192,6 +224,11 @@ func stderrTerminalWidth() int {
 
 func (ui *transferUI) start() {
 	if ui == nil || !ui.enabled {
+		return
+	}
+	if ui.plain {
+		ui.writePlainStart(time.Now())
+		go ui.loop()
 		return
 	}
 	ui.outputMu.Lock()
@@ -218,6 +255,14 @@ func (ui *transferUI) start() {
 
 func (ui *transferUI) loop() {
 	defer close(ui.doneCh)
+	if ui.plain {
+		ui.loopPlain()
+		return
+	}
+	ui.loopInteractive()
+}
+
+func (ui *transferUI) loopInteractive() {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	rate := progressRateEstimator{}
@@ -251,6 +296,70 @@ func (ui *transferUI) loop() {
 		case now = <-ticker.C:
 			tick++
 			lastRate, _, _ = render(now)
+		}
+	}
+}
+
+func (ui *transferUI) loopPlain() {
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	rate := progressRateEstimator{}
+	readRate := progressRateEstimator{}
+	generation := ui.rateGeneration.Load()
+	tick := 0
+	lastPhase := transferPhase(^uint32(0))
+	lastTransferred := int64(-1)
+	lastCompleted := int64(-1)
+	lastRetries := int64(-1)
+	lastBodyRead := int64(-1)
+	lastBodyWritten := int64(-1)
+	lastInputClosed := false
+	lastEmit := time.Time{}
+
+	render := func(now time.Time, force bool) float64 {
+		if currentGeneration := ui.rateGeneration.Load(); currentGeneration != generation {
+			generation = currentGeneration
+			rate.reset(now, ui.transferred.Load())
+		}
+		confirmedRate, stalled := rate.observe(now, ui.transferred.Load())
+		inputRate, _ := readRate.observe(now, ui.readBytes.Load())
+		snapshot := ui.snapshot(now, confirmedRate, inputRate, stalled, tick)
+		bodyReadAdvanced := lastBodyRead < 0 || snapshot.bodyReadBytes-lastBodyRead >= 8*1024*1024
+		changed := snapshot.phase != lastPhase ||
+			snapshot.transferred != lastTransferred ||
+			snapshot.completedChunks != lastCompleted ||
+			snapshot.retries != lastRetries ||
+			snapshot.bodyWritten != lastBodyWritten ||
+			snapshot.inputClosed != lastInputClosed || bodyReadAdvanced
+		heartbeat := lastEmit.IsZero() || now.Sub(lastEmit) >= 2*time.Second
+		if force || changed || heartbeat {
+			ui.writePlainSnapshot(now, snapshot)
+			lastPhase = snapshot.phase
+			lastTransferred = snapshot.transferred
+			lastCompleted = snapshot.completedChunks
+			lastRetries = snapshot.retries
+			lastBodyRead = snapshot.bodyReadBytes
+			lastBodyWritten = snapshot.bodyWritten
+			lastInputClosed = snapshot.inputClosed
+			lastEmit = now
+		}
+		return confirmedRate
+	}
+
+	now := time.Now()
+	rate.reset(now, ui.transferred.Load())
+	readRate.reset(now, ui.readBytes.Load())
+	lastRate := render(now, true)
+	for {
+		select {
+		case success := <-ui.stopCh:
+			now = time.Now()
+			lastRate = render(now, true)
+			ui.finishLine(success, lastRate, now)
+			return
+		case now = <-ticker.C:
+			tick++
+			lastRate = render(now, false)
 		}
 	}
 }
@@ -318,6 +427,7 @@ func (ui *transferUI) setBaseline(bytes, chunks int64) {
 	if chunks < 0 {
 		chunks = 0
 	}
+	ui.baselineBytes.Store(bytes)
 	ui.transferred.Store(bytes)
 	ui.completedChunks.Store(chunks)
 	ui.rateGeneration.Add(1)
@@ -326,6 +436,22 @@ func (ui *transferUI) setBaseline(bytes, chunks int64) {
 			ui.emitInfo("resume", formatByteSize(bytes)+" already verified")
 		})
 	}
+}
+
+func (ui *transferUI) addBodyRead(bytes int64) {
+	if ui != nil && bytes > 0 {
+		ui.bodyReadBytes.Add(bytes)
+	}
+}
+
+func (ui *transferUI) bodyRequestWritten(bytes int64) {
+	if ui == nil {
+		return
+	}
+	if bytes > 0 {
+		ui.bodyWritten.Add(bytes)
+	}
+	ui.bodyRequests.Add(1)
 }
 
 func (ui *transferUI) addTransferred(bytes int64) {
@@ -387,6 +513,13 @@ func (ui *transferUI) recordRequestDuration(duration time.Duration) {
 }
 
 func (ui *transferUI) emitInfo(label, detail string) {
+	if ui.plain {
+		ui.writePlainLine(time.Now(), "info",
+			"label="+plainQuote(label),
+			"detail="+plainQuote(detail),
+		)
+		return
+	}
 	ui.outputMu.Lock()
 	defer ui.outputMu.Unlock()
 	ui.clearDynamicLocked()
@@ -403,13 +536,24 @@ func (ui *transferUI) snapshot(now time.Time, rate, readRate float64, stalled bo
 	if requestCount > 0 {
 		confirmationLatency = time.Duration(ui.requestNanos.Load() / requestCount)
 	}
+	elapsed := now.Sub(ui.started)
+	if transferStarted := ui.transferStart.Load(); transferStarted > 0 {
+		elapsed = now.Sub(time.Unix(0, transferStarted))
+	}
+	if elapsed < 0 {
+		elapsed = 0
+	}
 	return transferProgressSnapshot{
 		kind:                ui.kind,
 		source:              ui.source,
 		phase:               phase,
 		total:               ui.total.Load(),
 		transferred:         ui.transferred.Load(),
+		baselineBytes:       ui.baselineBytes.Load(),
 		readBytes:           ui.readBytes.Load(),
+		bodyReadBytes:       ui.bodyReadBytes.Load(),
+		bodyWritten:         ui.bodyWritten.Load(),
+		bodyRequests:        ui.bodyRequests.Load(),
 		totalChunks:         ui.totalChunks.Load(),
 		completedChunks:     ui.completedChunks.Load(),
 		inFlight:            ui.inFlight.Load(),
@@ -420,8 +564,195 @@ func (ui *transferUI) snapshot(now time.Time, rate, readRate float64, stalled bo
 		inputClosed:         ui.inputClosed.Load(),
 		confirmationLatency: confirmationLatency,
 		phaseElapsed:        now.Sub(phaseSince),
+		elapsed:             elapsed,
 		tick:                tick,
 	}
+}
+
+func plainQuote(value string) string {
+	return strconv.Quote(strings.TrimSpace(value))
+}
+
+func (ui *transferUI) writePlainLine(now time.Time, event string, fields ...string) {
+	if ui == nil || !ui.enabled || !ui.plain {
+		return
+	}
+	var line strings.Builder
+	fmt.Fprintf(&line, "%s idoud transfer=%s event=%s", now.Format(time.RFC3339Nano), ui.kind, event)
+	for _, field := range fields {
+		if strings.TrimSpace(field) != "" {
+			line.WriteByte(' ')
+			line.WriteString(field)
+		}
+	}
+	ui.outputMu.Lock()
+	defer ui.outputMu.Unlock()
+	fmt.Fprintln(ui.writer, line.String())
+}
+
+func (ui *transferUI) writePlainStart(now time.Time) {
+	source := strings.TrimSpace(ui.source)
+	if source == "" {
+		source = "file"
+	}
+	semantics := "provider_confirmed"
+	if ui.kind == "download" {
+		semantics = "disk_written"
+	}
+	ui.writePlainLine(now, "start",
+		"source="+plainQuote(source),
+		"name="+plainQuote(ui.currentName()),
+		"progress_semantics="+semantics,
+		fmt.Sprintf("total_bytes=%d", ui.total.Load()),
+	)
+}
+
+func transferPhaseName(phase transferPhase) string {
+	switch phase {
+	case transferPhasePlanning:
+		return "planning"
+	case transferPhaseConnecting:
+		return "connecting"
+	case transferPhaseTransferring:
+		return "transferring"
+	case transferPhaseFinalizing:
+		return "finalizing"
+	case transferPhaseSaving:
+		return "saving"
+	default:
+		return "unknown"
+	}
+}
+
+func finiteRateInt(rate float64) int64 {
+	if rate <= 0 || math.IsNaN(rate) || math.IsInf(rate, 0) || rate >= float64(math.MaxInt64) {
+		return 0
+	}
+	return int64(math.Round(rate))
+}
+
+func confirmedAverageRate(snapshot transferProgressSnapshot) float64 {
+	moved := snapshot.transferred - snapshot.baselineBytes
+	if moved <= 0 || snapshot.elapsed <= 0 {
+		return 0
+	}
+	return float64(moved) / snapshot.elapsed.Seconds()
+}
+
+func bodyAverageRate(snapshot transferProgressSnapshot) float64 {
+	if snapshot.bodyReadBytes <= 0 || snapshot.elapsed <= 0 {
+		return 0
+	}
+	return float64(snapshot.bodyReadBytes) / snapshot.elapsed.Seconds()
+}
+
+func plainProgressState(snapshot transferProgressSnapshot) string {
+	switch snapshot.phase {
+	case transferPhasePlanning:
+		return "preparing_plan"
+	case transferPhaseConnecting:
+		return "connecting_routes"
+	case transferPhaseFinalizing:
+		return "committing_provider_data"
+	case transferPhaseSaving:
+		return "saving_file"
+	}
+	if snapshot.kind == "download" {
+		if snapshot.stalled && snapshot.inFlight > 0 {
+			return "awaiting_download_data"
+		}
+		if snapshot.rate > 0 || snapshot.inFlight > 0 {
+			return "downloading"
+		}
+		return "waiting"
+	}
+	if snapshot.bodyReadBytes > snapshot.bodyWritten && snapshot.inFlight > 0 {
+		return "writing_request_bodies"
+	}
+	if snapshot.inputClosed && snapshot.inFlight > 0 {
+		return "awaiting_confirmation"
+	}
+	if snapshot.bodyWritten > snapshot.transferred && snapshot.inFlight > 0 {
+		return "awaiting_provider_storage"
+	}
+	if snapshot.stalled && snapshot.inFlight > 0 {
+		return "awaiting_confirmation"
+	}
+	if snapshot.rate > 0 {
+		return "confirming"
+	}
+	if snapshot.readRate > 0 {
+		return "reading_input"
+	}
+	if snapshot.inFlight > 0 {
+		return "warming_up"
+	}
+	return "waiting"
+}
+
+func (ui *transferUI) writePlainSnapshot(now time.Time, snapshot transferProgressSnapshot) {
+	semantics := "provider_confirmed"
+	if ui.kind == "download" {
+		semantics = "disk_written"
+	}
+	fields := []string{
+		"phase=" + transferPhaseName(snapshot.phase),
+		"state=" + plainProgressState(snapshot),
+		"progress_semantics=" + semantics,
+		fmt.Sprintf("phase_elapsed_ms=%d", snapshot.phaseElapsed.Milliseconds()),
+		fmt.Sprintf("elapsed_ms=%d", snapshot.elapsed.Milliseconds()),
+		fmt.Sprintf("completed_bytes=%d", snapshot.transferred),
+		fmt.Sprintf("baseline_bytes=%d", snapshot.baselineBytes),
+		fmt.Sprintf("completed_rate_bps=%d", finiteRateInt(snapshot.rate)),
+		fmt.Sprintf("completed_average_bps=%d", finiteRateInt(confirmedAverageRate(snapshot))),
+		fmt.Sprintf("active_requests=%d", snapshot.inFlight),
+		fmt.Sprintf("retries=%d", snapshot.retries),
+	}
+	if snapshot.total >= 0 {
+		percent := float64(100)
+		if snapshot.total > 0 {
+			percent = float64(snapshot.transferred) / float64(snapshot.total) * 100
+		}
+		if percent < 0 {
+			percent = 0
+		}
+		if percent > 100 {
+			percent = 100
+		}
+		fields = append(fields,
+			fmt.Sprintf("total_bytes=%d", snapshot.total),
+			fmt.Sprintf("percent=%.2f", percent),
+		)
+	}
+	if snapshot.totalChunks >= 0 {
+		fields = append(fields,
+			fmt.Sprintf("completed_parts=%d", snapshot.completedChunks),
+			fmt.Sprintf("total_parts=%d", snapshot.totalChunks),
+		)
+	}
+	if snapshot.readBytes > 0 || snapshot.source == "stdin" || snapshot.source == "archive" {
+		field := "input_bytes"
+		if snapshot.source == "archive" {
+			field = "packed_bytes"
+		}
+		fields = append(fields, fmt.Sprintf("%s=%d", field, snapshot.readBytes))
+	}
+	if ui.kind == "upload" {
+		fields = append(fields,
+			fmt.Sprintf("body_read_bytes=%d", snapshot.bodyReadBytes),
+			fmt.Sprintf("body_written_bytes=%d", snapshot.bodyWritten),
+			fmt.Sprintf("body_requests_written=%d", snapshot.bodyRequests),
+			fmt.Sprintf("body_average_bps=%d", finiteRateInt(bodyAverageRate(snapshot))),
+			fmt.Sprintf("confirmation_average_ms=%d", snapshot.confirmationLatency.Milliseconds()),
+		)
+	}
+	eta := progressETA(snapshot)
+	etaMillis := int64(-1)
+	if eta > 0 {
+		etaMillis = eta.Milliseconds()
+	}
+	fields = append(fields, fmt.Sprintf("eta_ms=%d", etaMillis))
+	ui.writePlainLine(now, "progress", fields...)
 }
 
 func (ui *transferUI) formatProgress(snapshot transferProgressSnapshot) string {
@@ -475,8 +806,12 @@ func (ui *transferUI) formatKnownProgress(snapshot transferProgressSnapshot, wid
 	}
 	percent := fmt.Sprintf("%5.1f%%", ratio*100)
 	rateText := "warming up"
-	if snapshot.inputClosed && snapshot.inFlight > 0 {
+	if snapshot.bodyReadBytes > snapshot.bodyWritten && snapshot.inFlight > 0 {
+		rateText = "sending request bodies"
+	} else if snapshot.inputClosed && snapshot.inFlight > 0 {
 		rateText = "awaiting confirmation"
+	} else if snapshot.bodyWritten > snapshot.transferred && snapshot.inFlight > 0 {
+		rateText = "awaiting provider storage"
 	} else if snapshot.inputClosed && snapshot.source != "file" {
 		rateText = "input complete"
 	} else if snapshot.stalled {
@@ -549,8 +884,12 @@ func (ui *transferUI) formatUnknownProgress(snapshot transferProgressSnapshot, w
 	}
 	if width >= 76 {
 		rateText := "warming up"
-		if snapshot.inputClosed && snapshot.inFlight > 0 {
+		if snapshot.bodyReadBytes > snapshot.bodyWritten && snapshot.inFlight > 0 {
+			rateText = "sending request bodies"
+		} else if snapshot.inputClosed && snapshot.inFlight > 0 {
 			rateText = "awaiting confirmation"
+		} else if snapshot.bodyWritten > snapshot.transferred && snapshot.inFlight > 0 {
+			rateText = "awaiting provider storage"
 		} else if snapshot.inputClosed {
 			rateText = "input complete"
 		} else if snapshot.stalled {
@@ -613,17 +952,39 @@ func progressETA(snapshot transferProgressSnapshot) time.Duration {
 }
 
 func (ui *transferUI) finishLine(success bool, lastRate float64, now time.Time) {
+	snapshot := ui.snapshot(now, lastRate, 0, false, 0)
+	averageRate := confirmedAverageRate(snapshot)
+	if ui.plain {
+		result := "failure"
+		if success {
+			result = "success"
+		}
+		semantics := "provider_confirmed"
+		if ui.kind == "download" {
+			semantics = "disk_written"
+		}
+		fields := []string{
+			"result=" + result,
+			"progress_semantics=" + semantics,
+			fmt.Sprintf("completed_bytes=%d", snapshot.transferred),
+			fmt.Sprintf("elapsed_ms=%d", snapshot.elapsed.Milliseconds()),
+			fmt.Sprintf("average_bps=%d", finiteRateInt(averageRate)),
+			fmt.Sprintf("retries=%d", snapshot.retries),
+		}
+		if ui.kind == "upload" {
+			fields = append(fields,
+				fmt.Sprintf("body_read_bytes=%d", snapshot.bodyReadBytes),
+				fmt.Sprintf("body_written_bytes=%d", snapshot.bodyWritten),
+			)
+		}
+		ui.writePlainLine(now, "complete", fields...)
+		return
+	}
 	ui.outputMu.Lock()
 	defer ui.outputMu.Unlock()
 	ui.clearDynamicLocked()
-	transferred := ui.transferred.Load()
-	elapsed := now.Sub(ui.started)
-	if transferStarted := ui.transferStart.Load(); transferStarted > 0 {
-		elapsed = now.Sub(time.Unix(0, transferStarted))
-	}
-	if elapsed < 0 {
-		elapsed = 0
-	}
+	transferred := snapshot.transferred
+	elapsed := snapshot.elapsed
 	if success {
 		verb := "stored"
 		if ui.kind == "download" {
@@ -632,8 +993,8 @@ func (ui *transferUI) finishLine(success bool, lastRate float64, now time.Time) 
 		line := ui.success(ui.successMark() + " complete")
 		line += ui.dim(" · ") + formatByteSize(transferred) + " " + verb
 		line += ui.dim(" · ") + formatProgressElapsed(elapsed)
-		if lastRate > 0 {
-			line += ui.dim(" · ") + ui.accent(formatRateFromPerSecond(lastRate))
+		if averageRate > 0 {
+			line += ui.dim(" · ") + ui.accent(formatRateFromPerSecond(averageRate)+" avg")
 		}
 		fmt.Fprintln(ui.writer, "  "+line)
 		return
@@ -1013,7 +1374,10 @@ func uploadProgressParallel(u *uploader, src *sourceFile, totalChunks int64) int
 		}
 		return parallel
 	}
-	concurrentChunks := totalChunks - 1
+	concurrentChunks := totalChunks
+	if src.stream != nil && src.readerAt == nil {
+		concurrentChunks--
+	}
 	if concurrentChunks < 1 {
 		concurrentChunks = 1
 	}
