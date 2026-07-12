@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -18,8 +19,11 @@ import (
 )
 
 const (
-	archiveCopyBufferSize = 1024 * 1024
-	archiveCleanupGrace   = 250 * time.Millisecond
+	archiveCopyBufferSize       = 1024 * 1024
+	archiveCleanupGrace         = 250 * time.Millisecond
+	archivePrefetchMinFileBytes = int64(64 * 1024)
+	archivePrefetchMaxFileBytes = int64(32 * 1024 * 1024)
+	archivePrefetchMaxBytes     = int64(256 * 1024 * 1024)
 )
 
 // openArchiveSource starts a backpressured tar+LZ4 stream. The pipe means no
@@ -168,7 +172,320 @@ func writeTarLZ4(ctx context.Context, dst io.Writer, sourcePath, rootName string
 	return nil
 }
 
+type archivePrefetchPolicy struct {
+	workers      int
+	maxFileBytes int64
+}
+
+type archivePrefetchResult struct {
+	data     []byte
+	err      error
+	consumed chan struct{}
+}
+
+type archivePrefetchJob struct {
+	filePath string
+	size     int64
+	result   chan<- archivePrefetchResult
+}
+
+type archiveOrderedEntry struct {
+	filePath string
+	header   *tar.Header
+	regular  bool
+	prefetch <-chan archivePrefetchResult
+}
+
+// automaticArchivePrefetchPolicy spends only a bounded fraction of current
+// memory headroom. Each worker owns at most one completed read because result
+// delivery is unbuffered, so workers*maxFileBytes is a hard userspace bound.
+// Small machines retain a tiny read-ahead window; large machines can overlap
+// random file reads without allowing archive buffering to crowd out upload
+// request bodies.
+func automaticArchivePrefetchPolicy(available int64, gomaxprocs int) archivePrefetchPolicy {
+	if gomaxprocs < 1 {
+		gomaxprocs = 1
+	}
+	if available > 0 && available < 64*1024*1024 {
+		return archivePrefetchPolicy{}
+	}
+
+	workers := gomaxprocs * 2
+	if workers > 16 {
+		workers = 16
+	}
+	budget := archivePrefetchMaxBytes
+	switch {
+	case available <= 0:
+		if workers > 2 {
+			workers = 2
+		}
+		budget = 16 * 1024 * 1024
+	case available < 256*1024*1024:
+		if workers > 2 {
+			workers = 2
+		}
+		budget = available / 16
+	case available < 1024*1024*1024:
+		if workers > 4 {
+			workers = 4
+		}
+		budget = available / 12
+	default:
+		budget = available / 16
+	}
+	if budget > archivePrefetchMaxBytes {
+		budget = archivePrefetchMaxBytes
+	}
+	if budget < archivePrefetchMinFileBytes {
+		return archivePrefetchPolicy{}
+	}
+	maxFileBytes := budget / int64(workers)
+	if maxFileBytes > archivePrefetchMaxFileBytes {
+		maxFileBytes = archivePrefetchMaxFileBytes
+	}
+	if maxFileBytes < archivePrefetchMinFileBytes {
+		workers = int(budget / archivePrefetchMinFileBytes)
+		maxFileBytes = archivePrefetchMinFileBytes
+	}
+	if workers < 1 {
+		return archivePrefetchPolicy{}
+	}
+	return archivePrefetchPolicy{workers: workers, maxFileBytes: maxFileBytes}
+}
+
 func writeTarPath(ctx context.Context, tarWriter *tar.Writer, sourcePath, rootName string) error {
+	policy := automaticArchivePrefetchPolicy(streamMemoryAvailable(), runtime.GOMAXPROCS(0))
+	if policy.workers <= 0 || policy.maxFileBytes < archivePrefetchMinFileBytes {
+		return writeTarPathSequential(ctx, tarWriter, sourcePath, rootName)
+	}
+	return writeTarPathPrefetched(ctx, tarWriter, sourcePath, rootName, policy)
+}
+
+func writeTarPathPrefetched(ctx context.Context, tarWriter *tar.Writer, sourcePath, rootName string, policy archivePrefetchPolicy) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	prefetchCtx, cancel := context.WithCancel(ctx)
+
+	jobs := make(chan archivePrefetchJob)
+	entries := make(chan archiveOrderedEntry, policy.workers*4)
+	walkResult := make(chan error, 1)
+	var wg sync.WaitGroup
+	for range policy.workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			archivePrefetchWorker(prefetchCtx, jobs)
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := walkArchiveEntries(prefetchCtx, sourcePath, rootName, policy.maxFileBytes, entries, jobs)
+		close(jobs)
+		close(entries)
+		walkResult <- err
+	}()
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
+
+	copyBuffer := make([]byte, archiveCopyBufferSize)
+	for entry := range entries {
+		if err := prefetchCtx.Err(); err != nil {
+			return err
+		}
+		if err := tarWriter.WriteHeader(entry.header); err != nil {
+			return fmt.Errorf("write tar header for %q: %w", entry.filePath, err)
+		}
+		if !entry.regular {
+			continue
+		}
+
+		if entry.prefetch != nil {
+			select {
+			case <-prefetchCtx.Done():
+				return prefetchCtx.Err()
+			case result := <-entry.prefetch:
+				if result.err != nil {
+					close(result.consumed)
+					return result.err
+				}
+				written, err := tarWriter.Write(result.data)
+				close(result.consumed)
+				if err != nil {
+					return fmt.Errorf("write prefetched %q while archiving: %w", entry.filePath, err)
+				}
+				if int64(written) != entry.header.Size {
+					return fmt.Errorf("file %q changed while archiving: read %d of %d bytes", entry.filePath, written, entry.header.Size)
+				}
+			}
+			continue
+		}
+		if err := writeArchiveFileDirect(prefetchCtx, tarWriter, entry.filePath, entry.header.Size, copyBuffer); err != nil {
+			return err
+		}
+	}
+	if err := <-walkResult; err != nil {
+		return err
+	}
+	return nil
+}
+
+func archivePrefetchWorker(ctx context.Context, jobs <-chan archivePrefetchJob) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job, ok := <-jobs:
+			if !ok {
+				return
+			}
+			result := readArchiveFile(ctx, job.filePath, job.size)
+			result.consumed = make(chan struct{})
+			select {
+			case job.result <- result:
+			case <-ctx.Done():
+				return
+			}
+			select {
+			case <-result.consumed:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+func buildArchiveHeader(sourcePath, rootName, filePath string, entry fs.DirEntry) (*tar.Header, bool, error) {
+	info, err := entry.Info()
+	if err != nil {
+		return nil, false, fmt.Errorf("stat %q: %w", filePath, err)
+	}
+	if info.Mode()&os.ModeSocket != 0 {
+		// Sockets have no persistent payload and are not representable in a
+		// portable tar archive. This matches conventional tar behavior.
+		return nil, false, nil
+	}
+
+	linkTarget := ""
+	if info.Mode()&os.ModeSymlink != 0 {
+		linkTarget, err = os.Readlink(filePath)
+		if err != nil {
+			return nil, false, fmt.Errorf("read symlink %q: %w", filePath, err)
+		}
+	}
+	header, err := tar.FileInfoHeader(info, linkTarget)
+	if err != nil {
+		return nil, false, fmt.Errorf("create tar header for %q: %w", filePath, err)
+	}
+	rel, err := filepath.Rel(sourcePath, filePath)
+	if err != nil {
+		return nil, false, fmt.Errorf("resolve archive path for %q: %w", filePath, err)
+	}
+	header.Name = rootName
+	if rel != "." {
+		header.Name = path.Join(rootName, filepath.ToSlash(rel))
+	}
+	if info.IsDir() && !strings.HasSuffix(header.Name, "/") {
+		header.Name += "/"
+	}
+	return header, info.Mode().IsRegular(), nil
+}
+
+func walkArchiveEntries(ctx context.Context, sourcePath, rootName string, maxPrefetchBytes int64, entries chan<- archiveOrderedEntry, jobs chan<- archivePrefetchJob) error {
+	return filepath.WalkDir(sourcePath, func(filePath string, entry fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if walkErr != nil {
+			return fmt.Errorf("walk %q: %w", filePath, walkErr)
+		}
+
+		header, regular, err := buildArchiveHeader(sourcePath, rootName, filePath, entry)
+		if err != nil {
+			return err
+		}
+		if header == nil {
+			return nil
+		}
+
+		ordered := archiveOrderedEntry{filePath: filePath, header: header, regular: regular}
+		var job archivePrefetchJob
+		eligible := regular &&
+			header.Size >= archivePrefetchMinFileBytes &&
+			header.Size <= maxPrefetchBytes &&
+			header.Size <= int64(int(^uint(0)>>1))
+		if eligible {
+			result := make(chan archivePrefetchResult)
+			ordered.prefetch = result
+			job = archivePrefetchJob{filePath: filePath, size: header.Size, result: result}
+		}
+
+		select {
+		case entries <- ordered:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if eligible {
+			select {
+			case jobs <- job:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	})
+}
+
+func readArchiveFile(ctx context.Context, filePath string, size int64) archivePrefetchResult {
+	if size < 0 || size > int64(int(^uint(0)>>1)) {
+		return archivePrefetchResult{err: fmt.Errorf("invalid archive file size for %q: %d", filePath, size)}
+	}
+	file, err := os.Open(filePath)
+	if err != nil {
+		return archivePrefetchResult{err: fmt.Errorf("open %q while archiving: %w", filePath, err)}
+	}
+	data := make([]byte, int(size))
+	written, readErr := io.ReadFull(&archiveContextReader{ctx: ctx, reader: file}, data)
+	closeErr := file.Close()
+	if readErr != nil {
+		return archivePrefetchResult{err: fmt.Errorf("read %q while archiving: %w", filePath, readErr)}
+	}
+	if closeErr != nil {
+		return archivePrefetchResult{err: fmt.Errorf("close %q while archiving: %w", filePath, closeErr)}
+	}
+	if int64(written) != size {
+		return archivePrefetchResult{err: fmt.Errorf("file %q changed while archiving: read %d of %d bytes", filePath, written, size)}
+	}
+	return archivePrefetchResult{data: data}
+}
+
+func writeArchiveFileDirect(ctx context.Context, tarWriter *tar.Writer, filePath string, size int64, copyBuffer []byte) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("open %q while archiving: %w", filePath, err)
+	}
+	written, copyErr := io.CopyBuffer(tarWriter, &archiveContextReader{
+		ctx:    ctx,
+		reader: io.LimitReader(file, size),
+	}, copyBuffer)
+	closeErr := file.Close()
+	if copyErr != nil {
+		return fmt.Errorf("read %q while archiving: %w", filePath, copyErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close %q while archiving: %w", filePath, closeErr)
+	}
+	if written != size {
+		return fmt.Errorf("file %q changed while archiving: read %d of %d bytes", filePath, written, size)
+	}
+	return nil
+}
+
+func writeTarPathSequential(ctx context.Context, tarWriter *tar.Writer, sourcePath, rootName string) error {
 	copyBuffer := make([]byte, archiveCopyBufferSize)
 	return filepath.WalkDir(sourcePath, func(filePath string, entry fs.DirEntry, walkErr error) error {
 		if err := ctx.Err(); err != nil {
@@ -178,65 +495,20 @@ func writeTarPath(ctx context.Context, tarWriter *tar.Writer, sourcePath, rootNa
 			return fmt.Errorf("walk %q: %w", filePath, walkErr)
 		}
 
-		info, err := entry.Info()
+		header, regular, err := buildArchiveHeader(sourcePath, rootName, filePath, entry)
 		if err != nil {
-			return fmt.Errorf("stat %q: %w", filePath, err)
+			return err
 		}
-		if info.Mode()&os.ModeSocket != 0 {
-			// Sockets have no persistent payload and are not representable in a
-			// portable tar archive. This matches conventional tar behavior.
+		if header == nil {
 			return nil
-		}
-
-		linkTarget := ""
-		if info.Mode()&os.ModeSymlink != 0 {
-			linkTarget, err = os.Readlink(filePath)
-			if err != nil {
-				return fmt.Errorf("read symlink %q: %w", filePath, err)
-			}
-		}
-
-		header, err := tar.FileInfoHeader(info, linkTarget)
-		if err != nil {
-			return fmt.Errorf("create tar header for %q: %w", filePath, err)
-		}
-		rel, err := filepath.Rel(sourcePath, filePath)
-		if err != nil {
-			return fmt.Errorf("resolve archive path for %q: %w", filePath, err)
-		}
-		header.Name = rootName
-		if rel != "." {
-			header.Name = path.Join(rootName, filepath.ToSlash(rel))
-		}
-		if info.IsDir() && !strings.HasSuffix(header.Name, "/") {
-			header.Name += "/"
 		}
 		if err := tarWriter.WriteHeader(header); err != nil {
 			return fmt.Errorf("write tar header for %q: %w", filePath, err)
 		}
-		if !info.Mode().IsRegular() {
+		if !regular {
 			return nil
 		}
-
-		file, err := os.Open(filePath)
-		if err != nil {
-			return fmt.Errorf("open %q while archiving: %w", filePath, err)
-		}
-		written, copyErr := io.CopyBuffer(tarWriter, &archiveContextReader{
-			ctx:    ctx,
-			reader: io.LimitReader(file, header.Size),
-		}, copyBuffer)
-		closeErr := file.Close()
-		if copyErr != nil {
-			return fmt.Errorf("read %q while archiving: %w", filePath, copyErr)
-		}
-		if closeErr != nil {
-			return fmt.Errorf("close %q while archiving: %w", filePath, closeErr)
-		}
-		if written != header.Size {
-			return fmt.Errorf("file %q changed while archiving: read %d of %d bytes", filePath, written, header.Size)
-		}
-		return nil
+		return writeArchiveFileDirect(ctx, tarWriter, filePath, header.Size, copyBuffer)
 	})
 }
 

@@ -125,6 +125,64 @@ func TestArchiveSourceStreamsCompatibleTarLZ4(t *testing.T) {
 	}
 }
 
+func TestAutomaticArchivePrefetchPolicyIsResourceBounded(t *testing.T) {
+	if got := automaticArchivePrefetchPolicy(63*1024*1024, 64); got.workers != 0 {
+		t.Fatalf("very-low-memory policy=%+v, want sequential mode", got)
+	}
+	unknown := automaticArchivePrefetchPolicy(0, 64)
+	if unknown.workers != 2 || int64(unknown.workers)*unknown.maxFileBytes > 16*1024*1024 {
+		t.Fatalf("unknown-memory policy=%+v, want <=16MiB across two workers", unknown)
+	}
+	high := automaticArchivePrefetchPolicy(8*1024*1024*1024, 4)
+	if high.workers != 8 || high.maxFileBytes != 32*1024*1024 {
+		t.Fatalf("high-memory policy=%+v, want 8 x 32MiB", high)
+	}
+	if int64(high.workers)*high.maxFileBytes > archivePrefetchMaxBytes {
+		t.Fatalf("high-memory policy exceeds cap: %+v", high)
+	}
+}
+
+func TestPrefetchedTarMatchesSequentialTar(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "fixture")
+	if err := os.MkdirAll(filepath.Join(root, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string][]byte{
+		"small.txt":         []byte("small archive entry\n"),
+		"nested/medium.bin": bytes.Repeat([]byte("medium-prefetch-data"), 8192),
+		"nested/large.bin":  bytes.Repeat([]byte("direct-read-data"), 16384),
+	}
+	for name, data := range files {
+		if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(name)), data, 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	build := func(prefetched bool) []byte {
+		t.Helper()
+		var output bytes.Buffer
+		writer := tar.NewWriter(&output)
+		var err error
+		if prefetched {
+			err = writeTarPathPrefetched(t.Context(), writer, root, "fixture", archivePrefetchPolicy{workers: 3, maxFileBytes: 192 * 1024})
+		} else {
+			err = writeTarPathSequential(t.Context(), writer, root, "fixture")
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return output.Bytes()
+	}
+	sequential := build(false)
+	prefetched := build(true)
+	if !bytes.Equal(prefetched, sequential) {
+		t.Fatalf("prefetched tar differs from sequential tar: got %d bytes, want %d", len(prefetched), len(sequential))
+	}
+}
+
 func TestArchiveSourceDerivesCurrentDirectoryName(t *testing.T) {
 	parent := t.TempDir()
 	rootDir := filepath.Join(parent, "root")
