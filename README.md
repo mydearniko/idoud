@@ -79,20 +79,21 @@ every advanced option, and `idoud --version` for build identification.
 - Diagnostics go to stderr. Successful machine-readable output stays isolated
   on stdout.
 - Interactive terminals get a compact idoud-styled transfer display on stderr.
-  Upload progress counts only provider-confirmed bytes; download progress counts
-  bytes written to the resumable part file. Rates use a rolling confirmed-byte
-  window, known-size ETAs include slow stdin input, and finalization/file sync
-  are shown as separate phases instead of a fake completed bar.
-- Unknown-size stdin and `-z` streams show read/packed bytes, confirmed stored
-  bytes, rate, activity, and retries without inventing a percentage or ETA.
+  Uploads show smooth, retry-safe request-body progress as `sent` and separately
+  show provider-confirmed `stored` bytes, so retry traffic is never double
+  counted or mistaken for durability. Download progress counts bytes written to
+  the resumable part file. Rates use rolling byte windows, known-size ETAs
+  include slow stdin input, and finalization/file sync remain separate phases.
+- Unknown-size stdin and `-z` streams show read/packed, sent, and confirmed
+  stored bytes, rate, activity, and retries without inventing a percentage or ETA.
   Redirected stderr remains quiet in the default `auto` mode, `--no-progress`
   disables the display, and `NO_COLOR` preserves the layout without terminal
   colors.
 - `--progress=lines` (or `-g lines`) keeps the interactive spinner, progress
   bar, rate, ETA, part counts, and completion layout, but writes every refresh
-  as a separate timestamped line without cursor-control sequences. It remains
-  enabled when stderr is redirected, and `IDOUD_PROGRESS=lines` selects it by
-  default.
+  as a separate timestamped line without cursor-control sequences. Unchanged
+  snapshots are collapsed to a one-second heartbeat. It remains enabled when
+  stderr is redirected, and `IDOUD_PROGRESS=lines` selects it by default.
 - `--non-interactive` (or `--progress=plain`) emits timestamped, ANSI-free,
   line-oriented progress to stderr even when redirected. It separately reports
   request-body bytes, fully written request bodies, provider-confirmed bytes,

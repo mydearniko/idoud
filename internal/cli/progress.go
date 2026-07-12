@@ -40,10 +40,10 @@ type transferUIConfig struct {
 	totalChunks int64
 }
 
-// transferUI renders only provider-confirmed upload bytes or bytes actually
-// written by a download. It never treats request-body writes as durable upload
-// progress, which prevents a false 100% while the provider is still storing a
-// chunk.
+// transferUI keeps upload transport and durability progress separate. Smooth
+// request-body progress is retry-safe and explicitly labeled as sent, while
+// stored bytes advance only after confirmation. Download progress counts only
+// bytes actually written to the destination file.
 type transferUI struct {
 	enabled bool
 	plain   bool
@@ -67,6 +67,7 @@ type transferUI struct {
 	baselineBytes   atomic.Int64
 	readBytes       atomic.Int64
 	bodyReadBytes   atomic.Int64
+	bodySentBytes   atomic.Int64
 	bodyWritten     atomic.Int64
 	bodyRequests    atomic.Int64
 	completedChunks atomic.Int64
@@ -77,12 +78,15 @@ type transferUI struct {
 	inputClosed     atomic.Bool
 	requestNanos    atomic.Int64
 	requestCount    atomic.Int64
+	bodyProgress    sync.Map
 
-	outputMu        sync.Mutex
-	lastLineWidth   int
-	planOnce        sync.Once
-	resumeOnce      sync.Once
-	destinationOnce sync.Once
+	outputMu         sync.Mutex
+	lastLineWidth    int
+	lastRenderedLine string
+	lastRenderedAt   time.Time
+	planOnce         sync.Once
+	resumeOnce       sync.Once
+	destinationOnce  sync.Once
 
 	stopOnce sync.Once
 	stopCh   chan bool
@@ -109,8 +113,10 @@ type transferProgressSnapshot struct {
 	elapsed             time.Duration
 	baselineBytes       int64
 	bodyReadBytes       int64
+	bodySentBytes       int64
 	bodyWritten         int64
 	bodyRequests        int64
+	sendRate            float64
 	tick                int
 }
 
@@ -273,6 +279,7 @@ func (ui *transferUI) loopInteractive() {
 	defer ticker.Stop()
 	rate := progressRateEstimator{}
 	readRate := progressRateEstimator{}
+	sendRate := progressRateEstimator{}
 	generation := ui.rateGeneration.Load()
 	tick := 0
 
@@ -280,10 +287,12 @@ func (ui *transferUI) loopInteractive() {
 		if currentGeneration := ui.rateGeneration.Load(); currentGeneration != generation {
 			generation = currentGeneration
 			rate.reset(now, ui.transferred.Load())
+			sendRate.reset(now, ui.bodySentBytes.Load())
 		}
 		confirmedRate, stalled := rate.observe(now, ui.transferred.Load())
 		inputRate, _ := readRate.observe(now, ui.readBytes.Load())
-		snapshot := ui.snapshot(now, confirmedRate, inputRate, stalled, tick)
+		bodyRate, _ := sendRate.observe(now, ui.bodySentBytes.Load())
+		snapshot := ui.snapshot(now, confirmedRate, inputRate, bodyRate, stalled, tick)
 		ui.renderDynamic(now, ui.formatProgress(snapshot))
 		return confirmedRate, inputRate, stalled
 	}
@@ -291,6 +300,7 @@ func (ui *transferUI) loopInteractive() {
 	now := time.Now()
 	rate.reset(now, ui.transferred.Load())
 	readRate.reset(now, ui.readBytes.Load())
+	sendRate.reset(now, ui.bodySentBytes.Load())
 	lastRate, _, _ := render(now)
 	for {
 		select {
@@ -311,6 +321,7 @@ func (ui *transferUI) loopPlain() {
 	defer ticker.Stop()
 	rate := progressRateEstimator{}
 	readRate := progressRateEstimator{}
+	sendRate := progressRateEstimator{}
 	generation := ui.rateGeneration.Load()
 	tick := 0
 	lastPhase := transferPhase(^uint32(0))
@@ -318,6 +329,7 @@ func (ui *transferUI) loopPlain() {
 	lastCompleted := int64(-1)
 	lastRetries := int64(-1)
 	lastBodyRead := int64(-1)
+	lastBodySent := int64(-1)
 	lastBodyWritten := int64(-1)
 	lastInputClosed := false
 	lastEmit := time.Time{}
@@ -326,15 +338,18 @@ func (ui *transferUI) loopPlain() {
 		if currentGeneration := ui.rateGeneration.Load(); currentGeneration != generation {
 			generation = currentGeneration
 			rate.reset(now, ui.transferred.Load())
+			sendRate.reset(now, ui.bodySentBytes.Load())
 		}
 		confirmedRate, stalled := rate.observe(now, ui.transferred.Load())
 		inputRate, _ := readRate.observe(now, ui.readBytes.Load())
-		snapshot := ui.snapshot(now, confirmedRate, inputRate, stalled, tick)
+		bodyRate, _ := sendRate.observe(now, ui.bodySentBytes.Load())
+		snapshot := ui.snapshot(now, confirmedRate, inputRate, bodyRate, stalled, tick)
 		bodyReadAdvanced := lastBodyRead < 0 || snapshot.bodyReadBytes-lastBodyRead >= 8*1024*1024
 		changed := snapshot.phase != lastPhase ||
 			snapshot.transferred != lastTransferred ||
 			snapshot.completedChunks != lastCompleted ||
 			snapshot.retries != lastRetries ||
+			snapshot.bodySentBytes != lastBodySent ||
 			snapshot.bodyWritten != lastBodyWritten ||
 			snapshot.inputClosed != lastInputClosed || bodyReadAdvanced
 		heartbeat := lastEmit.IsZero() || now.Sub(lastEmit) >= 2*time.Second
@@ -345,6 +360,7 @@ func (ui *transferUI) loopPlain() {
 			lastCompleted = snapshot.completedChunks
 			lastRetries = snapshot.retries
 			lastBodyRead = snapshot.bodyReadBytes
+			lastBodySent = snapshot.bodySentBytes
 			lastBodyWritten = snapshot.bodyWritten
 			lastInputClosed = snapshot.inputClosed
 			lastEmit = now
@@ -355,6 +371,7 @@ func (ui *transferUI) loopPlain() {
 	now := time.Now()
 	rate.reset(now, ui.transferred.Load())
 	readRate.reset(now, ui.readBytes.Load())
+	sendRate.reset(now, ui.bodySentBytes.Load())
 	lastRate := render(now, true)
 	for {
 		select {
@@ -435,6 +452,7 @@ func (ui *transferUI) setBaseline(bytes, chunks int64) {
 	}
 	ui.baselineBytes.Store(bytes)
 	ui.transferred.Store(bytes)
+	ui.bodySentBytes.Store(bytes)
 	ui.completedChunks.Store(chunks)
 	ui.rateGeneration.Add(1)
 	if ui.enabled && bytes > 0 {
@@ -447,6 +465,56 @@ func (ui *transferUI) setBaseline(bytes, chunks int64) {
 func (ui *transferUI) addBodyRead(bytes int64) {
 	if ui != nil && bytes > 0 {
 		ui.bodyReadBytes.Add(bytes)
+		ui.bodySentBytes.Add(bytes)
+	}
+}
+
+func (ui *transferUI) recordBodyRead(chunkIndex, attemptBytes, contentLength, bytes int64) {
+	if ui == nil || bytes <= 0 {
+		return
+	}
+	if chunkIndex < 0 || contentLength <= 0 {
+		ui.bodyReadBytes.Add(bytes)
+		ui.bodySentBytes.Add(bytes)
+		return
+	}
+	ui.recordBodyReadProgress(ui.bodyProgressTracker(chunkIndex), attemptBytes, contentLength, bytes)
+}
+
+func (ui *transferUI) bodyProgressTracker(chunkIndex int64) *atomic.Int64 {
+	if ui == nil || chunkIndex < 0 {
+		return nil
+	}
+	candidate := &atomic.Int64{}
+	value, _ := ui.bodyProgress.LoadOrStore(chunkIndex, candidate)
+	tracker, _ := value.(*atomic.Int64)
+	return tracker
+}
+
+func (ui *transferUI) recordBodyReadProgress(tracker *atomic.Int64, attemptBytes, contentLength, bytes int64) {
+	if ui == nil || bytes <= 0 {
+		return
+	}
+	ui.bodyReadBytes.Add(bytes)
+	if tracker == nil || contentLength <= 0 {
+		ui.bodySentBytes.Add(bytes)
+		return
+	}
+	if attemptBytes < 0 {
+		attemptBytes = 0
+	}
+	if attemptBytes > contentLength {
+		attemptBytes = contentLength
+	}
+	for {
+		previous := tracker.Load()
+		if attemptBytes <= previous {
+			return
+		}
+		if tracker.CompareAndSwap(previous, attemptBytes) {
+			ui.bodySentBytes.Add(attemptBytes - previous)
+			return
+		}
 	}
 }
 
@@ -531,11 +599,13 @@ func (ui *transferUI) emitInfo(label, detail string) {
 	defer ui.outputMu.Unlock()
 	if !ui.lines {
 		ui.clearDynamicLocked()
+	} else {
+		ui.lastRenderedLine = ""
 	}
 	ui.writeStyledLineLocked(now, ui.dim(label)+"  "+ui.trimVisible(detail, ui.currentWidth()-utf8.RuneCountInString(label)-3))
 }
 
-func (ui *transferUI) snapshot(now time.Time, rate, readRate float64, stalled bool, tick int) transferProgressSnapshot {
+func (ui *transferUI) snapshot(now time.Time, rate, readRate, sendRate float64, stalled bool, tick int) transferProgressSnapshot {
 	ui.detailsMu.RLock()
 	phase := ui.phase
 	phaseSince := ui.phaseSince
@@ -561,8 +631,10 @@ func (ui *transferUI) snapshot(now time.Time, rate, readRate float64, stalled bo
 		baselineBytes:       ui.baselineBytes.Load(),
 		readBytes:           ui.readBytes.Load(),
 		bodyReadBytes:       ui.bodyReadBytes.Load(),
+		bodySentBytes:       ui.bodySentBytes.Load(),
 		bodyWritten:         ui.bodyWritten.Load(),
 		bodyRequests:        ui.bodyRequests.Load(),
+		sendRate:            sendRate,
 		totalChunks:         ui.totalChunks.Load(),
 		completedChunks:     ui.completedChunks.Load(),
 		inFlight:            ui.inFlight.Load(),
@@ -749,6 +821,8 @@ func (ui *transferUI) writePlainSnapshot(now time.Time, snapshot transferProgres
 	if ui.kind == "upload" {
 		fields = append(fields,
 			fmt.Sprintf("body_read_bytes=%d", snapshot.bodyReadBytes),
+			fmt.Sprintf("body_sent_bytes=%d", snapshot.bodySentBytes),
+			fmt.Sprintf("body_send_rate_bps=%d", finiteRateInt(snapshot.sendRate)),
 			fmt.Sprintf("body_written_bytes=%d", snapshot.bodyWritten),
 			fmt.Sprintf("body_requests_written=%d", snapshot.bodyRequests),
 			fmt.Sprintf("body_average_bps=%d", finiteRateInt(bodyAverageRate(snapshot))),
@@ -799,15 +873,30 @@ func (ui *transferUI) formatProgress(snapshot transferProgressSnapshot) string {
 
 func (ui *transferUI) formatKnownProgress(snapshot transferProgressSnapshot, width int) string {
 	total := snapshot.total
-	done := snapshot.transferred
+	confirmed := snapshot.transferred
 	if total <= 0 {
-		done = 0
+		confirmed = 0
 	}
-	if done < 0 {
-		done = 0
+	if confirmed < 0 {
+		confirmed = 0
 	}
-	if total > 0 && done > total {
-		done = total
+	if total > 0 && confirmed > total {
+		confirmed = total
+	}
+	sent := snapshot.bodySentBytes
+	if sent < confirmed {
+		sent = confirmed
+	}
+	if sent < 0 {
+		sent = 0
+	}
+	if total > 0 && sent > total {
+		sent = total
+	}
+	showSent := snapshot.kind == "upload" && sent > confirmed
+	done := confirmed
+	if showSent {
+		done = sent
 	}
 	ratio := 1.0
 	if total > 0 {
@@ -815,7 +904,13 @@ func (ui *transferUI) formatKnownProgress(snapshot transferProgressSnapshot, wid
 	}
 	percent := fmt.Sprintf("%5.1f%%", ratio*100)
 	rateText := "warming up"
-	if snapshot.bodyReadBytes > snapshot.bodyWritten && snapshot.inFlight > 0 {
+	if showSent && sent < total && snapshot.sendRate > 0 {
+		rateText = "sending " + formatRateFromPerSecond(snapshot.sendRate)
+	} else if showSent && sent < total && snapshot.inFlight > 0 {
+		rateText = "sending request bodies"
+	} else if showSent && confirmed < total {
+		rateText = "awaiting storage"
+	} else if snapshot.bodyReadBytes > snapshot.bodyWritten && snapshot.inFlight > 0 {
 		rateText = "sending request bodies"
 	} else if snapshot.inputClosed && snapshot.inFlight > 0 {
 		rateText = "awaiting confirmation"
@@ -855,9 +950,18 @@ func (ui *transferUI) formatKnownProgress(snapshot transferProgressSnapshot, wid
 	if barWidth > 0 {
 		line += ui.accent(ui.progressBar(ratio, barWidth)) + " "
 	}
-	line += ui.accentLight(percent) + "  " + formatByteSize(done) + "/" + formatByteSize(total)
+	if showSent {
+		line += ui.accentLight("sent "+strings.TrimSpace(percent)) + "  "
+	} else {
+		line += ui.accentLight(percent) + "  "
+	}
+	line += formatByteSize(done) + "/" + formatByteSize(total)
 	if width >= 72 {
-		line += ui.dim(" · ") + ui.accent(rateText) + ui.dim(" · ") + ui.link(etaText)
+		line += ui.dim(" · ") + ui.accent(rateText)
+		if showSent && width >= 96 {
+			line += ui.dim(" · stored ") + formatByteSize(confirmed)
+		}
+		line += ui.dim(" · ") + ui.link(etaText)
 	}
 	if width >= 118 && snapshot.totalChunks > 0 {
 		line += ui.dim(fmt.Sprintf(" · %d/%d parts", snapshot.completedChunks, snapshot.totalChunks))
@@ -883,7 +987,17 @@ func (ui *transferUI) formatUnknownProgress(snapshot transferProgressSnapshot, w
 	if barWidth > 0 {
 		line += ui.accent(ui.activityBar(snapshot.tick, barWidth)) + " "
 	}
-	line += ui.accentLight("streaming") + "  stored " + formatByteSize(snapshot.transferred)
+	sent := snapshot.bodySentBytes
+	if sent < snapshot.transferred {
+		sent = snapshot.transferred
+	}
+	showSent := snapshot.kind == "upload" && sent > snapshot.transferred
+	line += ui.accentLight("streaming") + "  "
+	if showSent {
+		line += "sent " + formatByteSize(sent) + ui.dim(" · stored ") + formatByteSize(snapshot.transferred)
+	} else {
+		line += "stored " + formatByteSize(snapshot.transferred)
+	}
 	if width >= 58 && (snapshot.readBytes > snapshot.transferred || snapshot.source == "stdin" || snapshot.source == "archive") {
 		readLabel := "read"
 		if snapshot.source == "archive" {
@@ -893,7 +1007,11 @@ func (ui *transferUI) formatUnknownProgress(snapshot transferProgressSnapshot, w
 	}
 	if width >= 76 {
 		rateText := "warming up"
-		if snapshot.bodyReadBytes > snapshot.bodyWritten && snapshot.inFlight > 0 {
+		if showSent && snapshot.sendRate > 0 {
+			rateText = "sending " + formatRateFromPerSecond(snapshot.sendRate)
+		} else if showSent && snapshot.inFlight > 0 {
+			rateText = "sending request bodies"
+		} else if snapshot.bodyReadBytes > snapshot.bodyWritten && snapshot.inFlight > 0 {
 			rateText = "sending request bodies"
 		} else if snapshot.inputClosed && snapshot.inFlight > 0 {
 			rateText = "awaiting confirmation"
@@ -938,6 +1056,19 @@ func progressETA(snapshot transferProgressSnapshot) time.Duration {
 	if confirmedRateReady && snapshot.rate > 0 && !snapshot.stalled {
 		eta = time.Duration(remaining / snapshot.rate * float64(time.Second))
 	}
+	if snapshot.kind == "upload" && snapshot.sendRate > 0 {
+		sent := snapshot.bodySentBytes
+		if sent < snapshot.transferred {
+			sent = snapshot.transferred
+		}
+		if sent < snapshot.total {
+			sendRemaining := float64(snapshot.total - sent)
+			sendETA := time.Duration(sendRemaining / snapshot.sendRate * float64(time.Second))
+			if sendETA > eta {
+				eta = sendETA
+			}
+		}
+	}
 	if snapshot.source != "file" && snapshot.readRate > 0 && snapshot.readBytes < snapshot.total {
 		inputRemaining := float64(snapshot.total - snapshot.readBytes)
 		inputETA := time.Duration(inputRemaining / snapshot.readRate * float64(time.Second))
@@ -961,7 +1092,7 @@ func progressETA(snapshot transferProgressSnapshot) time.Duration {
 }
 
 func (ui *transferUI) finishLine(success bool, lastRate float64, now time.Time) {
-	snapshot := ui.snapshot(now, lastRate, 0, false, 0)
+	snapshot := ui.snapshot(now, lastRate, 0, 0, false, 0)
 	averageRate := confirmedAverageRate(snapshot)
 	if ui.plain {
 		result := "failure"
@@ -983,6 +1114,7 @@ func (ui *transferUI) finishLine(success bool, lastRate float64, now time.Time) 
 		if ui.kind == "upload" {
 			fields = append(fields,
 				fmt.Sprintf("body_read_bytes=%d", snapshot.bodyReadBytes),
+				fmt.Sprintf("body_sent_bytes=%d", snapshot.bodySentBytes),
 				fmt.Sprintf("body_written_bytes=%d", snapshot.bodyWritten),
 			)
 		}
@@ -1017,7 +1149,12 @@ func (ui *transferUI) renderDynamic(now time.Time, line string) {
 	ui.outputMu.Lock()
 	defer ui.outputMu.Unlock()
 	if ui.lines {
+		if line == ui.lastRenderedLine && !ui.lastRenderedAt.IsZero() && now.Sub(ui.lastRenderedAt) < time.Second {
+			return
+		}
 		ui.writeStyledLineLocked(now, line)
+		ui.lastRenderedLine = line
+		ui.lastRenderedAt = now
 		return
 	}
 	visible := visibleTerminalWidth(line)

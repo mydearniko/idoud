@@ -47,6 +47,40 @@ func TestKnownProgressUsesConfirmedBytesAndETA(t *testing.T) {
 	}
 }
 
+func TestKnownProgressShowsSmoothSentAndStoredTruth(t *testing.T) {
+	ui := newProgressFormatter(140)
+	snapshot := transferProgressSnapshot{
+		kind:            "upload",
+		source:          "file",
+		phase:           transferPhaseTransferring,
+		total:           100 * 1024 * 1024,
+		transferred:     10 * 1024 * 1024,
+		bodySentBytes:   50 * 1024 * 1024,
+		totalChunks:     10,
+		completedChunks: 1,
+		inFlight:        9,
+		sendRate:        20 * 1024 * 1024,
+		phaseElapsed:    4 * time.Second,
+	}
+	line := ui.formatProgress(snapshot)
+	for _, want := range []string{
+		"sent 50.0%",
+		"50.00MiB/100.00MiB",
+		"sending 20.00MiB/s",
+		"stored 10.00MiB",
+		"eta ~3s",
+		"1/10 parts",
+		"9 active",
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("smooth progress line %q does not contain %q", line, want)
+		}
+	}
+	if strings.Contains(line, "sent 10.0%") {
+		t.Fatalf("smooth progress used stored bytes for the sent bar: %q", line)
+	}
+}
+
 func TestUnknownStreamProgressNeverInventsPercentOrETA(t *testing.T) {
 	ui := newProgressFormatter(100)
 	snapshot := transferProgressSnapshot{
@@ -180,6 +214,21 @@ func TestProgressETAIncludesSlowKnownInput(t *testing.T) {
 	}
 }
 
+func TestProgressETAUsesBodySendRateBeforeConfirmations(t *testing.T) {
+	snapshot := transferProgressSnapshot{
+		kind:          "upload",
+		source:        "file",
+		total:         100 * 1024 * 1024,
+		bodySentBytes: 40 * 1024 * 1024,
+		sendRate:      20 * 1024 * 1024,
+		totalChunks:   10,
+		phaseElapsed:  4 * time.Second,
+	}
+	if got := progressETA(snapshot); got != 3*time.Second {
+		t.Fatalf("ETA=%s, want 3s body-send ETA", got)
+	}
+}
+
 func TestProgressETAKeepsProviderConfirmationLatencyFloor(t *testing.T) {
 	snapshot := transferProgressSnapshot{
 		source:              "file",
@@ -306,6 +355,40 @@ func TestLineProgressKeepsInteractiveLayoutWithTimestampedNewlines(t *testing.T)
 	}
 }
 
+func TestLineProgressSuppressesUnchangedSnapshotsUntilHeartbeat(t *testing.T) {
+	var output bytes.Buffer
+	ui := newTransferUI(transferUIConfig{
+		enabled: true,
+		lines:   true,
+		writer:  &output,
+	})
+	start := time.Date(2026, 7, 12, 3, 0, 0, 0, time.FixedZone("MSK", 3*60*60))
+	ui.renderDynamic(start, "  ◆ [──────────] 0.0%")
+	ui.renderDynamic(start.Add(200*time.Millisecond), "  ◆ [──────────] 0.0%")
+	ui.renderDynamic(start.Add(time.Second), "  ◆ [──────────] 0.0%")
+
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("unchanged snapshots emitted %d lines, want initial + 1s heartbeat: %q", len(lines), output.String())
+	}
+}
+
+func TestBodyProgressCountsEachPartOnlyOnceAcrossRetries(t *testing.T) {
+	ui := newTransferUI(transferUIConfig{})
+	ui.setBaseline(10, 1)
+	ui.recordBodyRead(2, 4, 10, 4)
+	ui.recordBodyRead(2, 3, 10, 3)
+	ui.recordBodyRead(2, 8, 10, 5)
+	ui.recordBodyRead(3, 2, 10, 2)
+
+	if got := ui.bodyReadBytes.Load(); got != 14 {
+		t.Fatalf("raw body bytes=%d, want 14 including retry traffic", got)
+	}
+	if got := ui.bodySentBytes.Load(); got != 20 {
+		t.Fatalf("unique sent bytes=%d, want 10 baseline + 8 + 2", got)
+	}
+}
+
 func TestPlainProgressIsANSIFreeLineOrientedAndDiagnostic(t *testing.T) {
 	var output bytes.Buffer
 	ui := newTransferUI(transferUIConfig{
@@ -338,6 +421,7 @@ func TestPlainProgressIsANSIFreeLineOrientedAndDiagnostic(t *testing.T) {
 		"event=progress phase=finalizing",
 		"completed_bytes=10485760",
 		"body_read_bytes=10485760",
+		"body_sent_bytes=10485760",
 		"body_written_bytes=10485760",
 		"confirmation_average_ms=2000",
 		"event=complete result=success",

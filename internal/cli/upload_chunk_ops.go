@@ -409,8 +409,14 @@ func (u *uploader) uploadPUT(
 	}
 	defer uploadBodyLease.releaseRequest()
 	if u.ui != nil && body != nil && body != http.NoBody && contentLength > 0 {
-		body = &transferBodyProgressReader{reader: body, ui: u.ui}
+		body = &transferBodyProgressReader{
+			reader:        body,
+			ui:            u.ui,
+			chunkIndex:    chunkIndex,
+			contentLength: contentLength,
+		}
 	}
+	var wroteRequestAt atomic.Int64
 	if chunkIndex >= 0 {
 		ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
 			GotConn: func(info httptrace.GotConnInfo) {
@@ -420,6 +426,7 @@ func (u *uploader) uploadPUT(
 			},
 			WroteRequest: func(info httptrace.WroteRequestInfo) {
 				if info.Err == nil && u.ui != nil {
+					wroteRequestAt.Store(time.Now().UnixNano())
 					u.ui.bodyRequestWritten(contentLength)
 				}
 				uploadBodyLease.releaseWritten()
@@ -464,7 +471,8 @@ func (u *uploader) uploadPUT(
 		return "", 0, errors.New("missing HTTP client")
 	}
 	resp, err := client.Do(req)
-	u.debugHTTPRoundTrip(time.Since(httpStarted))
+	responseAt := time.Now()
+	u.debugHTTPRoundTrip(responseAt.Sub(httpStarted))
 	if err != nil {
 		requestErr := &requestError{cause: err, route: target.rawURL, fallback: target.fallback, master: target.master}
 		if u.routes != nil {
@@ -477,6 +485,11 @@ func (u *uploader) uploadPUT(
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if u.ui != nil {
+			if confirmation := uploadConfirmationDuration(wroteRequestAt.Load(), responseAt); confirmation > 0 {
+				u.ui.recordRequestDuration(confirmation)
+			}
+		}
 		if u.routes != nil {
 			u.routes.success(target.rawURL)
 		}
@@ -514,15 +527,34 @@ func (u *uploader) uploadPUT(
 	return "", resp.StatusCode, requestErr
 }
 
+func uploadConfirmationDuration(wroteRequestAt int64, responseAt time.Time) time.Duration {
+	if wroteRequestAt <= 0 || responseAt.IsZero() {
+		return 0
+	}
+	duration := responseAt.Sub(time.Unix(0, wroteRequestAt))
+	if duration <= 0 {
+		return 0
+	}
+	return duration
+}
+
 type transferBodyProgressReader struct {
-	reader io.Reader
-	ui     *transferUI
+	reader        io.Reader
+	ui            *transferUI
+	chunkIndex    int64
+	contentLength int64
+	readBytes     int64
+	tracker       *atomic.Int64
 }
 
 func (r *transferBodyProgressReader) Read(p []byte) (int, error) {
 	n, err := r.reader.Read(p)
 	if n > 0 && r.ui != nil {
-		r.ui.addBodyRead(int64(n))
+		r.readBytes += int64(n)
+		if r.tracker == nil {
+			r.tracker = r.ui.bodyProgressTracker(r.chunkIndex)
+		}
+		r.ui.recordBodyReadProgress(r.tracker, r.readBytes, r.contentLength, int64(n))
 	}
 	return n, err
 }

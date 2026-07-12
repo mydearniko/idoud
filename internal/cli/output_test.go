@@ -324,6 +324,28 @@ func TestRunLineProgressPreservesURLStdout(t *testing.T) {
 	}
 }
 
+func TestRunLineProgressShowsLiveSentBytesBeforeStorageConfirmation(t *testing.T) {
+	server := newUploadSuccessServerWithReadDelay(t, 8*time.Millisecond)
+	defer server.Close()
+
+	filePath := writeUploadFixture(t, "archive.zip", make([]byte, int(defaultChunkSize)))
+	exitCode, stdout, stderr := captureRunOutput(t, []string{
+		"-g", "lines", "--parallel", "1", "--server", server.URL, filePath,
+	})
+	if exitCode != 0 {
+		t.Fatalf("Run exitCode=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if stdout != server.URL+"/AbC123\n" {
+		t.Fatalf("stdout=%q, want only URL", stdout)
+	}
+	if !strings.Contains(stderr, "sent ") || !strings.Contains(stderr, "stored ") {
+		t.Fatalf("line progress did not separate live sent and stored bytes: %q", stderr)
+	}
+	if strings.Contains(stderr, "body_sent_bytes=") || strings.Contains(stderr, "\r") {
+		t.Fatalf("line progress fell back to diagnostic or dynamic output: %q", stderr)
+	}
+}
+
 func TestRunOutputNoneSuccess(t *testing.T) {
 	server := newUploadSuccessServer(t)
 	defer server.Close()
@@ -512,6 +534,10 @@ func captureRunOutput(t *testing.T, args []string) (int, string, string) {
 }
 
 func newUploadSuccessServer(t *testing.T) *httptest.Server {
+	return newUploadSuccessServerWithReadDelay(t, 0)
+}
+
+func newUploadSuccessServerWithReadDelay(t *testing.T, readDelay time.Duration) *httptest.Server {
 	t.Helper()
 
 	const fileID = "AbC123"
@@ -541,7 +567,18 @@ func newUploadSuccessServer(t *testing.T) *httptest.Server {
 				},
 			})
 		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/") && !strings.HasPrefix(r.URL.Path, "/v1/"):
-			_, _ = io.Copy(io.Discard, r.Body)
+			if readDelay <= 0 {
+				_, _ = io.Copy(io.Discard, r.Body)
+			} else {
+				buf := make([]byte, 64*1024)
+				for {
+					_, readErr := r.Body.Read(buf)
+					if readErr != nil {
+						break
+					}
+					time.Sleep(readDelay)
+				}
+			}
 			_ = r.Body.Close()
 			w.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(w, finalURL)

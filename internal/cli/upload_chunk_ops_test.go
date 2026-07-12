@@ -377,3 +377,58 @@ func TestWarmConnectionsRoutesPayloadDirectlyToHealthyStandby(t *testing.T) {
 		t.Fatalf("primary health=%d primary payload=%d standby payload=%d", primaryHealth, primaryPayload, standbyPayload)
 	}
 }
+
+func TestTransferBodyProgressReaderReportsAttemptOffsets(t *testing.T) {
+	ui := newTransferUI(transferUIConfig{width: func() int { return 140 }})
+	reader := &transferBodyProgressReader{
+		reader:        bytes.NewReader([]byte("abcdefgh")),
+		ui:            ui,
+		chunkIndex:    4,
+		contentLength: 8,
+	}
+	buf := make([]byte, 2)
+	var rendered []string
+	for {
+		n, err := reader.Read(buf)
+		if n > 0 {
+			rendered = append(rendered, ui.formatProgress(transferProgressSnapshot{
+				kind:          "upload",
+				phase:         transferPhaseTransferring,
+				total:         8,
+				bodySentBytes: ui.bodySentBytes.Load(),
+				inFlight:      1,
+			}))
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := ui.bodySentBytes.Load(); got != 8 {
+		t.Fatalf("unique sent bytes=%d, want 8", got)
+	}
+	if got := ui.bodyReadBytes.Load(); got != 8 {
+		t.Fatalf("raw body bytes=%d, want 8", got)
+	}
+	for index, want := range []string{"sent 25.0%", "sent 50.0%", "sent 75.0%", "sent 100.0%"} {
+		if index >= len(rendered) || !strings.Contains(rendered[index], want) {
+			t.Fatalf("rendered progress=%q, want step %d containing %q", rendered, index, want)
+		}
+	}
+}
+
+func TestUploadConfirmationDurationStartsAfterRequestBody(t *testing.T) {
+	wroteAt := time.Unix(100, 250*time.Millisecond.Nanoseconds())
+	responseAt := wroteAt.Add(450 * time.Millisecond)
+	if got := uploadConfirmationDuration(wroteAt.UnixNano(), responseAt); got != 450*time.Millisecond {
+		t.Fatalf("confirmation duration=%s, want 450ms", got)
+	}
+	if got := uploadConfirmationDuration(0, responseAt); got != 0 {
+		t.Fatalf("missing write timestamp duration=%s, want 0", got)
+	}
+	if got := uploadConfirmationDuration(responseAt.UnixNano(), wroteAt); got != 0 {
+		t.Fatalf("negative duration=%s, want 0", got)
+	}
+}

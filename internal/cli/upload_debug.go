@@ -616,9 +616,6 @@ func (u *uploader) debugRequestBuild(d time.Duration) {
 }
 
 func (u *uploader) debugHTTPRoundTrip(d time.Duration) {
-	if ui := u.ui; ui != nil {
-		ui.recordRequestDuration(d)
-	}
 	if dbg := u.dbg; dbg != nil {
 		debugRecordDuration(&dbg.httpNanos, &dbg.httpCount, &dbg.httpMaxNanos, d)
 	}
