@@ -91,7 +91,11 @@ its existing `--verbose` meaning.
 - `-z`/`--archive` streams a standards-compatible `.tar.lz4` archive directly
   into the uploader without creating a temporary archive. Absolute source paths
   are never stored in the tar, symlinks are preserved rather than followed, and
-  LZ4 compression runs concurrently across the available CPU capacity.
+  LZ4 compression runs concurrently across the available CPU capacity. An
+  ordered read-ahead stage overlaps independent file reads while preserving
+  byte-identical tar order; its worker count and hard RAM bound scale down from
+  live OS/container headroom, and very-low-memory systems use the sequential
+  path.
 - Diagnostics go to stderr. Successful machine-readable output stays isolated
   on stdout.
 - Interactive terminals get a compact idoud-styled transfer display on stderr.
