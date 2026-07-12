@@ -88,6 +88,11 @@ every advanced option, and `idoud --version` for build identification.
   Redirected stderr remains quiet in the default `auto` mode, `--no-progress`
   disables the display, and `NO_COLOR` preserves the layout without terminal
   colors.
+- `--progress=lines` (or `-g lines`) keeps the interactive spinner, progress
+  bar, rate, ETA, part counts, and completion layout, but writes every refresh
+  as a separate timestamped line without cursor-control sequences. It remains
+  enabled when stderr is redirected, and `IDOUD_PROGRESS=lines` selects it by
+  default.
 - `--non-interactive` (or `--progress=plain`) emits timestamped, ANSI-free,
   line-oriented progress to stderr even when redirected. It separately reports
   request-body bytes, fully written request bodies, provider-confirmed bytes,
@@ -112,6 +117,7 @@ Capture a complete human- and AI-readable transfer log without disturbing the
 URL or JSON written to stdout:
 
 ```sh
+idoud -g lines archive.bin 2>idoud-pretty.log
 idoud --non-interactive archive.bin 2>idoud-transfer.log
 cat archive.bin | idoud --stdin --name archive.bin --progress=plain \
   2>idoud-transfer.log

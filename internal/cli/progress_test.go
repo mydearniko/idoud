@@ -251,6 +251,61 @@ func TestTransferUIWritesStyledInformationAndCompletion(t *testing.T) {
 	}
 }
 
+func TestLineProgressKeepsInteractiveLayoutWithTimestampedNewlines(t *testing.T) {
+	var output bytes.Buffer
+	ui := newTransferUI(transferUIConfig{
+		enabled:     true,
+		lines:       true,
+		color:       false,
+		unicode:     true,
+		writer:      &output,
+		width:       func() int { return 140 },
+		kind:        "upload",
+		source:      "file",
+		name:        "fixture.bin",
+		total:       10 * 1024 * 1024,
+		totalChunks: 1,
+	})
+	ui.start()
+	ui.setPlan("1 route · up to 1 parallel · 1 × 10.00MiB")
+	ui.setPhase(transferPhaseTransferring)
+	ui.chunkStarted()
+	ui.addBodyRead(10 * 1024 * 1024)
+	ui.bodyRequestWritten(10 * 1024 * 1024)
+	ui.addTransferred(10 * 1024 * 1024)
+	ui.chunkFinished(true)
+	ui.stop(true)
+
+	got := output.String()
+	for _, want := range []string{
+		"idoud · upload",
+		"file  fixture.bin · 10.00MiB",
+		"plan  1 route · up to 1 parallel",
+		"◆ [",
+		"100.0%",
+		"10.00MiB/10.00MiB",
+		"1/1 parts",
+		"✓ complete",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("line progress output %q does not contain %q", got, want)
+		}
+	}
+	if strings.Contains(got, "\r") || strings.Contains(got, "event=progress") || strings.Contains(got, "\x1b[") {
+		t.Fatalf("line progress used dynamic, diagnostic, or ANSI output: %q", got)
+	}
+	lines := strings.Split(strings.TrimSpace(got), "\n")
+	if len(lines) < 5 {
+		t.Fatalf("line progress emitted only %d lines: %q", len(lines), got)
+	}
+	for _, line := range lines {
+		firstField := strings.Fields(line)[0]
+		if _, err := time.Parse(time.RFC3339Nano, firstField); err != nil {
+			t.Fatalf("line progress line has no RFC3339 timestamp: %q", line)
+		}
+	}
+}
+
 func TestPlainProgressIsANSIFreeLineOrientedAndDiagnostic(t *testing.T) {
 	var output bytes.Buffer
 	ui := newTransferUI(transferUIConfig{
@@ -389,6 +444,9 @@ func TestNoProgressOptionDisablesRendererBeforeTTYProbe(t *testing.T) {
 	}
 	if !transferProgressEnabled(options{debug: true, progressMode: progressModePlain}) {
 		t.Fatal("plain progress should remain enabled with debug logs")
+	}
+	if !transferProgressEnabled(options{debug: true, progressMode: progressModeLines}) {
+		t.Fatal("line progress should remain enabled with debug logs")
 	}
 }
 

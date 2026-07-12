@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRunJSONHelp(t *testing.T) {
@@ -290,6 +291,36 @@ func TestRunPlainProgressPreservesURLStdout(t *testing.T) {
 	}
 	if strings.Contains(stderr, "\r") || strings.Contains(stderr, "\x1b[") {
 		t.Fatalf("plain stderr contains terminal controls: %q", stderr)
+	}
+}
+
+func TestRunLineProgressPreservesURLStdout(t *testing.T) {
+	server := newUploadSuccessServer(t)
+	defer server.Close()
+
+	filePath := writeUploadFixture(t, "archive.zip", []byte("pretty line progress"))
+	exitCode, stdout, stderr := captureRunOutput(t, []string{
+		"--progress=lines", "--server", server.URL, filePath,
+	})
+	if exitCode != 0 {
+		t.Fatalf("Run exitCode=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	if stdout != server.URL+"/AbC123\n" {
+		t.Fatalf("stdout=%q, want only URL", stdout)
+	}
+	for _, want := range []string{"idoud · upload", "file  archive.zip", "plan  ", "complete"} {
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("line stderr=%q, want %q", stderr, want)
+		}
+	}
+	if strings.Contains(stderr, "\r") || strings.Contains(stderr, "event=progress") || strings.Contains(stderr, "\x1b[") {
+		t.Fatalf("line stderr contains dynamic, diagnostic, or ANSI output: %q", stderr)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(stderr), "\n") {
+		firstField := strings.Fields(line)[0]
+		if _, err := time.Parse(time.RFC3339Nano, firstField); err != nil {
+			t.Fatalf("line progress line has no RFC3339 timestamp: %q", line)
+		}
 	}
 }
 

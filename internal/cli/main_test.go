@@ -356,6 +356,16 @@ func TestParseFlagsNonInteractiveProgress(t *testing.T) {
 	}
 }
 
+func TestParseFlagsLineProgress(t *testing.T) {
+	opts, _, err := parseFlags([]string{"-g", "lines", "file.bin"})
+	if err != nil {
+		t.Fatalf("parseFlags returned error: %v", err)
+	}
+	if opts.progressMode != progressModeLines {
+		t.Fatalf("progressMode=%q, want %q", opts.progressMode, progressModeLines)
+	}
+}
+
 func TestParseFlagsProgressFromEnvironment(t *testing.T) {
 	t.Setenv("IDOUD_PROGRESS", "plain")
 	opts, _, err := parseFlags([]string{"file.bin"})
@@ -367,12 +377,26 @@ func TestParseFlagsProgressFromEnvironment(t *testing.T) {
 	}
 }
 
+func TestParseFlagsLineProgressFromEnvironment(t *testing.T) {
+	t.Setenv("IDOUD_PROGRESS", "lines")
+	opts, _, err := parseFlags([]string{"file.bin"})
+	if err != nil {
+		t.Fatalf("parseFlags returned error: %v", err)
+	}
+	if opts.progressMode != progressModeLines {
+		t.Fatalf("progressMode=%q, want %q", opts.progressMode, progressModeLines)
+	}
+}
+
 func TestParseFlagsRejectsConflictingProgressModes(t *testing.T) {
 	if _, _, err := parseFlags([]string{"--no-progress", "--non-interactive", "file.bin"}); err == nil {
 		t.Fatal("expected conflict between --no-progress and --non-interactive")
 	}
 	if _, _, err := parseFlags([]string{"--progress=auto", "--non-interactive", "file.bin"}); err == nil {
 		t.Fatal("expected conflict between explicit auto and --non-interactive")
+	}
+	if _, _, err := parseFlags([]string{"--progress=lines", "--non-interactive", "file.bin"}); err == nil {
+		t.Fatal("expected conflict between line and diagnostic progress")
 	}
 	if _, _, err := parseFlags([]string{"--progress=wat", "file.bin"}); err == nil {
 		t.Fatal("expected invalid progress mode error")

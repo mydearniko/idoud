@@ -375,7 +375,7 @@ func registerFlags(fs *flag.FlagSet, opts *options, chunkSizeRaw, stdinSizeRaw, 
 	fs.StringVar(outputRaw, "o", unsetOutputModeValue, "alias for --output")
 	fs.BoolVar(jsonOutput, "json", false, "shorthand for --output json")
 	fs.BoolVar(jsonOutput, "j", false, "alias for --json")
-	fs.StringVar(progressRaw, "progress", string(progressModeAuto), "progress mode: auto, plain, none")
+	fs.StringVar(progressRaw, "progress", string(progressModeAuto), "progress mode: auto, lines, plain, none")
 	fs.StringVar(progressRaw, "g", string(progressModeAuto), "alias for --progress")
 	fs.BoolVar(nonInteractive, "non-interactive", false, "emit ANSI-free line-oriented progress to stderr")
 	fs.BoolVar(nonInteractive, "plain-progress", false, "alias for --non-interactive")
@@ -399,10 +399,10 @@ func registerFlags(fs *flag.FlagSet, opts *options, chunkSizeRaw, stdinSizeRaw, 
 func parseProgressMode(raw string) (progressMode, error) {
 	mode := progressMode(strings.ToLower(strings.TrimSpace(raw)))
 	switch mode {
-	case progressModeAuto, progressModePlain, progressModeNone:
+	case progressModeAuto, progressModeLines, progressModePlain, progressModeNone:
 		return mode, nil
 	default:
-		return "", fmt.Errorf("invalid --progress %q: expected auto, plain, or none", raw)
+		return "", fmt.Errorf("invalid --progress %q: expected auto, lines, plain, or none", raw)
 	}
 }
 
@@ -473,7 +473,7 @@ DOWNLOAD
 OUTPUT
   -o, --output MODE          Success output: url, json, none
   -j, --json                 Alias for --output=json
-  -g, --progress MODE        Progress: auto, plain, none
+  -g, --progress MODE        Progress: auto, lines, plain, none
   -N, --non-interactive      Timestamped ANSI-free progress
   -q, --no-progress          Disable progress output
 
@@ -491,6 +491,7 @@ EXAMPLES
   %[1]s movie.mkv
   %[1]s -z .
   cat movie.mkv | %[1]s -S -n movie.mkv
+  %[1]s -g lines movie.mkv 2>pretty.log
   %[1]s -N movie.mkv 2>transfer.log
   %[1]s -D https://idoud.cc/AbC123/movie.mkv
 `, name))

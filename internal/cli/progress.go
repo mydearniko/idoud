@@ -28,6 +28,7 @@ const (
 type transferUIConfig struct {
 	enabled     bool
 	plain       bool
+	lines       bool
 	color       bool
 	unicode     bool
 	writer      io.Writer
@@ -46,6 +47,7 @@ type transferUIConfig struct {
 type transferUI struct {
 	enabled bool
 	plain   bool
+	lines   bool
 	color   bool
 	unicode bool
 	writer  io.Writer
@@ -129,9 +131,11 @@ func terminalTransferUIConfig(opts options, kind, source, name string, total, to
 	mode := resolvedTransferProgressMode(opts)
 	enabled := mode != progressModeNone
 	plain := mode == progressModePlain
+	lines := mode == progressModeLines
 	return transferUIConfig{
 		enabled:     enabled,
 		plain:       plain,
+		lines:       lines,
 		color:       enabled && !plain && colorOutputEnabled(),
 		unicode:     strings.TrimSpace(os.Getenv("IDOUD_ASCII")) == "",
 		writer:      os.Stderr,
@@ -155,6 +159,7 @@ func newTransferUI(config transferUIConfig) *transferUI {
 	ui := &transferUI{
 		enabled:    config.enabled,
 		plain:      config.plain,
+		lines:      config.lines,
 		color:      config.color,
 		unicode:    config.unicode,
 		writer:     config.writer,
@@ -188,7 +193,7 @@ func resolvedTransferProgressMode(opts options) progressMode {
 	if mode == "" {
 		mode = progressModeAuto
 	}
-	if mode == progressModePlain || mode == progressModeNone {
+	if mode == progressModeLines || mode == progressModePlain || mode == progressModeNone {
 		return mode
 	}
 	if opts.debug || opts.verbose {
@@ -226,13 +231,14 @@ func (ui *transferUI) start() {
 	if ui == nil || !ui.enabled {
 		return
 	}
+	now := time.Now()
 	if ui.plain {
-		ui.writePlainStart(time.Now())
+		ui.writePlainStart(now)
 		go ui.loop()
 		return
 	}
 	ui.outputMu.Lock()
-	fmt.Fprintf(ui.writer, "%s %s\n", ui.accent("idoud"), ui.dim("· "+ui.kind))
+	ui.writeStyledLineLocked(now, ui.accent("idoud")+" "+ui.dim("· "+ui.kind))
 	source := ui.source
 	if source == "" {
 		source = "file"
@@ -247,7 +253,7 @@ func (ui *transferUI) start() {
 	} else {
 		detail += " · size discovered while streaming"
 	}
-	fmt.Fprintf(ui.writer, "%s  %s\n", ui.dim(source), ui.trimVisible(detail, ui.currentWidth()-utf8.RuneCountInString(source)-3))
+	ui.writeStyledLineLocked(now, ui.dim(source)+"  "+ui.trimVisible(detail, ui.currentWidth()-utf8.RuneCountInString(source)-3))
 	ui.outputMu.Unlock()
 
 	go ui.loop()
@@ -278,7 +284,7 @@ func (ui *transferUI) loopInteractive() {
 		confirmedRate, stalled := rate.observe(now, ui.transferred.Load())
 		inputRate, _ := readRate.observe(now, ui.readBytes.Load())
 		snapshot := ui.snapshot(now, confirmedRate, inputRate, stalled, tick)
-		ui.renderDynamic(ui.formatProgress(snapshot))
+		ui.renderDynamic(now, ui.formatProgress(snapshot))
 		return confirmedRate, inputRate, stalled
 	}
 
@@ -513,8 +519,9 @@ func (ui *transferUI) recordRequestDuration(duration time.Duration) {
 }
 
 func (ui *transferUI) emitInfo(label, detail string) {
+	now := time.Now()
 	if ui.plain {
-		ui.writePlainLine(time.Now(), "info",
+		ui.writePlainLine(now, "info",
 			"label="+plainQuote(label),
 			"detail="+plainQuote(detail),
 		)
@@ -522,8 +529,10 @@ func (ui *transferUI) emitInfo(label, detail string) {
 	}
 	ui.outputMu.Lock()
 	defer ui.outputMu.Unlock()
-	ui.clearDynamicLocked()
-	fmt.Fprintf(ui.writer, "%s  %s\n", ui.dim(label), ui.trimVisible(detail, ui.currentWidth()-utf8.RuneCountInString(label)-3))
+	if !ui.lines {
+		ui.clearDynamicLocked()
+	}
+	ui.writeStyledLineLocked(now, ui.dim(label)+"  "+ui.trimVisible(detail, ui.currentWidth()-utf8.RuneCountInString(label)-3))
 }
 
 func (ui *transferUI) snapshot(now time.Time, rate, readRate float64, stalled bool, tick int) transferProgressSnapshot {
@@ -982,7 +991,9 @@ func (ui *transferUI) finishLine(success bool, lastRate float64, now time.Time) 
 	}
 	ui.outputMu.Lock()
 	defer ui.outputMu.Unlock()
-	ui.clearDynamicLocked()
+	if !ui.lines {
+		ui.clearDynamicLocked()
+	}
 	transferred := snapshot.transferred
 	elapsed := snapshot.elapsed
 	if success {
@@ -996,15 +1007,19 @@ func (ui *transferUI) finishLine(success bool, lastRate float64, now time.Time) 
 		if averageRate > 0 {
 			line += ui.dim(" · ") + ui.accent(formatRateFromPerSecond(averageRate)+" avg")
 		}
-		fmt.Fprintln(ui.writer, "  "+line)
+		ui.writeStyledLineLocked(now, "  "+line)
 		return
 	}
-	fmt.Fprintln(ui.writer, "  "+ui.failure(ui.failureMark()+" transfer stopped")+ui.dim(" · "+formatByteSize(transferred)+" confirmed"))
+	ui.writeStyledLineLocked(now, "  "+ui.failure(ui.failureMark()+" transfer stopped")+ui.dim(" · "+formatByteSize(transferred)+" confirmed"))
 }
 
-func (ui *transferUI) renderDynamic(line string) {
+func (ui *transferUI) renderDynamic(now time.Time, line string) {
 	ui.outputMu.Lock()
 	defer ui.outputMu.Unlock()
+	if ui.lines {
+		ui.writeStyledLineLocked(now, line)
+		return
+	}
 	visible := visibleTerminalWidth(line)
 	padding := ui.lastLineWidth - visible
 	if padding < 0 {
@@ -1012,6 +1027,14 @@ func (ui *transferUI) renderDynamic(line string) {
 	}
 	fmt.Fprintf(ui.writer, "\r%s%s", line, strings.Repeat(" ", padding))
 	ui.lastLineWidth = visible
+}
+
+func (ui *transferUI) writeStyledLineLocked(now time.Time, line string) {
+	if ui.lines {
+		fmt.Fprintf(ui.writer, "%s %s\n", now.Format("2006-01-02T15:04:05.000Z07:00"), line)
+		return
+	}
+	fmt.Fprintln(ui.writer, line)
 }
 
 func (ui *transferUI) clearDynamicLocked() {

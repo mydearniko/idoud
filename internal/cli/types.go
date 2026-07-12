@@ -86,6 +86,7 @@ type progressMode string
 
 const (
 	progressModeAuto  progressMode = "auto"
+	progressModeLines progressMode = "lines"
 	progressModePlain progressMode = "plain"
 	progressModeNone  progressMode = "none"
 )
