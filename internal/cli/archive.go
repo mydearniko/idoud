@@ -3,7 +3,6 @@ package cli
 import (
 	"archive/tar"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -24,29 +23,39 @@ const (
 	archivePrefetchMinFileBytes = int64(64 * 1024)
 	archivePrefetchMaxFileBytes = int64(32 * 1024 * 1024)
 	archivePrefetchMaxBytes     = int64(256 * 1024 * 1024)
+	multiArchiveUploadName      = "archive.tar.lz4"
 )
+
+type archivePathSpec struct {
+	inputPath string
+	absPath   string
+	rootName  string
+}
 
 // openArchiveSource starts a backpressured tar+LZ4 stream. The pipe means no
 // temporary archive is created: compression advances only while the upload
 // pipeline is able to accept more bytes.
 func openArchiveSource(sourcePath string, opts options) (*sourceFile, func(), error) {
-	absPath, err := filepath.Abs(sourcePath)
+	return openArchiveSources([]string{sourcePath}, opts)
+}
+
+func openArchiveSources(sourcePaths []string, opts options) (*sourceFile, func(), error) {
+	expandedPaths, err := expandArchivePathPatterns(sourcePaths, runtime.GOOS == "windows")
 	if err != nil {
-		return nil, nil, fmt.Errorf("resolve archive path failed: %w", err)
+		return nil, nil, err
 	}
-	absPath = filepath.Clean(absPath)
-	info, err := os.Lstat(absPath)
+	paths, err := prepareArchivePaths(expandedPaths)
 	if err != nil {
-		return nil, nil, fmt.Errorf("archive path stat failed: %w", err)
-	}
-	if info.Mode()&os.ModeSocket != 0 {
-		return nil, nil, errors.New("cannot archive a socket")
+		return nil, nil, err
 	}
 
-	rootName := archiveRootName(absPath)
 	uploadName := opts.nameOverride
 	if strings.TrimSpace(uploadName) == "" {
-		uploadName = sanitizeFilename(rootName) + ".tar.lz4"
+		if len(paths) == 1 {
+			uploadName = sanitizeFilename(paths[0].rootName) + ".tar.lz4"
+		} else {
+			uploadName = multiArchiveUploadName
+		}
 	} else {
 		uploadName = sanitizeFilename(uploadName)
 		if !filenameHasExtension(uploadName) {
@@ -65,9 +74,13 @@ func openArchiveSource(sourcePath string, opts options) (*sourceFile, func(), er
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		err := writeTarLZ4(archiveCtx, writer, absPath, rootName)
+		err := writeTarLZ4Paths(archiveCtx, writer, paths)
 		_ = writer.CloseWithError(err)
 	}()
+	displayName := paths[0].inputPath
+	if len(paths) > 1 {
+		displayName = fmt.Sprintf("%d paths", len(paths))
+	}
 
 	src := &sourceFile{
 		stream:                  reader,
@@ -79,7 +92,7 @@ func openArchiveSource(sourcePath string, opts options) (*sourceFile, func(), er
 		uploadURLParsed:         uploadParsed[0],
 		uploadURLs:              uploadURLs,
 		uploadURLParsedByServer: uploadParsed,
-		displayName:             sourcePath,
+		displayName:             displayName,
 		archive:                 true,
 	}
 
@@ -92,6 +105,70 @@ func openArchiveSource(sourcePath string, opts options) (*sourceFile, func(), er
 		})
 	}
 	return src, cleanup, nil
+}
+
+func expandArchivePathPatterns(sourcePaths []string, expandWildcards bool) ([]string, error) {
+	if !expandWildcards {
+		return append([]string(nil), sourcePaths...), nil
+	}
+
+	expanded := make([]string, 0, len(sourcePaths))
+	for _, sourcePath := range sourcePaths {
+		// Unix shells normally expand these before invoking idoud. Native
+		// Windows shells may pass them through, and '*'/'?' cannot be literal
+		// Windows filename characters, so expanding them here is unambiguous.
+		if !strings.ContainsAny(sourcePath, "*?") {
+			expanded = append(expanded, sourcePath)
+			continue
+		}
+		matches, err := filepath.Glob(sourcePath)
+		if err != nil {
+			return nil, fmt.Errorf("invalid archive path pattern %q: %w", sourcePath, err)
+		}
+		if len(matches) == 0 {
+			// Preserve the original token so the normal stat error identifies the
+			// unmatched operand instead of silently creating an empty archive.
+			expanded = append(expanded, sourcePath)
+			continue
+		}
+		expanded = append(expanded, matches...)
+	}
+	return expanded, nil
+}
+
+func prepareArchivePaths(sourcePaths []string) ([]archivePathSpec, error) {
+	if len(sourcePaths) == 0 {
+		return nil, errMissingInput
+	}
+
+	paths := make([]archivePathSpec, 0, len(sourcePaths))
+	rootOwners := make(map[string]string, len(sourcePaths))
+	for _, sourcePath := range sourcePaths {
+		absPath, err := filepath.Abs(sourcePath)
+		if err != nil {
+			return nil, fmt.Errorf("resolve archive path %q failed: %w", sourcePath, err)
+		}
+		absPath = filepath.Clean(absPath)
+		info, err := os.Lstat(absPath)
+		if err != nil {
+			return nil, fmt.Errorf("archive path stat failed for %q: %w", sourcePath, err)
+		}
+		if info.Mode()&os.ModeSocket != 0 {
+			return nil, fmt.Errorf("cannot archive socket %q", sourcePath)
+		}
+
+		rootName := archiveRootName(absPath)
+		if previous, exists := rootOwners[rootName]; exists {
+			return nil, fmt.Errorf("archive paths %q and %q both map to top-level entry %q", previous, sourcePath, rootName)
+		}
+		rootOwners[rootName] = sourcePath
+		paths = append(paths, archivePathSpec{
+			inputPath: sourcePath,
+			absPath:   absPath,
+			rootName:  rootName,
+		})
+	}
+	return paths, nil
 }
 
 func archiveRootName(absPath string) string {
@@ -137,8 +214,15 @@ func waitForArchiveProducer(done <-chan struct{}, grace time.Duration) {
 }
 
 func writeTarLZ4(ctx context.Context, dst io.Writer, sourcePath, rootName string) error {
+	return writeTarLZ4Paths(ctx, dst, []archivePathSpec{{absPath: sourcePath, rootName: rootName}})
+}
+
+func writeTarLZ4Paths(ctx context.Context, dst io.Writer, paths []archivePathSpec) error {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if len(paths) == 0 {
+		return errMissingInput
 	}
 	lz4Writer := lz4.NewWriter(dst)
 	if err := lz4Writer.Apply(
@@ -152,7 +236,7 @@ func writeTarLZ4(ctx context.Context, dst io.Writer, sourcePath, rootName string
 	}
 
 	tarWriter := tar.NewWriter(lz4Writer)
-	walkErr := writeTarPath(ctx, tarWriter, sourcePath, rootName)
+	walkErr := writeTarPaths(ctx, tarWriter, paths)
 	if walkErr != nil {
 		// Concurrent LZ4 may still have compressed blocks queued. Drain those
 		// asynchronously after cancellation so CLI shutdown never waits for the
@@ -255,16 +339,30 @@ func automaticArchivePrefetchPolicy(available int64, gomaxprocs int) archivePref
 }
 
 func writeTarPath(ctx context.Context, tarWriter *tar.Writer, sourcePath, rootName string) error {
+	return writeTarPaths(ctx, tarWriter, []archivePathSpec{{absPath: sourcePath, rootName: rootName}})
+}
+
+func writeTarPaths(ctx context.Context, tarWriter *tar.Writer, paths []archivePathSpec) error {
+	if len(paths) == 0 {
+		return errMissingInput
+	}
 	policy := automaticArchivePrefetchPolicy(streamMemoryAvailable(), runtime.GOMAXPROCS(0))
 	if policy.workers <= 0 || policy.maxFileBytes < archivePrefetchMinFileBytes {
-		return writeTarPathSequential(ctx, tarWriter, sourcePath, rootName)
+		return writeTarPathsSequential(ctx, tarWriter, paths)
 	}
-	return writeTarPathPrefetched(ctx, tarWriter, sourcePath, rootName, policy)
+	return writeTarPathsPrefetched(ctx, tarWriter, paths, policy)
 }
 
 func writeTarPathPrefetched(ctx context.Context, tarWriter *tar.Writer, sourcePath, rootName string, policy archivePrefetchPolicy) error {
+	return writeTarPathsPrefetched(ctx, tarWriter, []archivePathSpec{{absPath: sourcePath, rootName: rootName}}, policy)
+}
+
+func writeTarPathsPrefetched(ctx context.Context, tarWriter *tar.Writer, paths []archivePathSpec, policy archivePrefetchPolicy) error {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if len(paths) == 0 {
+		return errMissingInput
 	}
 	prefetchCtx, cancel := context.WithCancel(ctx)
 
@@ -282,7 +380,7 @@ func writeTarPathPrefetched(ctx context.Context, tarWriter *tar.Writer, sourcePa
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		err := walkArchiveEntries(prefetchCtx, sourcePath, rootName, policy.maxFileBytes, entries, jobs)
+		err := walkArchivePaths(prefetchCtx, paths, policy.maxFileBytes, entries, jobs)
 		close(jobs)
 		close(entries)
 		walkResult <- err
@@ -395,6 +493,15 @@ func buildArchiveHeader(sourcePath, rootName, filePath string, entry fs.DirEntry
 	return header, info.Mode().IsRegular(), nil
 }
 
+func walkArchivePaths(ctx context.Context, paths []archivePathSpec, maxPrefetchBytes int64, entries chan<- archiveOrderedEntry, jobs chan<- archivePrefetchJob) error {
+	for _, archivePath := range paths {
+		if err := walkArchiveEntries(ctx, archivePath.absPath, archivePath.rootName, maxPrefetchBytes, entries, jobs); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func walkArchiveEntries(ctx context.Context, sourcePath, rootName string, maxPrefetchBytes int64, entries chan<- archiveOrderedEntry, jobs chan<- archivePrefetchJob) error {
 	return filepath.WalkDir(sourcePath, func(filePath string, entry fs.DirEntry, walkErr error) error {
 		if err := ctx.Err(); err != nil {
@@ -486,7 +593,23 @@ func writeArchiveFileDirect(ctx context.Context, tarWriter *tar.Writer, filePath
 }
 
 func writeTarPathSequential(ctx context.Context, tarWriter *tar.Writer, sourcePath, rootName string) error {
+	return writeTarPathsSequential(ctx, tarWriter, []archivePathSpec{{absPath: sourcePath, rootName: rootName}})
+}
+
+func writeTarPathsSequential(ctx context.Context, tarWriter *tar.Writer, paths []archivePathSpec) error {
+	if len(paths) == 0 {
+		return errMissingInput
+	}
 	copyBuffer := make([]byte, archiveCopyBufferSize)
+	for _, archivePath := range paths {
+		if err := writeTarPathSequentialWithBuffer(ctx, tarWriter, archivePath.absPath, archivePath.rootName, copyBuffer); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeTarPathSequentialWithBuffer(ctx context.Context, tarWriter *tar.Writer, sourcePath, rootName string, copyBuffer []byte) error {
 	return filepath.WalkDir(sourcePath, func(filePath string, entry fs.DirEntry, walkErr error) error {
 		if err := ctx.Err(); err != nil {
 			return err

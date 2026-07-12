@@ -36,6 +36,48 @@ func TestParseFlagsArchiveAliases(t *testing.T) {
 	}
 }
 
+func TestParseFlagsArchiveAcceptsMultiplePaths(t *testing.T) {
+	opts, filePath, err := parseFlags([]string{"-z", "alpha.txt", "beta", "--name", "selected"})
+	if err != nil {
+		t.Fatalf("parseFlags returned error: %v", err)
+	}
+	if filePath != "alpha.txt" {
+		t.Fatalf("filePath=%q, want first archive path", filePath)
+	}
+	if len(opts.archivePaths) != 2 || opts.archivePaths[0] != "alpha.txt" || opts.archivePaths[1] != "beta" {
+		t.Fatalf("archivePaths=%q, want [alpha.txt beta]", opts.archivePaths)
+	}
+	if opts.nameOverride != "selected" {
+		t.Fatalf("nameOverride=%q, want selected", opts.nameOverride)
+	}
+}
+
+func TestExpandArchivePathPatternsForWindowsShells(t *testing.T) {
+	parent := t.TempDir()
+	for _, name := range []string{"beta.txt", "alpha.txt"} {
+		if err := os.WriteFile(filepath.Join(parent, name), []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pattern := filepath.Join(parent, "*.txt")
+	expanded, err := expandArchivePathPatterns([]string{pattern}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{filepath.Join(parent, "alpha.txt"), filepath.Join(parent, "beta.txt")}
+	if len(expanded) != len(want) || expanded[0] != want[0] || expanded[1] != want[1] {
+		t.Fatalf("expanded=%q, want %q", expanded, want)
+	}
+
+	unexpanded, err := expandArchivePathPatterns([]string{pattern}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unexpanded) != 1 || unexpanded[0] != pattern {
+		t.Fatalf("unexpanded=%q, want literal pattern %q", unexpanded, pattern)
+	}
+}
+
 func TestParseFlagsArchiveRejectsIncompatibleModes(t *testing.T) {
 	tests := [][]string{
 		{"-z", "--stdin", "."},
@@ -125,6 +167,126 @@ func TestArchiveSourceStreamsCompatibleTarLZ4(t *testing.T) {
 	}
 }
 
+func TestArchiveSourceStreamsMultiplePathsInArgumentOrder(t *testing.T) {
+	parent := t.TempDir()
+	firstPath := filepath.Join(parent, "alpha.txt")
+	secondPath := filepath.Join(parent, "beta")
+	if err := os.WriteFile(firstPath, []byte("alpha payload\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(secondPath, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(secondPath, "child.bin"), []byte("beta payload\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	opts, filePath, err := parseFlags([]string{"-z", firstPath, secondPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, cleanup, err := openSource(filePath, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if src.uploadName != multiArchiveUploadName {
+		t.Fatalf("uploadName=%q, want %q", src.uploadName, multiArchiveUploadName)
+	}
+
+	compressed, err := io.ReadAll(src.stream)
+	if err != nil {
+		t.Fatalf("read archive stream: %v", err)
+	}
+	entries := readTarLZ4EntryList(t, compressed)
+	wantNames := []string{"alpha.txt", "beta/", "beta/child.bin"}
+	if len(entries) != len(wantNames) {
+		t.Fatalf("archive entries=%d, want %d: %v", len(entries), len(wantNames), archiveEntryNames(entries))
+	}
+	for idx, want := range wantNames {
+		if entries[idx].header.Name != want {
+			t.Fatalf("entry[%d]=%q, want %q (all=%v)", idx, entries[idx].header.Name, want, archiveEntryNames(entries))
+		}
+	}
+	if got := string(entries[0].body); got != "alpha payload\n" {
+		t.Fatalf("alpha body=%q", got)
+	}
+	if got := string(entries[2].body); got != "beta payload\n" {
+		t.Fatalf("beta body=%q", got)
+	}
+}
+
+func TestArchiveSourceMultiplePathsHonorsExplicitName(t *testing.T) {
+	parent := t.TempDir()
+	firstPath := filepath.Join(parent, "one")
+	secondPath := filepath.Join(parent, "two")
+	if err := os.WriteFile(firstPath, []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secondPath, []byte("2"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	opts, filePath, err := parseFlags([]string{"-z", firstPath, secondPath, "--name", "bundle"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, cleanup, err := openSource(filePath, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if src.uploadName != "bundle.tar.lz4" {
+		t.Fatalf("uploadName=%q, want bundle.tar.lz4", src.uploadName)
+	}
+	if _, err := io.Copy(io.Discard, src.stream); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestArchiveSourceRejectsCollidingTopLevelNames(t *testing.T) {
+	parent := t.TempDir()
+	firstPath := filepath.Join(parent, "one", "same.txt")
+	secondPath := filepath.Join(parent, "two", "same.txt")
+	if err := os.MkdirAll(filepath.Dir(firstPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(secondPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(firstPath, []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secondPath, []byte("2"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	opts, filePath, err := parseFlags([]string{"-z", firstPath, secondPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := openSource(filePath, opts); err == nil || !strings.Contains(err.Error(), "both map to top-level entry") {
+		t.Fatalf("openSource error=%v, want top-level collision", err)
+	}
+}
+
+func TestArchiveSourceValidatesEveryPathBeforeStreaming(t *testing.T) {
+	parent := t.TempDir()
+	firstPath := filepath.Join(parent, "present.txt")
+	if err := os.WriteFile(firstPath, []byte("present"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	missingPath := filepath.Join(parent, "missing.txt")
+
+	opts, filePath, err := parseFlags([]string{"-z", firstPath, missingPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := openSource(filePath, opts); err == nil || !strings.Contains(err.Error(), missingPath) {
+		t.Fatalf("openSource error=%v, want missing second path", err)
+	}
+}
+
 func TestAutomaticArchivePrefetchPolicyIsResourceBounded(t *testing.T) {
 	if got := automaticArchivePrefetchPolicy(63*1024*1024, 64); got.workers != 0 {
 		t.Fatalf("very-low-memory policy=%+v, want sequential mode", got)
@@ -180,6 +342,46 @@ func TestPrefetchedTarMatchesSequentialTar(t *testing.T) {
 	prefetched := build(true)
 	if !bytes.Equal(prefetched, sequential) {
 		t.Fatalf("prefetched tar differs from sequential tar: got %d bytes, want %d", len(prefetched), len(sequential))
+	}
+}
+
+func TestPrefetchedMultiPathTarMatchesSequentialTar(t *testing.T) {
+	parent := t.TempDir()
+	firstPath := filepath.Join(parent, "first.bin")
+	secondPath := filepath.Join(parent, "second.bin")
+	if err := os.WriteFile(firstPath, bytes.Repeat([]byte("first-prefetch-data"), 8192), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secondPath, bytes.Repeat([]byte("second-prefetch-data"), 8192), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := prepareArchivePaths([]string{secondPath, firstPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	build := func(prefetched bool) []byte {
+		t.Helper()
+		var output bytes.Buffer
+		writer := tar.NewWriter(&output)
+		var err error
+		if prefetched {
+			err = writeTarPathsPrefetched(t.Context(), writer, paths, archivePrefetchPolicy{workers: 2, maxFileBytes: 256 * 1024})
+		} else {
+			err = writeTarPathsSequential(t.Context(), writer, paths)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return output.Bytes()
+	}
+	sequential := build(false)
+	prefetched := build(true)
+	if !bytes.Equal(prefetched, sequential) {
+		t.Fatalf("prefetched multi-path tar differs from sequential tar: got %d bytes, want %d", len(prefetched), len(sequential))
 	}
 }
 
@@ -333,8 +535,18 @@ func TestArchiveSourceRejectsMissingPath(t *testing.T) {
 
 func readTarLZ4Entries(t *testing.T, compressed []byte) map[string]*archiveTestEntry {
 	t.Helper()
+	list := readTarLZ4EntryList(t, compressed)
+	entries := make(map[string]*archiveTestEntry, len(list))
+	for _, entry := range list {
+		entries[entry.header.Name] = entry
+	}
+	return entries
+}
+
+func readTarLZ4EntryList(t *testing.T, compressed []byte) []*archiveTestEntry {
+	t.Helper()
 	reader := tar.NewReader(lz4.NewReader(bytes.NewReader(compressed)))
-	entries := make(map[string]*archiveTestEntry)
+	entries := make([]*archiveTestEntry, 0)
 	for {
 		header, err := reader.Next()
 		if errors.Is(err, io.EOF) {
@@ -348,7 +560,17 @@ func readTarLZ4Entries(t *testing.T, compressed []byte) map[string]*archiveTestE
 			t.Fatalf("read tar body %q: %v", header.Name, err)
 		}
 		clone := *header
-		entries[header.Name] = &archiveTestEntry{header: &clone, body: body}
+		entries = append(entries, &archiveTestEntry{header: &clone, body: body})
 	}
 	return entries
+}
+
+func archiveEntryNames(entries []*archiveTestEntry) []string {
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry != nil && entry.header != nil {
+			names = append(names, entry.header.Name)
+		}
+	}
+	return names
 }

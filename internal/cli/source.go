@@ -13,7 +13,11 @@ import (
 
 func openSource(filePath string, opts options) (*sourceFile, func(), error) {
 	if opts.archive {
-		return openArchiveSource(filePath, opts)
+		paths := opts.archivePaths
+		if len(paths) == 0 {
+			paths = []string{filePath}
+		}
+		return openArchiveSources(paths, opts)
 	}
 	if opts.stdin {
 		return openStdinSource(os.Stdin, opts)

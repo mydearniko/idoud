@@ -99,6 +99,7 @@ type options struct {
 	forcedIPs             []string
 	stdin                 bool
 	archive               bool
+	archivePaths          []string
 	stdinSize             int64
 	nameOverride          string
 	chunkSize             int64

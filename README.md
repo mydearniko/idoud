@@ -32,6 +32,10 @@ idoud archive.zip
 # This names the upload after the selected path, for example project.tar.lz4.
 idoud -z ./project
 
+# Archive every shell-expanded path in one stream. Multiple paths default to
+# archive.tar.lz4; use --name to choose another upload name.
+idoud -z *
+
 # Piped stdin is detected automatically, including its file extension.
 cat archive.zip | idoud
 
@@ -88,14 +92,20 @@ its existing `--verbose` meaning.
   or dropping stream bytes. Compound tar compression is recognized for Gzip,
   Bzip2, and LZ4 (for example `.tar.lz4`); unknown binary data safely falls
   back to `.bin`. Supplying an extension skips inspection entirely.
-- `-z`/`--archive` streams a standards-compatible `.tar.lz4` archive directly
-  into the uploader without creating a temporary archive. Absolute source paths
-  are never stored in the tar, symlinks are preserved rather than followed, and
-  LZ4 compression runs concurrently across the available CPU capacity. An
-  ordered read-ahead stage overlaps independent file reads while preserving
-  byte-identical tar order; its worker count and hard RAM bound scale down from
-  live OS/container headroom, and very-low-memory systems use the sequential
-  path.
+- `-z`/`--archive` accepts one or more paths and streams one standards-compatible
+  `.tar.lz4` archive directly into the uploader without creating a temporary
+  archive. This includes commands such as `idoud -z *`; Unix shells expand the
+  operands before launch, while the CLI expands `*` and `?` on Windows when the
+  native shell passes them through. Operands become top-level tar entries in
+  argument order. A single operand names the upload after that path, while
+  multiple operands default to `archive.tar.lz4`.
+  Absolute source paths are never stored in the tar, symlinks are preserved
+  rather than followed, and conflicting top-level names are rejected before an
+  upload starts. LZ4 compression runs concurrently across the available CPU
+  capacity. One ordered read-ahead stage overlaps independent file reads across
+  all operands while preserving byte-identical tar order; its worker count and
+  hard RAM bound scale down from live OS/container headroom, and very-low-memory
+  systems use the sequential path.
 - Diagnostics go to stderr. Successful machine-readable output stays isolated
   on stdout.
 - Interactive terminals get a compact idoud-styled transfer display on stderr.

@@ -272,6 +272,10 @@ func parseFlagsWithAutomaticStdin(args []string, automaticStdin bool) (options, 
 	if fs.NArg() == 0 {
 		return options{}, "", errMissingInput
 	}
+	if opts.archive {
+		opts.archivePaths = append([]string(nil), fs.Args()...)
+		return opts, opts.archivePaths[0], nil
+	}
 	if fs.NArg() > 1 {
 		return options{}, "", fmt.Errorf("unexpected extra arguments: %s", strings.Join(fs.Args()[1:], ", "))
 	}
@@ -329,7 +333,7 @@ func registerFlags(fs *flag.FlagSet, opts *options, chunkSizeRaw, stdinSizeRaw, 
 	fs.StringVar(&opts.serverURL, "s", defaultServerURL, "alias for --server")
 	fs.BoolVar(&opts.stdin, "stdin", false, "read file data from stdin")
 	fs.BoolVar(&opts.stdin, "S", false, "alias for --stdin")
-	fs.BoolVar(&opts.archive, "archive", false, "stream a path as a tar archive compressed with LZ4")
+	fs.BoolVar(&opts.archive, "archive", false, "stream one or more paths as a tar archive compressed with LZ4")
 	fs.BoolVar(&opts.archive, "z", false, "alias for --archive")
 	fs.StringVar(stdinSizeRaw, "stdin-size", "", "stdin size hint for stdin uploads")
 	fs.StringVar(stdinSizeRaw, "L", "", "alias for --stdin-size")
@@ -473,12 +477,12 @@ USAGE
   %[1]s [options] FILE
   command | %[1]s [-n NAME] [options]
   %[1]s -S [-n NAME] [options]
-  %[1]s -z PATH [options]
+  %[1]s -z PATH... [options]
   %[1]s -D URL_OR_ID [options]
   %[1]s --update
 
 INPUT
-  -z, --archive              Stream PATH as a .tar.lz4 archive
+  -z, --archive              Stream one or more PATHs as a .tar.lz4 archive
   -S, --stdin                Read stdin explicitly (piped stdin is automatic)
   -n, --name NAME            Override name; detect extension when missing
   -L, --stdin-size SIZE      Provide the expected stdin size
@@ -518,6 +522,7 @@ OTHER
 EXAMPLES
   %[1]s movie.mkv
   %[1]s -z .
+  %[1]s -z *
   cat movie.mkv | %[1]s
   cat archive.tar.lz4 | %[1]s -n backup
   %[1]s -g lines movie.mkv 2>pretty.log
