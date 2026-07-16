@@ -203,12 +203,17 @@ func newURLCapture(src *sourceFile) *urlCapture {
 }
 
 type requestError struct {
-	status   int
-	body     string
-	cause    error
-	route    string
-	fallback bool
-	master   bool
+	status        int
+	body          string
+	cause         error
+	route         string
+	fallback      bool
+	master        bool
+	retryAfter    time.Duration
+	retryAfterSet bool
+	backpressure  bool
+	rateBucket    string
+	rateScope     string
 }
 
 type chunkAttemptResult struct {
@@ -256,6 +261,7 @@ type uploader struct {
 	routeInit       sync.Once
 	routes          *routeCircuitSet
 	routeLimits     *routeLimiterSet
+	cooldowns       *uploadCooldownSet
 	streamAdaptive  *adaptiveStreamController
 }
 

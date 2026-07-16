@@ -55,7 +55,8 @@ func (u *uploader) prepareUpload(ctx context.Context, src *sourceFile) error {
 		if attempt >= u.opts.retries {
 			delay = 10 * time.Second
 		}
-		u.logf("upload prepare retry attempt=%d status=%d delay=%s err=%v", attempt+1, reqErr.status, delay, err)
+		delay = retryDelayForError(delay, err)
+		u.logf("upload prepare retry attempt=%d status=%d delay=%s retry_after=%s err=%v", attempt+1, reqErr.status, delay, reqErr.retryAfter, err)
 		if u.ui != nil {
 			u.ui.retried()
 		}
@@ -133,9 +134,14 @@ func (u *uploader) prepareUploadOnce(ctx context.Context, src *sourceFile) error
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 	bodyText := strings.TrimSpace(string(respBody))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		retryAfter, retryAfterSet := retryAfterFromResponse(resp, time.Now())
 		return fmt.Errorf("upload prepare failed: %w", &requestError{
-			status: resp.StatusCode,
-			body:   publicUploadPrepareErrorBody(bodyText),
+			status:        resp.StatusCode,
+			body:          publicUploadPrepareErrorBody(bodyText),
+			retryAfter:    retryAfter,
+			retryAfterSet: retryAfterSet,
+			rateBucket:    uploadCooldownHeaderValue(resp.Header, "X-RateLimit-Bucket"),
+			rateScope:     uploadCooldownHeaderValue(resp.Header, "X-RateLimit-Scope"),
 		})
 	}
 	if bodyText == "" {

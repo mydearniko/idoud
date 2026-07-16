@@ -170,28 +170,48 @@ readLoop:
 		remaining -= expected
 	}
 
+	// EOF (or the declared stdin size) tells us which request is final. Start
+	// that provider confirmation immediately while older non-final requests are
+	// still completing; only finalization itself must wait for every worker.
+	var finalErrCh chan error
+	if finalTask != nil {
+		u.debugMarkStdinClosed(false)
+		task := *finalTask
+		finalTask = nil
+		finalErrCh = make(chan error, 1)
+		go func() {
+			err := u.uploadPreparedChunkWithRetry(ctx, src, task, true, urls)
+			pool.release(task.buf)
+			if err != nil {
+				cancel()
+			}
+			finalErrCh <- err
+		}()
+	}
+
 	if workers > 0 {
 		close(jobs)
 		wg.Wait()
 	}
+	var finalErr error
+	if finalErrCh != nil {
+		finalErr = <-finalErrCh
+	}
 
+	var workerErr error
 	select {
 	case err := <-errCh:
-		return "", err
+		workerErr = err
 	default:
+	}
+	if err := preferredConcurrentUploadError(finalErr, workerErr); err != nil {
+		return "", err
 	}
 	if ctx.Err() != nil {
 		return "", ctx.Err()
 	}
-	if finalTask == nil {
+	if finalErrCh == nil {
 		return "", errors.New("final chunk is missing")
-	}
-	u.debugMarkStdinClosed(false)
-
-	finalErr := u.uploadPreparedChunkWithRetry(ctx, src, *finalTask, true, urls)
-	pool.release(finalTask.buf)
-	if finalErr != nil {
-		return "", finalErr
 	}
 
 	finalURL := urls.get()
@@ -254,11 +274,8 @@ func (u *uploader) uploadPreparedChunkOnceWithContentRange(
 	if finalChunk {
 		timeout = u.opts.finalChunkTimeout
 	}
-	reqCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
 	reader := bytes.NewReader(chunk.buf[:chunk.size])
-	return u.uploadPUT(reqCtx, src, reader, int64(chunk.size), contentRange, chunk.index, finalChunk, setFinalChunkHeader, attempt)
+	return u.uploadPUTWithTimeout(ctx, timeout, src, reader, int64(chunk.size), contentRange, chunk.index, finalChunk, setFinalChunkHeader, attempt)
 }
 
 // stdinScatterResult carries a chunk from the scatter-read goroutine to the
@@ -459,9 +476,10 @@ func (u *uploader) uploadUnknownSizeStreamChunked(ctx context.Context, src *sour
 		go workerFn()
 	}
 
-	// Dispatch loop: consume scatter-read results, forward non-final chunks
-	// to workers, hold the final chunk for special handling.
-	var finalChunk *preparedChunk
+	// Dispatch loop: consume scatter-read results and forward non-final chunks
+	// to workers. As soon as EOF identifies the final chunk, start it alongside
+	// the outstanding requests instead of adding one serial provider RTT.
+	var finalErrCh chan error
 	var readErr error
 
 drainLoop:
@@ -476,12 +494,16 @@ drainLoop:
 			break drainLoop
 		}
 		if res.final {
-			finalChunk = &preparedChunk{
-				index: res.chunk.index,
-				start: res.chunk.start,
-				size:  res.chunk.size,
-				buf:   res.chunk.buf,
-			}
+			task := res.chunk
+			finalErrCh = make(chan error, 1)
+			go func() {
+				err := u.uploadPreparedChunkUnknownWithRetry(ctx, src, task, true, urls)
+				putBuf(task.buf)
+				if err != nil {
+					cancel()
+				}
+				finalErrCh <- err
+			}()
 			break drainLoop
 		}
 		queueWaitStart := time.Now()
@@ -504,30 +526,32 @@ drainLoop:
 
 	close(jobs)
 	wg.Wait()
+	for task := range jobs {
+		putBuf(task.buf)
+	}
+	var finalErr error
+	if finalErrCh != nil {
+		finalErr = <-finalErrCh
+	}
 
+	var workerErr error
 	select {
 	case err := <-errCh:
-		if finalChunk != nil {
-			putBuf(finalChunk.buf)
-		}
-		return "", err
+		workerErr = err
 	default:
 	}
+	if err := preferredConcurrentUploadError(finalErr, workerErr); err != nil {
+		return "", err
+	}
 	if readErr != nil {
-		if finalChunk != nil {
-			putBuf(finalChunk.buf)
-		}
 		return "", readErr
 	}
 	if ctx.Err() != nil {
-		if finalChunk != nil {
-			putBuf(finalChunk.buf)
-		}
 		return "", ctx.Err()
 	}
 
 	// Handle empty stdin.
-	if finalChunk == nil {
+	if finalErrCh == nil {
 		if emptyErr := u.uploadEmptyWithRetry(ctx, src, urls); emptyErr != nil {
 			return "", emptyErr
 		}
@@ -538,17 +562,25 @@ drainLoop:
 		return finalURL, nil
 	}
 
-	// Upload the final chunk.
-	finalErr := u.uploadPreparedChunkUnknownWithRetry(ctx, src, *finalChunk, true, urls)
-	putBuf(finalChunk.buf)
-	if finalErr != nil {
-		return "", finalErr
-	}
-
 	finalURL := urls.get()
 	if err := u.finalizeIfNeeded(ctx, finalURL); err != nil {
 		return "", err
 	}
 	u.logf("upload(stream-unknown) complete url=%s", finalURL)
 	return finalURL, nil
+}
+
+func preferredConcurrentUploadError(finalErr, workerErr error) error {
+	// Cancellation from one side is normally a consequence of the useful error
+	// from the other side. Preserve that useful cause for diagnostics.
+	if finalErr != nil && !isContextErr(finalErr) {
+		return finalErr
+	}
+	if workerErr != nil && !isContextErr(workerErr) {
+		return workerErr
+	}
+	if finalErr != nil {
+		return finalErr
+	}
+	return workerErr
 }

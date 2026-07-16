@@ -7,8 +7,12 @@ Small, static command-line client for uploading to and downloading from idoud.
 Linux and macOS:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mydearniko/idoud/main/install.sh | sh
+curl -fsSL https://idoud.cc/s | sh
 ```
+
+This is a short redirect to this repository's canonical `install.sh`. Run the
+same command again at any time to install the newest GitHub release, including
+when the installed CLI is too old to update itself.
 
 Windows PowerShell:
 
@@ -80,11 +84,16 @@ its existing `--verbose` meaning.
   requests allow two minutes for durable provider confirmation. Change these
   windows with `--resume-timeout` and `--request-timeout`.
 - Standard-input and `-z` uploads keep complete retryable chunks in RAM only.
-  Their window starts at up to 64 requests on machines with ample headroom,
-  allocates buffers lazily, and grows after real confirmations when the source,
-  route plan, and live host/container memory permit it. A 256 MiB cap resolves
-  to the established 24-request window; smaller machines automatically use a
-  still smaller bounded window. `-M`/`--stream-memory` sets an explicit cap.
+  Their data window starts at up to 64 requests on machines with ample
+  headroom, allocates buffers lazily, and grows after real confirmations when
+  the source, route plan, and live host/container memory permit it. Before the
+  unknown stream has produced multiple parts, connection warmup opens one
+  initial payload lane while active routes race in parallel; slow route probes
+  rejoin in the background instead of blocking that first healthy route. The
+  remaining lanes open concurrently as useful parts materialize. A 256 MiB cap
+  resolves to the established 24-request window;
+  smaller machines automatically use a still smaller bounded window.
+  `-M`/`--stream-memory` sets an explicit cap.
 - Piped stdin is an automatic upload input, so `producer | idoud` needs no
   stdin flag or filename. When the name is automatic—or `-n`/`--name` is
   extensionless—the CLI incrementally inspects a replayable in-memory prefix,
@@ -121,6 +130,17 @@ its existing `--verbose` meaning.
   Redirected stderr remains quiet in the default `auto` mode, `--no-progress`
   disables the display, and `NO_COLOR` preserves the layout without terminal
   colors.
+- Windows Terminal v1.6+ automatically mirrors interactive transfer state into
+  its tab progress ring and Windows taskbar through OSC 9;4, for both native
+  Windows and WSL sessions. Planning, connection setup, and unknown-size
+  streams are indeterminate; known uploads advance smoothly with sent bytes but
+  reserve 100% for provider-confirmed storage; downloads use bytes written to
+  disk; retry/stall states are warnings; failures report the error state; and
+  every completion clears the terminal state. `IDOUD_TAB_PROGRESS=on` enables
+  the protocol on another compatible interactive TTY when automatic Windows
+  Terminal detection is unavailable, while `off` disables it. Redirected
+  output, `--progress=plain`, and `--no-progress` never receive these terminal
+  control sequences.
 - `--progress=lines` (or `-g lines`) keeps the interactive spinner, progress
   bar, rate, ETA, part counts, and completion layout, but writes every refresh
   as a separate timestamped line without cursor-control sequences. Unchanged

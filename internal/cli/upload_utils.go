@@ -284,6 +284,15 @@ func (p *uploadSubdomainPool) acquire() int {
 	return selected
 }
 
+func (p *uploadSubdomainPool) reset() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.next = p.minIndex
+	p.mu.Unlock()
+}
+
 func shouldUseBrowserSubdomains(base *url.URL, disabled bool) bool {
 	if disabled || base == nil {
 		return false
@@ -323,16 +332,41 @@ func (u *uploader) routeUploadURL(rawURL string) string {
 }
 
 func (u *uploader) warmConnections(ctx context.Context, src *sourceFile, count int) {
-	if count <= 0 || src == nil {
+	if src == nil || !uploadHasPendingPayload(u, src) {
 		return
 	}
-	if count > 128 {
-		count = 128
-	}
+	// Route probes already establish and retain one reusable connection to each
+	// direct upload origin. Additional direct-route health requests made startup
+	// a full barrier without adding useful capacity: the real PUTs can open the
+	// remaining HTTP/1.1 connections concurrently with their request bodies.
+	// Legacy numbered subdomains are different because the route probe targets
+	// the base origin, so retain their explicit per-payload-lane warmup below.
 	u.probeUploadRoutes(ctx, src)
+	if count <= 0 || u == nil || u.subdomains == nil {
+		return
+	}
+	chunkIndexes := uploadWarmChunkIndexes(u, src, count)
+	if len(chunkIndexes) > 128 {
+		chunkIndexes = chunkIndexes[:128]
+	}
+	if len(chunkIndexes) == 0 {
+		return
+	}
+	// Legacy uploads can still use numbered idoud.cc hosts. Assign those hosts
+	// deterministically before starting goroutines, then rewind the pool after
+	// warmup so payload part N uses the same client/host pair warmed for part N.
+	// Prepared multi-route plans disable this pool and use their direct routes.
+	if u != nil && u.subdomains != nil {
+		defer u.subdomains.reset()
+	}
+	// Payload requests use the next available body lane, not chunkIndex modulo
+	// the client count. Snapshot the pre-transfer lane order without changing it
+	// so a resumed upload with one missing chunk warms the exact connection pool
+	// identity that its next payload request will acquire.
+	bodyLanes := uploadWarmBodyLanes(u)
 	var wg sync.WaitGroup
-	for i := 0; i < count; i++ {
-		selected, err := u.selectUploadRoute(src, int64(i))
+	for ordinal, chunkIndex := range chunkIndexes {
+		selected, err := u.selectUploadRoute(src, chunkIndex)
 		target := selected.parsedURL
 		if err != nil || target == nil || target.Scheme == "" || target.Host == "" {
 			continue
@@ -343,20 +377,26 @@ func (u *uploader) warmConnections(ctx context.Context, src *sourceFile, count i
 		warmTarget.RawQuery = ""
 		warmTarget.Fragment = ""
 		warmURL := warmTarget.String()
+		requestURL := warmURL
+		if u != nil && u.subdomains != nil {
+			requestURL = u.routeUploadURL(warmURL)
+		}
+		client := u.clientForChunk(chunkIndex)
+		if ordinal < len(bodyLanes) {
+			client = u.clientForUpload(chunkIndex, &uploadBodyLease{connectionLane: bodyLanes[ordinal]})
+		}
+		if client == nil {
+			continue
+		}
 		wg.Add(1)
-		go func(targetURL string, routeURL string, chunkOrder int) {
+		go func(targetURL string, routeURL string, client *http.Client) {
 			defer wg.Done()
 			reqCtx, cancel := context.WithTimeout(ctx, warmupTimeout)
 			defer cancel()
-			reqURL := targetURL
-			if u != nil && u.subdomains != nil {
-				reqURL = u.routeUploadURL(targetURL)
-			}
-			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, reqURL, nil)
+			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, targetURL, nil)
 			if err != nil {
 				return
 			}
-			client := u.clientForChunk(int64(chunkOrder))
 			resp, err := client.Do(req)
 			if err != nil {
 				if u.routes != nil {
@@ -373,9 +413,125 @@ func (u *uploader) warmConnections(ctx context.Context, src *sourceFile, count i
 					u.routes.failure(routeURL, http.StatusServiceUnavailable, &requestError{status: resp.StatusCode})
 				}
 			}
-		}(warmURL, selected.rawURL, i)
+		}(requestURL, selected.rawURL, client)
 	}
 	wg.Wait()
+}
+
+func uploadHasPendingPayload(u *uploader, src *sourceFile) bool {
+	if src == nil {
+		return false
+	}
+	if !src.knownSize || src.size <= 0 || u == nil || u.opts.chunkSize <= 0 {
+		return true
+	}
+	totalChunks := (src.size + u.opts.chunkSize - 1) / u.opts.chunkSize
+	if totalChunks <= 0 || int64(len(src.committedChunks)) < totalChunks {
+		return true
+	}
+	for index := int64(0); index < totalChunks; index++ {
+		if !src.isChunkCommitted(index) {
+			return true
+		}
+	}
+	return false
+}
+
+func uploadWarmBodyLanes(u *uploader) []int {
+	if u == nil || u.chunkBodyLanes == nil {
+		return nil
+	}
+	// warmConnections runs before payload dispatch, so every configured lane is
+	// available. Drain and restore the channel in order to inspect that order
+	// without rotating it and invalidating the warmup-to-payload identity.
+	available := len(u.chunkBodyLanes)
+	lanes := make([]int, 0, available)
+	for index := 0; index < available; index++ {
+		lanes = append(lanes, <-u.chunkBodyLanes)
+	}
+	for _, lane := range lanes {
+		u.chunkBodyLanes <- lane
+	}
+	return lanes
+}
+
+func uploadWarmConnectionCount(u *uploader, src *sourceFile, parallel int) int {
+	if src == nil || parallel < 1 {
+		return 0
+	}
+	// Direct prepared/explicit routes are warmed by probeUploadRoutes. Warming
+	// every useful chunk separately delays first payload while duplicating the
+	// probe and is unnecessary for both the shared HTTP/1.1 transport and the
+	// optional fixed HTTP/2 connection pool. Numbered legacy subdomains need a
+	// separate request because their hostnames differ from the probed base URL.
+	if u == nil || u.subdomains == nil {
+		return 0
+	}
+	if !src.knownSize {
+		// Unknown streams may end in their first partial part. Additional lanes
+		// are opened naturally as complete retryable bodies materialize.
+		return 1
+	}
+	return len(uploadWarmChunkIndexes(u, src, parallel))
+}
+
+func uploadWarmChunkIndexes(u *uploader, src *sourceFile, parallel int) []int64 {
+	if src == nil || parallel < 1 {
+		return nil
+	}
+	if src.knownSize {
+		totalChunks := int64(0)
+		if src.size > 0 && u != nil && u.opts.chunkSize > 0 {
+			totalChunks = (src.size + u.opts.chunkSize - 1) / u.opts.chunkSize
+		}
+		if totalChunks == 0 {
+			return []int64{-1}
+		}
+		count := uploadProgressParallel(u, src, totalChunks)
+		if count > parallel {
+			count = parallel
+		}
+		if src.readerAt != nil {
+			indexes := make([]int64, 0, count)
+			add := func(index int64) {
+				if len(indexes) >= count || index < 0 || src.isChunkCommitted(index) {
+					return
+				}
+				indexes = append(indexes, index)
+			}
+			// Match the payload scheduler's first/final/middle order while
+			// stopping as soon as the bounded initial concurrency window is full.
+			// Avoid materializing every pending job for multi-terabyte files just
+			// to decide whether a few more route probes should join startup.
+			add(0)
+			if totalChunks > 1 {
+				add(totalChunks - 1)
+			}
+			for index := int64(1); index < totalChunks-1 && len(indexes) < count; index++ {
+				add(index)
+			}
+			return indexes
+		}
+		if count < 1 {
+			count = 1
+		}
+		indexes := make([]int64, count)
+		for index := range indexes {
+			indexes[index] = int64(index)
+		}
+		return indexes
+	}
+
+	// An unknown stream may end after its first partial part. Prewarming the
+	// full adaptive ceiling made a tiny archive open 128 connections before its
+	// only request. Warm one initial payload lane; the concurrent route race
+	// below already opens one connection to every active route, and genuinely
+	// large streams open their remaining lanes as complete parts materialize.
+	indexes := make([]int64, parallel)
+	for index := range indexes {
+		indexes[index] = int64(index)
+	}
+	return indexes
 }
 
 func buildUploadURL(base *url.URL, filename string) string {
@@ -583,17 +739,6 @@ func pushRate(window []float64, value float64, max int) []float64 {
 	return window
 }
 
-func avgFloat64(values []float64) float64 {
-	if len(values) == 0 {
-		return 0
-	}
-	sum := 0.0
-	for _, v := range values {
-		sum += v
-	}
-	return sum / float64(len(values))
-}
-
 func avgRateWindow(values []float64, windowSize int) float64 {
 	if windowSize <= 0 || len(values) == 0 {
 		return 0
@@ -736,6 +881,68 @@ func isRetryableStatus(ctx context.Context, status int, err error) bool {
 	}
 }
 
+// parseRetryAfter accepts the RFC-defined delay-seconds and HTTP-date forms.
+// Fractional seconds are also accepted because some upload gateways return
+// sub-second backpressure hints even though the base HTTP grammar uses whole
+// seconds.
+func parseRetryAfter(raw string, now time.Time) (time.Duration, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, false
+	}
+	if seconds, err := strconv.ParseFloat(raw, 64); err == nil {
+		if seconds < 0 || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+			return 0, false
+		}
+		maxSeconds := float64(math.MaxInt64) / float64(time.Second)
+		if seconds >= maxSeconds {
+			return time.Duration(math.MaxInt64), true
+		}
+		return time.Duration(seconds * float64(time.Second)), true
+	}
+	deadline, err := http.ParseTime(raw)
+	if err != nil {
+		return 0, false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	delay := deadline.Sub(now)
+	if delay < 0 {
+		delay = 0
+	}
+	return delay, true
+}
+
+func retryAfterFromResponse(resp *http.Response, now time.Time) (time.Duration, bool) {
+	if resp == nil {
+		return 0, false
+	}
+	return parseRetryAfter(resp.Header.Get("Retry-After"), now)
+}
+
+func retryDelayForError(base time.Duration, err error) time.Duration {
+	var reqErr *requestError
+	if errors.As(err, &reqErr) && reqErr != nil && reqErr.retryAfterSet && reqErr.retryAfter > base {
+		return reqErr.retryAfter
+	}
+	return base
+}
+
+func uploadBackpressureResponse(status int, body string, retryAfterSet bool) bool {
+	if !retryAfterSet {
+		return false
+	}
+	switch strings.TrimSpace(body) {
+	case "upload buffer is busy, retry", "upload buffer unavailable":
+		return status == http.StatusServiceUnavailable
+	case "request timed out while waiting for upload buffer":
+		return status == http.StatusRequestTimeout
+	default:
+		return false
+	}
+}
+
 func statusMayStillFinalize(status int) bool {
 	switch status {
 	case 404, 409, 425, 429:
@@ -823,7 +1030,7 @@ func isFinitePositive(v float64) bool {
 }
 
 func (u *uploader) logf(format string, args ...any) {
-	if !u.opts.verbose {
+	if !u.opts.verbose && !u.opts.debug {
 		return
 	}
 	stderrLogf(format, args...)

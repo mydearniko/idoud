@@ -14,6 +14,7 @@ import (
 
 const (
 	routeProbeTimeout       = 2 * time.Second
+	routeProbeJoinGrace     = 250 * time.Millisecond
 	routeFailureBaseBackoff = 30 * time.Second
 	routeFailureMaxBackoff  = 2 * time.Minute
 )
@@ -42,6 +43,9 @@ func (u *uploader) ensureRouteState() {
 		}
 		if u.routeLimits == nil {
 			u.routeLimits = newRouteLimiterSet()
+		}
+		if u.cooldowns == nil {
+			u.cooldowns = newUploadCooldownSet()
 		}
 	})
 }
@@ -84,8 +88,24 @@ func (s *routeCircuitSet) success(raw string) {
 func routeFailure(status int, err error) bool {
 	if err != nil {
 		var statusErr *requestError
-		if errors.As(err, &statusErr) && statusErr != nil && statusErr.status > 0 {
-			status = statusErr.status
+		if errors.As(err, &statusErr) && statusErr != nil {
+			// Node upload-buffer pressure is a retryable scheduling signal, not
+			// evidence that the origin is unhealthy. Keep the route available and
+			// honor its Retry-After instead of opening the circuit for 30 seconds.
+			if statusErr.backpressure {
+				return false
+			}
+			if statusErr.status > 0 {
+				status = statusErr.status
+			} else {
+				var netErr net.Error
+				if errors.As(err, &netErr) || errors.Is(err, context.DeadlineExceeded) {
+					return true
+				}
+				if status == 0 {
+					return false
+				}
+			}
 		} else {
 			var netErr net.Error
 			if errors.As(err, &netErr) || errors.Is(err, context.DeadlineExceeded) {
@@ -136,6 +156,23 @@ func (s *routeCircuitSet) failure(raw string, status int, err error) bool {
 	s.states[key] = state
 	s.mu.Unlock()
 	return true
+}
+
+func (s *routeCircuitSet) probing(raw string, until time.Time) {
+	if s == nil || until.IsZero() {
+		return
+	}
+	key := routeOriginKey(raw)
+	if key == "" {
+		return
+	}
+	s.mu.Lock()
+	state := s.states[key]
+	if until.After(state.blockedUntil) {
+		state.blockedUntil = until
+	}
+	s.states[key] = state
+	s.mu.Unlock()
 }
 
 type routeLimiter struct {
@@ -205,18 +242,122 @@ func allUploadRouteTargets(src *sourceFile) []uploadRouteTarget {
 	return out
 }
 
+func uploadPhysicalNodeKey(target uploadRouteTarget) string {
+	if nodeID := strings.TrimSpace(target.nodeID); nodeID != "" {
+		return "node\x00" + nodeID
+	}
+	if origin := routeOriginKey(target.rawURL); origin != "" {
+		return "origin\x00" + origin
+	}
+	return ""
+}
+
+func scheduledPrimaryNodeKeys(src *sourceFile, targets []uploadRouteTarget) map[string]struct{} {
+	required := make(map[string]struct{})
+	add := func(index int) {
+		if index < 0 || index >= len(targets) {
+			return
+		}
+		if key := uploadPhysicalNodeKey(targets[index]); key != "" {
+			required[key] = struct{}{}
+		}
+	}
+	if src != nil && len(src.uploadTargetSchedule) > 0 {
+		for _, index := range src.uploadTargetSchedule {
+			add(index)
+		}
+		return required
+	}
+	for index := range targets {
+		add(index)
+	}
+	return required
+}
+
+type uploadRouteProbeResult struct {
+	physicalNode string
+	success      bool
+}
+
+func uploadRouteProbeJoinNeeded(u *uploader, src *sourceFile, targets []uploadRouteTarget) bool {
+	if u == nil || src == nil || !src.knownSize || len(targets) < 2 {
+		return false
+	}
+	pending := len(uploadWarmChunkIndexes(u, src, u.effectiveUploadParallel()))
+	if pending < 2 {
+		return false
+	}
+	seen := make(map[string]struct{}, len(targets))
+	availableCapacity := 0
+	hasPendingRoute := false
+	now := time.Now()
+	for _, target := range targets {
+		origin := routeOriginKey(target.rawURL)
+		if origin == "" {
+			continue
+		}
+		if _, duplicate := seen[origin]; duplicate {
+			continue
+		}
+		seen[origin] = struct{}{}
+		if u.routes != nil && !u.routes.available(target.rawURL, now) {
+			hasPendingRoute = true
+			continue
+		}
+		// An omitted route limit is effectively bounded by the uploader's
+		// global parallelism, so one ready route already has enough capacity.
+		if target.maxParallel < 1 {
+			return false
+		}
+		availableCapacity += target.maxParallel
+		if availableCapacity >= pending {
+			return false
+		}
+	}
+	return hasPendingRoute && availableCapacity < pending
+}
+
+func (u *uploader) waitForUploadRouteProbeJoin(
+	ctx context.Context,
+	src *sourceFile,
+	targets []uploadRouteTarget,
+	results <-chan uploadRouteProbeResult,
+	pendingResults int,
+	started time.Time,
+) {
+	if pendingResults < 1 || !uploadRouteProbeJoinNeeded(u, src, targets) {
+		return
+	}
+	timer := time.NewTimer(routeProbeJoinGrace)
+	defer timer.Stop()
+	u.logf("route probe join start elapsed=%s pending_routes=%d grace=%s", time.Since(started), pendingResults, routeProbeJoinGrace)
+	for pendingResults > 0 && uploadRouteProbeJoinNeeded(u, src, targets) {
+		select {
+		case <-results:
+			pendingResults--
+		case <-timer.C:
+			u.logf("route probe join timeout elapsed=%s pending_routes=%d", time.Since(started), pendingResults)
+			return
+		case <-ctx.Done():
+			u.logf("route probe join stopped elapsed=%s err=%v", time.Since(started), ctx.Err())
+			return
+		}
+	}
+	u.logf("route probe join ready elapsed=%s pending_routes=%d", time.Since(started), pendingResults)
+}
+
 func (u *uploader) probeUploadRoutes(ctx context.Context, src *sourceFile) {
 	if u == nil || src == nil {
 		return
 	}
 	u.ensureRouteState()
-	targets := allUploadRouteTargets(src)
+	targets := src.uploadRouteTargets
 	if len(targets) == 0 {
 		targets = legacyUploadRouteTargets(src)
 	}
+	unique := make([]uploadRouteTarget, 0, len(targets))
 	seen := make(map[string]struct{}, len(targets))
-	var wg sync.WaitGroup
-	for i, target := range targets {
+	for _, target := range targets {
 		key := routeOriginKey(target.rawURL)
 		if key == "" {
 			continue
@@ -225,9 +366,37 @@ func (u *uploader) probeUploadRoutes(ctx context.Context, src *sourceFile) {
 			continue
 		}
 		seen[key] = struct{}{}
-		wg.Add(1)
+		unique = append(unique, target)
+	}
+	if len(unique) == 0 {
+		return
+	}
+	requiredNodes := scheduledPrimaryNodeKeys(src, targets)
+	pendingByNode := make(map[string]int, len(requiredNodes))
+	for _, target := range unique {
+		key := uploadPhysicalNodeKey(target)
+		if _, required := requiredNodes[key]; required {
+			pendingByNode[key]++
+		}
+	}
+
+	// Mark every candidate unavailable until its own probe succeeds. Readiness
+	// requires one healthy alias for every physical node used by the schedule;
+	// additional aliases keep probing in the background and rejoin independently.
+	// A one-node plan therefore remains ready after its first healthy alias.
+	probeDeadline := time.Now().Add(routeProbeTimeout)
+	for _, target := range unique {
+		u.routes.probing(target.rawURL, probeDeadline)
+	}
+	started := time.Now()
+	u.logf("route probe start active=%d required_nodes=%d timeout=%s", len(unique), len(requiredNodes), routeProbeTimeout)
+	results := make(chan uploadRouteProbeResult, len(unique))
+	for order, target := range unique {
 		go func(target uploadRouteTarget, order int) {
-			defer wg.Done()
+			origin := routeOriginKey(target.rawURL)
+			physicalNode := uploadPhysicalNodeKey(target)
+			success := false
+			defer func() { results <- uploadRouteProbeResult{physicalNode: physicalNode, success: success} }()
 			if target.parsedURL == nil {
 				u.routes.failure(target.rawURL, http.StatusServiceUnavailable, errors.New("invalid route URL"))
 				return
@@ -255,20 +424,56 @@ func (u *uploader) probeUploadRoutes(ctx context.Context, src *sourceFile) {
 			resp, err := client.Do(req)
 			if err != nil {
 				u.routes.failure(target.rawURL, 0, err)
-				u.logf("route probe failed origin=%s err=%v", key, err)
+				u.logf("route probe failed origin=%s err=%v", origin, err)
 				return
 			}
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 			_ = resp.Body.Close()
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				u.routes.failure(target.rawURL, http.StatusServiceUnavailable, &requestError{status: resp.StatusCode})
-				u.logf("route probe failed origin=%s status=%d", key, resp.StatusCode)
+				u.logf("route probe failed origin=%s status=%d", origin, resp.StatusCode)
 				return
 			}
 			u.routes.success(target.rawURL)
-		}(target, i)
+			success = true
+			u.logf("route probe healthy origin=%s elapsed=%s", origin, time.Since(started))
+		}(target, order)
 	}
-	wg.Wait()
+
+	if len(requiredNodes) == 0 {
+		u.logf("route probe ready elapsed=%s required_nodes=0", time.Since(started))
+		return
+	}
+	satisfied := make(map[string]struct{}, len(requiredNodes))
+	for remaining := len(unique); remaining > 0; remaining-- {
+		select {
+		case result := <-results:
+			if _, required := requiredNodes[result.physicalNode]; !required {
+				continue
+			}
+			if pendingByNode[result.physicalNode] > 0 {
+				pendingByNode[result.physicalNode]--
+			}
+			if result.success {
+				satisfied[result.physicalNode] = struct{}{}
+			}
+			if len(satisfied) == len(requiredNodes) {
+				u.logf("route probe ready elapsed=%s healthy_nodes=%d pending_routes=%d", time.Since(started), len(satisfied), remaining-1)
+				u.waitForUploadRouteProbeJoin(ctx, src, targets, results, remaining-1, started)
+				return
+			}
+			if pendingByNode[result.physicalNode] == 0 {
+				if _, healthy := satisfied[result.physicalNode]; !healthy {
+					u.logf("route probe node unavailable elapsed=%s healthy_nodes=%d required_nodes=%d", time.Since(started), len(satisfied), len(requiredNodes))
+					return
+				}
+			}
+		case <-ctx.Done():
+			u.logf("route probe stopped elapsed=%s err=%v", time.Since(started), ctx.Err())
+			return
+		}
+	}
+	u.logf("route probe exhausted active=%d elapsed=%s", len(unique), time.Since(started))
 }
 
 func legacyUploadRouteTargets(src *sourceFile) []uploadRouteTarget {

@@ -29,6 +29,7 @@ type transferUIConfig struct {
 	enabled     bool
 	plain       bool
 	lines       bool
+	tabProgress bool
 	color       bool
 	unicode     bool
 	writer      io.Writer
@@ -45,16 +46,17 @@ type transferUIConfig struct {
 // stored bytes advance only after confirmation. Download progress counts only
 // bytes actually written to the destination file.
 type transferUI struct {
-	enabled bool
-	plain   bool
-	lines   bool
-	color   bool
-	unicode bool
-	writer  io.Writer
-	width   func() int
-	kind    string
-	source  string
-	started time.Time
+	enabled     bool
+	plain       bool
+	lines       bool
+	tabProgress bool
+	color       bool
+	unicode     bool
+	writer      io.Writer
+	width       func() int
+	kind        string
+	source      string
+	started     time.Time
 
 	detailsMu        sync.RWMutex
 	name             string
@@ -86,6 +88,9 @@ type transferUI struct {
 	lastLineWidth    int
 	lastRenderedLine string
 	lastRenderedAt   time.Time
+	tabProgressSet   bool
+	tabProgressState terminalTabProgressState
+	tabProgressValue int
 	planOnce         sync.Once
 	resumeOnce       sync.Once
 	destinationOnce  sync.Once
@@ -140,10 +145,12 @@ func terminalTransferUIConfig(opts options, kind, source, name string, total, to
 	enabled := mode != progressModeNone
 	plain := mode == progressModePlain
 	lines := mode == progressModeLines
+	stderrTTY := term.IsTerminal(int(os.Stderr.Fd()))
 	return transferUIConfig{
 		enabled:     enabled,
 		plain:       plain,
 		lines:       lines,
+		tabProgress: enabled && !plain && terminalTabProgressEnabled(stderrTTY, os.Getenv),
 		color:       enabled && !plain && colorOutputEnabled(),
 		unicode:     strings.TrimSpace(os.Getenv("IDOUD_ASCII")) == "",
 		writer:      os.Stderr,
@@ -165,21 +172,22 @@ func newTransferUI(config transferUIConfig) *transferUI {
 		config.width = func() int { return 96 }
 	}
 	ui := &transferUI{
-		enabled:    config.enabled,
-		plain:      config.plain,
-		lines:      config.lines,
-		color:      config.color,
-		unicode:    config.unicode,
-		writer:     config.writer,
-		width:      config.width,
-		kind:       strings.TrimSpace(config.kind),
-		source:     strings.TrimSpace(config.source),
-		name:       strings.TrimSpace(config.name),
-		started:    now,
-		phase:      transferPhasePlanning,
-		phaseSince: now,
-		stopCh:     make(chan bool, 1),
-		doneCh:     make(chan struct{}),
+		enabled:     config.enabled,
+		plain:       config.plain,
+		lines:       config.lines,
+		tabProgress: config.tabProgress && !config.plain,
+		color:       config.color,
+		unicode:     config.unicode,
+		writer:      config.writer,
+		width:       config.width,
+		kind:        strings.TrimSpace(config.kind),
+		source:      strings.TrimSpace(config.source),
+		name:        strings.TrimSpace(config.name),
+		started:     now,
+		phase:       transferPhasePlanning,
+		phaseSince:  now,
+		stopCh:      make(chan bool, 1),
+		doneCh:      make(chan struct{}),
 	}
 	ui.total.Store(config.total)
 	ui.totalChunks.Store(config.totalChunks)
@@ -276,6 +284,7 @@ func (ui *transferUI) loopInteractive() {
 		inputRate, _ := readRate.observe(now, ui.readBytes.Load())
 		bodyRate, _ := sendRate.observe(now, ui.bodySentBytes.Load())
 		snapshot := ui.snapshot(now, confirmedRate, inputRate, bodyRate, stalled, tick)
+		ui.renderTabProgress(snapshot)
 		ui.renderDynamic(now, ui.formatProgress(snapshot))
 		return confirmedRate, inputRate, stalled
 	}
@@ -284,17 +293,17 @@ func (ui *transferUI) loopInteractive() {
 	rate.reset(now, ui.transferred.Load())
 	readRate.reset(now, ui.readBytes.Load())
 	sendRate.reset(now, ui.bodySentBytes.Load())
-	lastRate, _, _ := render(now)
+	render(now)
 	for {
 		select {
 		case success := <-ui.stopCh:
 			now = time.Now()
-			lastRate, _, _ = render(now)
-			ui.finishLine(success, lastRate, now)
+			finalRate, _, _ := render(now)
+			ui.finishLine(success, finalRate, now)
 			return
 		case now = <-ticker.C:
 			tick++
-			lastRate, _, _ = render(now)
+			render(now)
 		}
 	}
 }
@@ -355,17 +364,17 @@ func (ui *transferUI) loopPlain() {
 	rate.reset(now, ui.transferred.Load())
 	readRate.reset(now, ui.readBytes.Load())
 	sendRate.reset(now, ui.bodySentBytes.Load())
-	lastRate := render(now, true)
+	render(now, true)
 	for {
 		select {
 		case success := <-ui.stopCh:
 			now = time.Now()
-			lastRate = render(now, true)
-			ui.finishLine(success, lastRate, now)
+			finalRate := render(now, true)
+			ui.finishLine(success, finalRate, now)
 			return
 		case now = <-ticker.C:
 			tick++
-			lastRate = render(now, false)
+			render(now, false)
 		}
 	}
 }
@@ -1084,11 +1093,17 @@ func (ui *transferUI) formatUnknownProgress(snapshot transferProgressSnapshot, w
 	}
 	if width >= 76 {
 		rateText := "warming up"
-		if showSent && snapshot.sendRate > 0 {
+		if snapshot.bodyReadBytes > snapshot.bodyWritten && snapshot.inFlight > 0 {
+			rateText = "sending request bodies"
+		} else if snapshot.inputClosed && snapshot.readBytes <= sent && showSent {
+			// Once a finite stdin/archive stream is exhausted and every byte has
+			// entered a request body, a retained send-rate sample describes past
+			// work. Label the remaining durable-provider wait truthfully instead
+			// of making a tiny completed payload look like a slow live transfer.
+			rateText = "awaiting storage"
+		} else if showSent && snapshot.sendRate > 0 {
 			rateText = "sending " + formatRateFromPerSecond(snapshot.sendRate)
 		} else if showSent && snapshot.inFlight > 0 {
-			rateText = "sending request bodies"
-		} else if snapshot.bodyReadBytes > snapshot.bodyWritten && snapshot.inFlight > 0 {
 			rateText = "sending request bodies"
 		} else if snapshot.inputClosed && snapshot.inFlight > 0 {
 			rateText = "awaiting confirmation"
@@ -1201,6 +1216,7 @@ func (ui *transferUI) finishLine(success bool, lastRate float64, now time.Time) 
 	}
 	ui.outputMu.Lock()
 	defer ui.outputMu.Unlock()
+	ui.finishTabProgressLocked(snapshot, success)
 	if !ui.lines {
 		ui.clearDynamicLocked()
 	}
@@ -1218,9 +1234,11 @@ func (ui *transferUI) finishLine(success bool, lastRate float64, now time.Time) 
 			line += ui.dim(" · ") + ui.accent(formatRateFromPerSecond(averageRate)+" avg")
 		}
 		ui.writeStyledLineLocked(now, "  "+line)
+		ui.clearTabProgressLocked()
 		return
 	}
 	ui.writeStyledLineLocked(now, "  "+ui.failure(ui.failureMark()+" transfer stopped")+ui.dim(" · "+formatByteSize(transferred)+" confirmed"))
+	ui.clearTabProgressLocked()
 }
 
 func (ui *transferUI) renderDynamic(now time.Time, line string) {
@@ -1613,9 +1631,6 @@ func uploadProgressParallel(u *uploader, src *sourceFile, totalChunks int64) int
 		return parallel
 	}
 	concurrentChunks := totalChunks
-	if src.stream != nil && src.readerAt == nil {
-		concurrentChunks--
-	}
 	if concurrentChunks < 1 {
 		concurrentChunks = 1
 	}

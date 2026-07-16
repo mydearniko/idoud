@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -173,18 +172,18 @@ func TestRequestFinalizeUploadIgnoresTransientProbeTimeout(t *testing.T) {
 		return nil, context.DeadlineExceeded
 	})
 
-	ready, failed, finalURL, err := u.requestFinalizeUpload(context.Background(), "AbC123", 30*time.Millisecond)
+	result, err := u.requestFinalizeUpload(context.Background(), "AbC123", 30*time.Millisecond)
 	if err != nil {
 		t.Fatalf("requestFinalizeUpload error = %v, want nil", err)
 	}
-	if ready {
+	if result.ready {
 		t.Fatal("requestFinalizeUpload ready=true, want false")
 	}
-	if failed {
+	if result.failed {
 		t.Fatal("requestFinalizeUpload failed=true, want false")
 	}
-	if finalURL != "" {
-		t.Fatalf("requestFinalizeUpload finalURL=%q, want empty", finalURL)
+	if result.finalURL != "" {
+		t.Fatalf("requestFinalizeUpload finalURL=%q, want empty", result.finalURL)
 	}
 }
 
@@ -213,7 +212,7 @@ func TestRequestFinalizeUploadPropagatesCallerCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, _, _, err := u.requestFinalizeUpload(ctx, "AbC123", 30*time.Millisecond)
+	_, err := u.requestFinalizeUpload(ctx, "AbC123", 30*time.Millisecond)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("requestFinalizeUpload err = %v, want context.Canceled", err)
 	}
@@ -314,13 +313,10 @@ func TestWarmConnectionsUsesPreparedUploadTargets(t *testing.T) {
 		parsed = append(parsed, u)
 	}
 
-	var mu sync.Mutex
-	var got []string
+	requests := make(chan string, 8)
 	u := &uploader{
 		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			mu.Lock()
-			got = append(got, req.URL.String())
-			mu.Unlock()
+			requests <- req.URL.String()
 			return &http.Response{
 				StatusCode:    http.StatusOK,
 				Body:          http.NoBody,
@@ -338,22 +334,236 @@ func TestWarmConnectionsUsesPreparedUploadTargets(t *testing.T) {
 
 	u.warmConnections(context.Background(), src, 4)
 
-	sort.Strings(got)
-	want := []string{
-		"https://first.example/v1/health",
-		"https://first.example/v1/health",
-		"https://first.example/v1/health",
-		"https://second.example/v1/health",
-		"https://second.example/v1/health",
-		"https://second.example/v1/health",
-	}
-	if len(got) != len(want) {
-		t.Fatalf("warm request count=%d, want %d (%v)", len(got), len(want), got)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("warm request %d=%q, want %q", i, got[i], want[i])
+	got := make([]string, 0, 2)
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for len(got) < 2 {
+		select {
+		case requestURL := <-requests:
+			got = append(got, requestURL)
+		case <-timer.C:
+			t.Fatalf("route probe count=%d, want 2 (%v)", len(got), got)
 		}
+	}
+	counts := make(map[string]int, 2)
+	for _, requestURL := range got {
+		counts[requestURL]++
+	}
+	if counts["https://first.example/v1/health"] < 1 || counts["https://second.example/v1/health"] < 1 {
+		t.Fatalf("prepared route probes=%v, want both routes probed", counts)
+	}
+	if len(counts) != 2 {
+		t.Fatalf("warm request targets=%v, want only prepared routes", counts)
+	}
+	select {
+	case requestURL := <-requests:
+		t.Fatalf("unexpected redundant direct-route warm request %q", requestURL)
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestUploadWarmConnectionCountMatchesUsefulWork(t *testing.T) {
+	u := &uploader{
+		opts:       options{parallel: 384, chunkSize: 10},
+		subdomains: newUploadSubdomainPool(384),
+	}
+
+	tiny := &sourceFile{knownSize: true, size: 4, readerAt: bytes.NewReader(make([]byte, 4))}
+	if got := uploadWarmConnectionCount(u, tiny, 384); got != 1 {
+		t.Fatalf("tiny known upload warm count=%d, want 1", got)
+	}
+
+	finite := &sourceFile{knownSize: true, size: 250, readerAt: bytes.NewReader(make([]byte, 250))}
+	if got := uploadWarmConnectionCount(u, finite, 384); got != 25 {
+		t.Fatalf("finite upload warm count=%d, want 25", got)
+	}
+	for index := int64(0); index < 24; index++ {
+		finite.markChunkCommitted(index)
+	}
+	if got := uploadWarmConnectionCount(u, finite, 384); got != 1 {
+		t.Fatalf("nearly complete resume warm count=%d, want 1 missing part", got)
+	}
+	finite.markChunkCommitted(24)
+	if got := uploadWarmConnectionCount(u, finite, 384); got != 0 {
+		t.Fatalf("complete resume warm count=%d, want 0", got)
+	}
+
+	unknown := &sourceFile{
+		knownSize: false,
+		stream:    strings.NewReader("stream"),
+		uploadRouteTargets: []uploadRouteTarget{
+			{rawURL: "https://route-a.example/file"},
+			{rawURL: "https://route-b.example/file"},
+			{rawURL: "https://route-c.example/file"},
+			{rawURL: "https://route-d.example/file"},
+		},
+	}
+	if got := uploadWarmConnectionCount(u, unknown, 384); got != 1 {
+		t.Fatalf("unknown upload warm count=%d, want one initial payload lane", got)
+	}
+	if got := uploadWarmConnectionCount(u, unknown, 2); got != 1 {
+		t.Fatalf("parallel-bounded unknown warm count=%d, want 1", got)
+	}
+
+	direct := &uploader{opts: options{parallel: 384, chunkSize: 10}}
+	if got := uploadWarmConnectionCount(direct, finite, 384); got != 0 {
+		t.Fatalf("direct-route warm count=%d, want route probes only", got)
+	}
+}
+
+func TestWarmConnectionsSkipsRouteProbeForCompleteResume(t *testing.T) {
+	target := mustParseURL(t, "https://route.example/AbC123/file.bin")
+	requests := 0
+	u := &uploader{
+		opts: options{parallel: 4, chunkSize: 10},
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			requests++
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+		})},
+	}
+	src := &sourceFile{
+		readerAt:           bytes.NewReader(make([]byte, 20)),
+		size:               20,
+		knownSize:          true,
+		committedChunks:    map[int64]struct{}{0: {}, 1: {}},
+		uploadRouteTargets: []uploadRouteTarget{{rawURL: target.String(), parsedURL: target}},
+	}
+
+	u.warmConnections(context.Background(), src, 0)
+	if requests != 0 {
+		t.Fatalf("complete resume route probes=%d, want 0", requests)
+	}
+}
+
+func TestWarmConnectionsRewindsLegacySubdomainsToWarmedLanes(t *testing.T) {
+	target := mustParseURL(t, "https://route.example/AbC123/file.bin")
+	type laneRequest struct {
+		lane int
+		host string
+		path string
+	}
+	var mu sync.Mutex
+	requests := make([]laneRequest, 0, 3)
+	clients := make([]*http.Client, 2)
+	for lane := range clients {
+		lane := lane
+		clients[lane] = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			mu.Lock()
+			requests = append(requests, laneRequest{lane: lane, host: req.URL.Host, path: req.URL.Path})
+			mu.Unlock()
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, ContentLength: 0}, nil
+		})}
+	}
+	u := &uploader{
+		client:       clients[0],
+		chunkClients: clients,
+		subdomains:   newUploadSubdomainPool(4),
+	}
+	src := &sourceFile{
+		uploadURL:               target.String(),
+		uploadURLParsed:         target,
+		uploadURLs:              []string{target.String()},
+		uploadURLParsedByServer: []*url.URL{target},
+	}
+
+	u.warmConnections(context.Background(), src, 2)
+
+	mu.Lock()
+	defer mu.Unlock()
+	warmed := map[int]string{}
+	for _, req := range requests {
+		if req.path == "/v1/health" && strings.HasSuffix(req.host, ".idoud.cc") {
+			warmed[req.lane] = req.host
+		}
+	}
+	if warmed[0] != "1.idoud.cc" || warmed[1] != "2.idoud.cc" {
+		t.Fatalf("warmed lane hosts=%v, want lane 0/1 on 1/2.idoud.cc", warmed)
+	}
+	if got := u.routeUploadURL(target.String()); !strings.HasPrefix(got, "https://1.idoud.cc/") {
+		t.Fatalf("first payload URL after warmup=%q, want rewound 1.idoud.cc", got)
+	}
+}
+
+func TestWarmConnectionsProbesActiveRoutesButSkipsStandby(t *testing.T) {
+	primary := mustParseURL(t, "https://primary.example/AbC123/file.bin")
+	standby := mustParseURL(t, "https://standby.example/AbC123/file.bin")
+	var mu sync.Mutex
+	requests := make(map[string]int)
+	u := &uploader{
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			mu.Lock()
+			requests[req.URL.Host]++
+			mu.Unlock()
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, ContentLength: 0}, nil
+		})},
+	}
+	src := &sourceFile{
+		uploadRouteTargets:    []uploadRouteTarget{{rawURL: primary.String(), parsedURL: primary, nodeID: "primary"}},
+		uploadFallbackTargets: []uploadRouteTarget{{rawURL: standby.String(), parsedURL: standby, nodeID: "standby", fallback: true}},
+	}
+
+	u.warmConnections(context.Background(), src, 1)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if requests["primary.example"] != 1 {
+		t.Fatalf("primary health requests=%d, want one route probe without redundant warmup", requests["primary.example"])
+	}
+	if requests["standby.example"] != 0 {
+		t.Fatalf("unused standby blocked initial upload with %d probes", requests["standby.example"])
+	}
+}
+
+func TestWarmConnectionsContinuesAfterFirstHealthyRoute(t *testing.T) {
+	slow := mustParseURL(t, "https://slow.example/AbC123/file.bin")
+	fast := mustParseURL(t, "https://fast.example/AbC123/file.bin")
+	slowStarted := make(chan struct{})
+	releaseSlow := make(chan struct{})
+	slowDone := make(chan struct{})
+	var slowOnce sync.Once
+	u := &uploader{
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Host == "slow.example" {
+				slowOnce.Do(func() { close(slowStarted) })
+				select {
+				case <-releaseSlow:
+					close(slowDone)
+				case <-req.Context().Done():
+					return nil, req.Context().Err()
+				}
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, ContentLength: 0}, nil
+		})},
+	}
+	src := &sourceFile{
+		uploadRouteTargets: []uploadRouteTarget{
+			{rawURL: slow.String(), parsedURL: slow, nodeID: "primary"},
+			{rawURL: fast.String(), parsedURL: fast, nodeID: "primary"},
+		},
+	}
+
+	started := time.Now()
+	u.warmConnections(context.Background(), src, 1)
+	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
+		t.Fatalf("warmup waited %s for a slow route after another route was healthy", elapsed)
+	}
+	select {
+	case <-slowStarted:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("slow active route was not probed in the background")
+	}
+	selected, err := u.selectUploadRoute(src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.rawURL != fast.String() {
+		t.Fatalf("selected route=%q, want first healthy route %q", selected.rawURL, fast.String())
+	}
+	close(releaseSlow)
+	select {
+	case <-slowDone:
+	case <-time.After(time.Second):
+		t.Fatal("background slow route probe did not finish")
 	}
 }
 

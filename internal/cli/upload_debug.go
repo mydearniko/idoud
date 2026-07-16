@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -71,16 +73,75 @@ type uploadDebugStats struct {
 	retrySleepNanos    int64
 	retrySleepCount    int64
 	retrySleepMaxNanos int64
+
+	routeWaitNanos    int64
+	routeWaitCount    int64
+	routeWaitMaxNanos int64
+
+	bodyGateNanos    int64
+	bodyGateCount    int64
+	bodyGateMaxNanos int64
+
+	cooldownWaitNanos    int64
+	cooldownWaitCount    int64
+	cooldownWaitMaxNanos int64
+
+	connAcquireNanos    int64
+	connAcquireCount    int64
+	connAcquireMaxNanos int64
+
+	connPoolNanos    int64
+	connPoolCount    int64
+	connPoolMaxNanos int64
+
+	dnsNanos    int64
+	dnsCount    int64
+	dnsMaxNanos int64
+
+	connectNanos    int64
+	connectCount    int64
+	connectMaxNanos int64
+
+	tlsNanos    int64
+	tlsCount    int64
+	tlsMaxNanos int64
+
+	bodySendNanos    int64
+	bodySendCount    int64
+	bodySendMaxNanos int64
+
+	providerWaitNanos    int64
+	providerWaitCount    int64
+	providerWaitMaxNanos int64
+
+	connectionsFresh  int64
+	connectionsReused int64
+	backpressure      int64
+	retryAfterNanos   int64
+	retryAfterCount   int64
+	retryAfterMax     int64
+
+	routeMu       sync.Mutex
+	routeOutcomes map[string]uploadRouteDebugOutcome
+}
+
+type uploadRouteDebugOutcome struct {
+	success      int64
+	failure      int64
+	backpressure int64
+	status429    int64
+	status5xx    int64
 }
 
 func newUploadDebugStats(label, name string) *uploadDebugStats {
 	now := time.Now()
 	d := &uploadDebugStats{
-		label:  label,
-		name:   name,
-		start:  now,
-		stopCh: make(chan struct{}),
-		doneCh: make(chan struct{}),
+		label:         label,
+		name:          name,
+		start:         now,
+		stopCh:        make(chan struct{}),
+		doneCh:        make(chan struct{}),
+		routeOutcomes: make(map[string]uploadRouteDebugOutcome),
 	}
 	if strings.HasPrefix(label, "stdin") {
 		d.stdinTracked = true
@@ -169,6 +230,7 @@ func (d *uploadDebugStats) startLoop() {
 					avgRateWindow(readRateWindow, rateAvgWindow),
 					avgRateWindow(uploadRateWindow, rateAvgWindow),
 				)
+				d.printRouteSummaries()
 				return
 			case now := <-ticker.C:
 				readNow := atomic.LoadInt64(&d.readBytes)
@@ -276,6 +338,78 @@ func (d *uploadDebugStats) printLine(
 	retrySleepNanos := atomic.LoadInt64(&d.retrySleepNanos)
 	retrySleepCount := atomic.LoadInt64(&d.retrySleepCount)
 	retrySleepMaxNanos := atomic.LoadInt64(&d.retrySleepMaxNanos)
+	routeWaitNanos := atomic.LoadInt64(&d.routeWaitNanos)
+	routeWaitCount := atomic.LoadInt64(&d.routeWaitCount)
+	routeWaitMaxNanos := atomic.LoadInt64(&d.routeWaitMaxNanos)
+	bodyGateNanos := atomic.LoadInt64(&d.bodyGateNanos)
+	bodyGateCount := atomic.LoadInt64(&d.bodyGateCount)
+	bodyGateMaxNanos := atomic.LoadInt64(&d.bodyGateMaxNanos)
+	cooldownWaitNanos := atomic.LoadInt64(&d.cooldownWaitNanos)
+	cooldownWaitCount := atomic.LoadInt64(&d.cooldownWaitCount)
+	cooldownWaitMaxNanos := atomic.LoadInt64(&d.cooldownWaitMaxNanos)
+	connAcquireNanos := atomic.LoadInt64(&d.connAcquireNanos)
+	connAcquireCount := atomic.LoadInt64(&d.connAcquireCount)
+	connAcquireMaxNanos := atomic.LoadInt64(&d.connAcquireMaxNanos)
+	connPoolNanos := atomic.LoadInt64(&d.connPoolNanos)
+	connPoolCount := atomic.LoadInt64(&d.connPoolCount)
+	connPoolMaxNanos := atomic.LoadInt64(&d.connPoolMaxNanos)
+	dnsNanos := atomic.LoadInt64(&d.dnsNanos)
+	dnsCount := atomic.LoadInt64(&d.dnsCount)
+	dnsMaxNanos := atomic.LoadInt64(&d.dnsMaxNanos)
+	connectNanos := atomic.LoadInt64(&d.connectNanos)
+	connectCount := atomic.LoadInt64(&d.connectCount)
+	connectMaxNanos := atomic.LoadInt64(&d.connectMaxNanos)
+	tlsNanos := atomic.LoadInt64(&d.tlsNanos)
+	tlsCount := atomic.LoadInt64(&d.tlsCount)
+	tlsMaxNanos := atomic.LoadInt64(&d.tlsMaxNanos)
+	bodySendNanos := atomic.LoadInt64(&d.bodySendNanos)
+	bodySendCount := atomic.LoadInt64(&d.bodySendCount)
+	bodySendMaxNanos := atomic.LoadInt64(&d.bodySendMaxNanos)
+	providerWaitNanos := atomic.LoadInt64(&d.providerWaitNanos)
+	providerWaitCount := atomic.LoadInt64(&d.providerWaitCount)
+	providerWaitMaxNanos := atomic.LoadInt64(&d.providerWaitMaxNanos)
+	retryAfterNanos := atomic.LoadInt64(&d.retryAfterNanos)
+	retryAfterCount := atomic.LoadInt64(&d.retryAfterCount)
+	retryAfterMax := atomic.LoadInt64(&d.retryAfterMax)
+	transportStages := fmt.Sprintf(
+		" stage_cooldown_wait_avg=%s stage_cooldown_wait_max=%s stage_cooldown_wait_n=%d stage_route_gate_avg=%s stage_route_gate_max=%s stage_route_gate_n=%d stage_body_gate_avg=%s stage_body_gate_max=%s stage_body_gate_n=%d stage_conn_acquire_total_avg=%s stage_conn_acquire_total_max=%s stage_conn_acquire_total_n=%d stage_conn_pool_avg=%s stage_conn_pool_max=%s stage_conn_pool_n=%d stage_dns_avg=%s stage_dns_max=%s stage_dns_n=%d stage_connect_avg=%s stage_connect_max=%s stage_connect_n=%d stage_tls_avg=%s stage_tls_max=%s stage_tls_n=%d stage_body_send_avg=%s stage_body_send_max=%s stage_body_send_n=%d stage_provider_wait_success_avg=%s stage_provider_wait_success_max=%s stage_provider_wait_success_n=%d conn_fresh=%d conn_reused=%d backpressure=%d retry_after_avg=%s retry_after_max=%s retry_after_n=%d",
+		roundStageDuration(avgDurationNanos(cooldownWaitNanos, cooldownWaitCount)),
+		roundStageDuration(time.Duration(cooldownWaitMaxNanos)),
+		cooldownWaitCount,
+		roundStageDuration(avgDurationNanos(routeWaitNanos, routeWaitCount)),
+		roundStageDuration(time.Duration(routeWaitMaxNanos)),
+		routeWaitCount,
+		roundStageDuration(avgDurationNanos(bodyGateNanos, bodyGateCount)),
+		roundStageDuration(time.Duration(bodyGateMaxNanos)),
+		bodyGateCount,
+		roundStageDuration(avgDurationNanos(connAcquireNanos, connAcquireCount)),
+		roundStageDuration(time.Duration(connAcquireMaxNanos)),
+		connAcquireCount,
+		roundStageDuration(avgDurationNanos(connPoolNanos, connPoolCount)),
+		roundStageDuration(time.Duration(connPoolMaxNanos)),
+		connPoolCount,
+		roundStageDuration(avgDurationNanos(dnsNanos, dnsCount)),
+		roundStageDuration(time.Duration(dnsMaxNanos)),
+		dnsCount,
+		roundStageDuration(avgDurationNanos(connectNanos, connectCount)),
+		roundStageDuration(time.Duration(connectMaxNanos)),
+		connectCount,
+		roundStageDuration(avgDurationNanos(tlsNanos, tlsCount)),
+		roundStageDuration(time.Duration(tlsMaxNanos)),
+		tlsCount,
+		roundStageDuration(avgDurationNanos(bodySendNanos, bodySendCount)),
+		roundStageDuration(time.Duration(bodySendMaxNanos)),
+		bodySendCount,
+		roundStageDuration(avgDurationNanos(providerWaitNanos, providerWaitCount)),
+		roundStageDuration(time.Duration(providerWaitMaxNanos)),
+		providerWaitCount,
+		atomic.LoadInt64(&d.connectionsFresh),
+		atomic.LoadInt64(&d.connectionsReused),
+		atomic.LoadInt64(&d.backpressure),
+		roundStageDuration(avgDurationNanos(retryAfterNanos, retryAfterCount)),
+		roundStageDuration(time.Duration(retryAfterMax)),
+		retryAfterCount,
+	)
 
 	serverWaitStr := ""
 	if swStart := atomic.LoadInt64(&d.serverWaitStartUnix); swStart > 0 {
@@ -283,7 +417,7 @@ func (d *uploadDebugStats) printLine(
 	}
 
 	stderrLogf(
-		"%s mode=%s name=%q t=%s inflight=%d max=%d started=%d done=%d failed=%d attempts=%d retries=%d hedges=%d timeouts=%d status_429=%d status_5xx=%d final_started=%d final_done=%d final_failed=%d read=%s uploaded=%s read_rate=%s upload_rate=%s read_rate_avg7=%s upload_rate_avg7=%s attempt_rate=%s done_rate=%s stage_pool_wait_avg=%s stage_pool_wait_max=%s stage_pool_wait_n=%d stage_queue_wait_avg=%s stage_queue_wait_max=%s stage_queue_wait_n=%d stage_read_avg=%s stage_read_max=%s stage_read_n=%d stage_req_build_avg=%s stage_req_build_max=%s stage_req_build_n=%d stage_http_avg=%s stage_http_max=%s stage_http_n=%d stage_resp_read_avg=%s stage_resp_read_max=%s stage_resp_read_n=%d stage_retry_sleep_avg=%s stage_retry_sleep_max=%s stage_retry_sleep_total=%s stage_retry_sleep_n=%d stdin_state=%s stdin_idle=%s%s",
+		"%s mode=%s name=%q t=%s inflight=%d max=%d started=%d done=%d failed=%d attempts=%d retries=%d hedges=%d timeouts=%d status_429=%d status_5xx=%d final_started=%d final_done=%d final_failed=%d read=%s uploaded=%s read_rate=%s upload_rate=%s read_rate_avg7=%s upload_rate_avg7=%s attempt_rate=%s done_rate=%s stage_buffer_pool_wait_avg=%s stage_buffer_pool_wait_max=%s stage_buffer_pool_wait_n=%d stage_queue_wait_avg=%s stage_queue_wait_max=%s stage_queue_wait_n=%d stage_read_avg=%s stage_read_max=%s stage_read_n=%d stage_req_build_avg=%s stage_req_build_max=%s stage_req_build_n=%d stage_request_total_avg=%s stage_request_total_max=%s stage_request_total_n=%d stage_resp_read_avg=%s stage_resp_read_max=%s stage_resp_read_n=%d stage_retry_sleep_avg=%s stage_retry_sleep_max=%s stage_retry_sleep_total=%s stage_retry_sleep_n=%d stdin_state=%s stdin_idle=%s%s%s",
 		prefix,
 		d.label,
 		d.name,
@@ -335,6 +469,7 @@ func (d *uploadDebugStats) printLine(
 		stdinState,
 		stdinIdle,
 		serverWaitStr,
+		transportStages,
 	)
 }
 
@@ -358,21 +493,28 @@ func (u *uploader) upload(ctx context.Context, src *sourceFile) (finalURL string
 		}()
 	}
 
-	if err := u.prepareUpload(ctx, src); err != nil {
-		return "", err
-	}
-	u.configureUploadProgress(src)
-	parallel := u.effectiveUploadParallel()
-
 	stopDebug := u.startDebug(src)
 	defer stopDebug()
 	defer u.logChunkOriginIPs()
+
+	prepareStarted := time.Now()
+	if err := u.prepareUpload(ctx, src); err != nil {
+		u.logf("upload stage=prepare status=error duration=%s err=%v", time.Since(prepareStarted), err)
+		return "", err
+	}
+	u.logf("upload stage=prepare status=ok duration=%s", time.Since(prepareStarted))
+	u.configureUploadProgress(src)
+	parallel := u.effectiveUploadParallel()
 
 	if hasAnyNonLoopbackServer(u.opts) {
 		if u.ui != nil {
 			u.ui.setPhase(transferPhaseConnecting)
 		}
-		u.warmConnections(ctx, src, parallel)
+		warmCount := uploadWarmConnectionCount(u, src, parallel)
+		u.logf("upload warm start connections=%d parallel=%d known_size=%t size=%d", warmCount, parallel, src.knownSize, src.size)
+		warmStarted := time.Now()
+		u.warmConnections(ctx, src, warmCount)
+		u.logf("upload stage=connect status=done duration=%s warmed=%d", time.Since(warmStarted), warmCount)
 	}
 	if u.ui != nil {
 		u.ui.setPhase(transferPhaseTransferring)
@@ -630,6 +772,147 @@ func (u *uploader) debugResponseRead(d time.Duration) {
 func (u *uploader) debugRetrySleep(d time.Duration) {
 	if dbg := u.dbg; dbg != nil {
 		debugRecordDuration(&dbg.retrySleepNanos, &dbg.retrySleepCount, &dbg.retrySleepMaxNanos, d)
+	}
+}
+
+func (u *uploader) debugRouteWait(d time.Duration) {
+	if dbg := u.dbg; dbg != nil {
+		debugRecordDuration(&dbg.routeWaitNanos, &dbg.routeWaitCount, &dbg.routeWaitMaxNanos, d)
+	}
+}
+
+func (u *uploader) debugBodyGateWait(d time.Duration) {
+	if dbg := u.dbg; dbg != nil {
+		debugRecordDuration(&dbg.bodyGateNanos, &dbg.bodyGateCount, &dbg.bodyGateMaxNanos, d)
+	}
+}
+
+func (u *uploader) debugCooldownWait(d time.Duration) {
+	if dbg := u.dbg; dbg != nil {
+		debugRecordDuration(&dbg.cooldownWaitNanos, &dbg.cooldownWaitCount, &dbg.cooldownWaitMaxNanos, d)
+	}
+}
+
+func (u *uploader) debugConnectionAcquire(d time.Duration) {
+	if dbg := u.dbg; dbg != nil {
+		debugRecordDuration(&dbg.connAcquireNanos, &dbg.connAcquireCount, &dbg.connAcquireMaxNanos, d)
+	}
+}
+
+func (u *uploader) debugConnectionPoolWait(d time.Duration) {
+	if dbg := u.dbg; dbg != nil {
+		debugRecordDuration(&dbg.connPoolNanos, &dbg.connPoolCount, &dbg.connPoolMaxNanos, d)
+	}
+}
+
+func (u *uploader) debugDNS(d time.Duration) {
+	if dbg := u.dbg; dbg != nil {
+		debugRecordDuration(&dbg.dnsNanos, &dbg.dnsCount, &dbg.dnsMaxNanos, d)
+	}
+}
+
+func (u *uploader) debugConnect(d time.Duration) {
+	if dbg := u.dbg; dbg != nil {
+		debugRecordDuration(&dbg.connectNanos, &dbg.connectCount, &dbg.connectMaxNanos, d)
+	}
+}
+
+func (u *uploader) debugTLS(d time.Duration) {
+	if dbg := u.dbg; dbg != nil {
+		debugRecordDuration(&dbg.tlsNanos, &dbg.tlsCount, &dbg.tlsMaxNanos, d)
+	}
+}
+
+func (u *uploader) debugBodySend(d time.Duration) {
+	if dbg := u.dbg; dbg != nil {
+		debugRecordDuration(&dbg.bodySendNanos, &dbg.bodySendCount, &dbg.bodySendMaxNanos, d)
+	}
+}
+
+func (u *uploader) debugProviderWait(d time.Duration) {
+	if dbg := u.dbg; dbg != nil {
+		debugRecordDuration(&dbg.providerWaitNanos, &dbg.providerWaitCount, &dbg.providerWaitMaxNanos, d)
+	}
+}
+
+func (u *uploader) debugConnection(reused bool) {
+	if dbg := u.dbg; dbg != nil {
+		if reused {
+			atomic.AddInt64(&dbg.connectionsReused, 1)
+		} else {
+			atomic.AddInt64(&dbg.connectionsFresh, 1)
+		}
+	}
+}
+
+func debugSafeRouteOrigin(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed == nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "<invalid>"
+	}
+	return strings.ToLower(parsed.Scheme + "://" + parsed.Host)
+}
+
+func (u *uploader) debugRouteOutcome(raw string, status int, requestErr error) {
+	dbg := u.dbg
+	if dbg == nil {
+		return
+	}
+	origin := debugSafeRouteOrigin(raw)
+	backpressure := false
+	var reqErr *requestError
+	if errors.As(requestErr, &reqErr) && reqErr != nil {
+		backpressure = reqErr.backpressure
+		if reqErr.retryAfterSet {
+			debugRecordDuration(&dbg.retryAfterNanos, &dbg.retryAfterCount, &dbg.retryAfterMax, reqErr.retryAfter)
+		}
+	}
+	if backpressure {
+		atomic.AddInt64(&dbg.backpressure, 1)
+	}
+	dbg.routeMu.Lock()
+	outcome := dbg.routeOutcomes[origin]
+	if requestErr == nil && status >= 200 && status < 300 {
+		outcome.success++
+	} else {
+		outcome.failure++
+	}
+	if backpressure {
+		outcome.backpressure++
+	}
+	if status == http.StatusTooManyRequests {
+		outcome.status429++
+	} else if status >= http.StatusInternalServerError {
+		outcome.status5xx++
+	}
+	dbg.routeOutcomes[origin] = outcome
+	dbg.routeMu.Unlock()
+}
+
+func (d *uploadDebugStats) printRouteSummaries() {
+	if d == nil {
+		return
+	}
+	d.routeMu.Lock()
+	origins := make([]string, 0, len(d.routeOutcomes))
+	copyOutcomes := make(map[string]uploadRouteDebugOutcome, len(d.routeOutcomes))
+	for origin, outcome := range d.routeOutcomes {
+		origins = append(origins, origin)
+		copyOutcomes[origin] = outcome
+	}
+	d.routeMu.Unlock()
+	sort.Strings(origins)
+	for _, origin := range origins {
+		outcome := copyOutcomes[origin]
+		stderrLogf(
+			"debug route_summary origin=%s success=%d failure=%d backpressure=%d status_429=%d status_5xx=%d",
+			origin,
+			outcome.success,
+			outcome.failure,
+			outcome.backpressure,
+			outcome.status429,
+			outcome.status5xx,
+		)
 	}
 }
 

@@ -122,6 +122,27 @@ func TestClosedStreamShowsProviderConfirmationInsteadOfDecayingInputRate(t *test
 	}
 }
 
+func TestClosedStreamShowsStorageWaitAfterEveryBodyByteWasSent(t *testing.T) {
+	ui := newProgressFormatter(100)
+	line := ui.formatProgress(transferProgressSnapshot{
+		kind:          "upload",
+		source:        "archive",
+		phase:         transferPhaseTransferring,
+		total:         -1,
+		transferred:   0,
+		readBytes:     4 * 1024,
+		bodyReadBytes: 4 * 1024,
+		bodySentBytes: 4 * 1024,
+		bodyWritten:   4 * 1024,
+		sendRate:      18.35 * 1024,
+		inFlight:      1,
+		inputClosed:   true,
+	})
+	if !strings.Contains(line, "awaiting storage") || strings.Contains(line, "sending 18.35KiB/s") {
+		t.Fatalf("closed stream progress=%q, want durable storage wait", line)
+	}
+}
+
 func TestClosedStreamStillShowsRequestBodyWritingBeforeConfirmation(t *testing.T) {
 	ui := newProgressFormatter(100)
 	line := ui.formatProgress(transferProgressSnapshot{

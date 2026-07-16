@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,7 +29,7 @@ type knownUploadChunkJob struct {
 	final bool
 }
 
-func (u *uploader) uploadKnownChunkSet(ctx context.Context, src *sourceFile, lastChunk int64, includeFinal bool, urls *urlCapture) error {
+func knownUploadChunkJobs(src *sourceFile, lastChunk int64, includeFinal bool) []knownUploadChunkJob {
 	if lastChunk < 0 || (!includeFinal && lastChunk == 0) {
 		return nil
 	}
@@ -50,6 +51,11 @@ func (u *uploader) uploadKnownChunkSet(ctx context.Context, src *sourceFile, las
 	for index := int64(1); index < lastChunk; index++ {
 		addJob(index, false)
 	}
+	return jobsToUpload
+}
+
+func (u *uploader) uploadKnownChunkSet(ctx context.Context, src *sourceFile, lastChunk int64, includeFinal bool, urls *urlCapture) error {
+	jobsToUpload := knownUploadChunkJobs(src, lastChunk, includeFinal)
 	if len(jobsToUpload) == 0 {
 		return nil
 	}
@@ -207,10 +213,16 @@ func (u *uploader) uploadEmptyWithRetry(ctx context.Context, src *sourceFile, ur
 			delay = 50 * time.Millisecond
 		}
 		var reqErr *requestError
-		if attempt >= u.opts.retries && errors.As(err, &reqErr) && reqErr != nil && reqErr.master {
+		_ = errors.As(err, &reqErr)
+		if attempt >= u.opts.retries && reqErr != nil && reqErr.master {
 			delay = 10 * time.Second
 		}
-		u.logf("empty upload retry attempt=%d status=%d delay=%s err=%v", attempt+1, status, delay, err)
+		delay = retryDelayForError(delay, err)
+		retryAfter, backpressure, route := time.Duration(0), false, ""
+		if reqErr != nil {
+			retryAfter, backpressure, route = reqErr.retryAfter, reqErr.backpressure, debugSafeRouteOrigin(reqErr.route)
+		}
+		u.logf("empty upload retry attempt=%d status=%d delay=%s retry_after=%s backpressure=%t route=%s err=%v", attempt+1, status, delay, retryAfter, backpressure, route, err)
 		if err := sleepContext(ctx, delay); err != nil {
 			return err
 		}
@@ -352,11 +364,17 @@ func (u *uploader) retryChunkUpload(
 			delay = 50 * time.Millisecond
 		}
 		var reqErr *requestError
-		if attempt >= u.opts.retries && errors.As(err, &reqErr) && reqErr != nil && reqErr.master {
+		_ = errors.As(err, &reqErr)
+		if attempt >= u.opts.retries && reqErr != nil && reqErr.master {
 			delay = 10 * time.Second
 		}
+		delay = retryDelayForError(delay, err)
+		retryAfter, backpressure, route := time.Duration(0), false, ""
+		if reqErr != nil {
+			retryAfter, backpressure, route = reqErr.retryAfter, reqErr.backpressure, debugSafeRouteOrigin(reqErr.route)
+		}
 		u.debugRetry()
-		u.logf("chunk(%s) retry idx=%d final=%t attempt=%d status=%d delay=%s master_fallback=%t err=%v", mode, chunkIndex, finalChunk, attempt+1, status, delay, u.masterFallback.Load(), err)
+		u.logf("chunk(%s) retry idx=%d final=%t attempt=%d status=%d delay=%s retry_after=%s backpressure=%t route=%s master_fallback=%t err=%v", mode, chunkIndex, finalChunk, attempt+1, status, delay, retryAfter, backpressure, route, u.masterFallback.Load(), err)
 		sleepStarted := time.Now()
 		sleepErr := sleepContext(ctx, delay)
 		u.debugRetrySleep(time.Since(sleepStarted))
@@ -388,10 +406,24 @@ func (u *uploader) uploadPUT(
 	setFinalChunkHeader bool,
 	attempt int,
 ) (string, int, error) {
+	return u.uploadPUTWithTimeout(ctx, 0, src, body, contentLength, contentRange, chunkIndex, finalChunk, setFinalChunkHeader, attempt)
+}
+
+func (u *uploader) uploadPUTWithTimeout(
+	ctx context.Context,
+	requestTimeout time.Duration,
+	src *sourceFile,
+	body io.Reader,
+	contentLength int64,
+	contentRange string,
+	chunkIndex int64,
+	finalChunk bool,
+	setFinalChunkHeader bool,
+	attempt int,
+) (string, int, error) {
 	if src == nil {
 		return "", 0, errors.New("missing upload source")
 	}
-	_ = attempt
 	u.ensureRouteState()
 	target, err := u.selectUploadRoute(src, chunkIndex)
 	if err != nil {
@@ -401,16 +433,7 @@ func (u *uploader) uploadPUT(
 		u.routeLimits = newRouteLimiterSet()
 	}
 	u.routeLimits.configure([]uploadRouteTarget{target})
-	releaseRoute, err := u.routeLimits.acquire(ctx, target.rawURL)
-	if err != nil {
-		return "", 0, &requestError{cause: err, route: target.rawURL, fallback: target.fallback, master: target.master}
-	}
-	defer releaseRoute()
-	uploadBodyLease, err := u.acquireUploadBody(ctx, chunkIndex)
-	if err != nil {
-		return "", 0, &requestError{cause: err, route: target.rawURL, fallback: target.fallback, master: target.master}
-	}
-	defer uploadBodyLease.releaseRequest()
+	var uploadBodyLease *uploadBodyLease
 	if u.ui != nil && body != nil && body != http.NoBody && contentLength > 0 {
 		body = &transferBodyProgressReader{
 			reader:        body,
@@ -420,21 +443,116 @@ func (u *uploader) uploadPUT(
 		}
 	}
 	var wroteRequestAt atomic.Int64
+	var wroteHeadersAt atomic.Int64
+	var getConnAt atomic.Int64
+	var dnsStartedAt atomic.Int64
+	var tlsStartedAt atomic.Int64
+	var connectStarted sync.Map
 	if chunkIndex >= 0 {
 		ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+			GetConn: func(_ string) {
+				getConnAt.Store(time.Now().UnixNano())
+			},
 			GotConn: func(info httptrace.GotConnInfo) {
+				now := time.Now()
+				if startedAt := getConnAt.Swap(0); startedAt > 0 {
+					duration := now.Sub(time.Unix(0, startedAt))
+					if info.Reused {
+						u.debugConnectionPoolWait(duration)
+					} else {
+						u.debugConnectionAcquire(duration)
+					}
+				}
+				u.debugConnection(info.Reused)
 				if info.Conn != nil {
 					u.recordChunkRemoteIP(info.Conn.RemoteAddr())
 				}
 			},
+			DNSStart: func(_ httptrace.DNSStartInfo) {
+				dnsStartedAt.Store(time.Now().UnixNano())
+			},
+			DNSDone: func(_ httptrace.DNSDoneInfo) {
+				if startedAt := dnsStartedAt.Swap(0); startedAt > 0 {
+					u.debugDNS(time.Since(time.Unix(0, startedAt)))
+				}
+			},
+			ConnectStart: func(network, address string) {
+				connectStarted.Store(network+"\x00"+address, time.Now())
+			},
+			ConnectDone: func(network, address string, _ error) {
+				if started, ok := connectStarted.LoadAndDelete(network + "\x00" + address); ok {
+					u.debugConnect(time.Since(started.(time.Time)))
+				}
+			},
+			TLSHandshakeStart: func() {
+				tlsStartedAt.Store(time.Now().UnixNano())
+			},
+			TLSHandshakeDone: func(_ tls.ConnectionState, _ error) {
+				if startedAt := tlsStartedAt.Swap(0); startedAt > 0 {
+					u.debugTLS(time.Since(time.Unix(0, startedAt)))
+				}
+			},
+			WroteHeaders: func() {
+				wroteHeadersAt.CompareAndSwap(0, time.Now().UnixNano())
+			},
 			WroteRequest: func(info httptrace.WroteRequestInfo) {
-				if info.Err == nil && u.ui != nil {
-					wroteRequestAt.Store(time.Now().UnixNano())
-					u.ui.bodyRequestWritten(contentLength)
+				if info.Err == nil {
+					now := time.Now()
+					if wroteRequestAt.CompareAndSwap(0, now.UnixNano()) {
+						if startedAt := wroteHeadersAt.Load(); startedAt > 0 && contentLength > 0 {
+							u.debugBodySend(now.Sub(time.Unix(0, startedAt)))
+						}
+						if u.ui != nil {
+							u.ui.bodyRequestWritten(contentLength)
+						}
+					}
 				}
 				uploadBodyLease.releaseWritten()
 			},
 		})
+	}
+	var releaseRoute func()
+	for {
+		if err := u.waitUploadCooldown(ctx, target); err != nil {
+			return "", 0, &requestError{cause: err, route: target.rawURL, fallback: target.fallback, master: target.master}
+		}
+		routeWaitStarted := time.Now()
+		releaseRoute, err = u.routeLimits.acquire(ctx, target.rawURL)
+		u.debugRouteWait(time.Since(routeWaitStarted))
+		if err != nil {
+			return "", 0, &requestError{cause: err, route: target.rawURL, fallback: target.fallback, master: target.master}
+		}
+		bodyGateStarted := time.Now()
+		uploadBodyLease, err = u.acquireUploadBody(ctx, chunkIndex)
+		u.debugBodyGateWait(time.Since(bodyGateStarted))
+		if err != nil {
+			releaseRoute()
+			return "", 0, &requestError{cause: err, route: target.rawURL, fallback: target.fallback, master: target.master}
+		}
+		// A cooldown may have appeared while this worker was queued. Never hold
+		// scarce route/body permits across that delay: return both, wait at the
+		// top of the loop, then reacquire and recheck at the dispatch boundary.
+		if u.cooldowns != nil && u.cooldowns.remaining(target, time.Now()) > 0 {
+			uploadBodyLease.releaseRequest()
+			releaseRoute()
+			uploadBodyLease = nil
+			releaseRoute = nil
+			continue
+		}
+		break
+	}
+	defer releaseRoute()
+	defer uploadBodyLease.releaseRequest()
+	client := u.clientForUpload(chunkIndex, uploadBodyLease)
+	if client == nil {
+		return "", 0, errors.New("missing HTTP client")
+	}
+	// Scheduler and cooldown waits are complete. Start the network deadline only
+	// now so Retry-After never consumes it before request construction/dispatch.
+	if requestTimeout > 0 {
+		requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+		defer cancel()
+		ctx = requestCtx
 	}
 	buildStarted := time.Now()
 	req, err := u.newUploadPUTRequest(ctx, body, target)
@@ -469,15 +587,12 @@ func (u *uploader) uploadPUT(
 	u.debugRequestBuild(time.Since(buildStarted))
 
 	httpStarted := time.Now()
-	client := u.clientForUpload(chunkIndex, uploadBodyLease)
-	if client == nil {
-		return "", 0, errors.New("missing HTTP client")
-	}
 	resp, err := client.Do(req)
 	responseAt := time.Now()
 	u.debugHTTPRoundTrip(responseAt.Sub(httpStarted))
 	if err != nil {
 		requestErr := &requestError{cause: err, route: target.rawURL, fallback: target.fallback, master: target.master}
+		u.debugRouteOutcome(target.rawURL, 0, requestErr)
 		if u.routes != nil {
 			u.routes.failure(target.rawURL, 0, requestErr)
 		}
@@ -487,7 +602,28 @@ func (u *uploader) uploadPUT(
 		return "", 0, requestErr
 	}
 	defer resp.Body.Close()
+	retryAfter, retryAfterSet := retryAfterFromResponse(resp, responseAt)
+	rateBucket := uploadCooldownHeaderValue(resp.Header, "X-RateLimit-Bucket")
+	rateScope := uploadCooldownHeaderValue(resp.Header, "X-RateLimit-Scope")
+	if resp.StatusCode == http.StatusTooManyRequests {
+		cooldownErr := &requestError{
+			status:        resp.StatusCode,
+			retryAfter:    retryAfter,
+			retryAfterSet: retryAfterSet,
+			rateBucket:    rateBucket,
+			rateScope:     rateScope,
+		}
+		if !cooldownErr.retryAfterSet || cooldownErr.retryAfter <= 0 {
+			cooldownErr.retryAfter = retryBackoff(attempt + 1)
+			cooldownErr.retryAfterSet = true
+		}
+		u.observeUploadCooldown(target, cooldownErr, responseAt)
+	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if confirmation := uploadConfirmationDuration(wroteRequestAt.Load(), responseAt); confirmation > 0 {
+			u.debugProviderWait(confirmation)
+		}
+		u.debugRouteOutcome(target.rawURL, resp.StatusCode, nil)
 		if u.ui != nil {
 			if confirmation := uploadConfirmationDuration(wroteRequestAt.Load(), responseAt); confirmation > 0 {
 				u.ui.recordRequestDuration(confirmation)
@@ -515,12 +651,21 @@ func (u *uploader) uploadPUT(
 	u.debugResponseRead(time.Since(respReadStarted))
 	respBody := strings.TrimSpace(string(bodyBytes))
 	requestErr := &requestError{
-		status:   resp.StatusCode,
-		body:     respBody,
-		route:    target.rawURL,
-		fallback: target.fallback,
-		master:   target.master,
+		status:        resp.StatusCode,
+		body:          respBody,
+		route:         target.rawURL,
+		fallback:      target.fallback,
+		master:        target.master,
+		retryAfter:    retryAfter,
+		retryAfterSet: retryAfterSet,
+		backpressure:  uploadBackpressureResponse(resp.StatusCode, respBody, retryAfterSet),
+		rateBucket:    rateBucket,
+		rateScope:     rateScope,
 	}
+	if resp.StatusCode != http.StatusTooManyRequests {
+		u.observeUploadCooldown(target, requestErr, responseAt)
+	}
+	u.debugRouteOutcome(target.rawURL, resp.StatusCode, requestErr)
 	if u.routes != nil {
 		u.routes.failure(target.rawURL, resp.StatusCode, requestErr)
 	}
@@ -664,19 +809,13 @@ func (u *uploader) uploadChunkOnce(ctx context.Context, src *sourceFile, chunkIn
 	if finalChunk {
 		timeout = u.opts.finalChunkTimeout
 	}
-	reqCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
 	reader := io.NewSectionReader(src.readerAt, start, length)
 	contentRange := buildContentRange(start, endExclusive)
-	return u.uploadPUT(reqCtx, src, reader, length, contentRange, chunkIndex, finalChunk, true, attempt)
+	return u.uploadPUTWithTimeout(ctx, timeout, src, reader, length, contentRange, chunkIndex, finalChunk, true, attempt)
 }
 
 func (u *uploader) uploadEmptyOnce(ctx context.Context, src *sourceFile, attempt int) (string, int, error) {
-	reqCtx, cancel := context.WithTimeout(ctx, u.opts.finalChunkTimeout)
-	defer cancel()
-
-	return u.uploadPUT(reqCtx, src, http.NoBody, 0, "", -1, false, false, attempt)
+	return u.uploadPUTWithTimeout(ctx, u.opts.finalChunkTimeout, src, http.NoBody, 0, "", -1, false, false, attempt)
 }
 
 func buildContentRange(start, endExclusive int64) string {
@@ -694,14 +833,24 @@ func buildContentRange(start, endExclusive int64) string {
 }
 
 func (u *uploader) finalizeIfNeeded(ctx context.Context, finalURL string) error {
+	started := time.Now()
 	finalURL = strings.TrimSpace(finalURL)
 	if finalURL == "" {
-		return errors.New("server returned empty upload URL")
+		err := errors.New("server returned empty upload URL")
+		u.logf("upload stage=finalize status=error duration=%s err=%v", time.Since(started), err)
+		return err
 	}
 	if u != nil && u.opts.speedtest {
+		u.logf("upload stage=finalize status=skipped duration=%s", time.Since(started))
 		return nil
 	}
-	return u.waitForReady(ctx, finalURL, u.opts.finalizeTimeout)
+	err := u.waitForReady(ctx, finalURL, u.opts.finalizeTimeout)
+	if err != nil {
+		u.logf("upload stage=finalize status=error duration=%s err=%v", time.Since(started), err)
+		return err
+	}
+	u.logf("upload stage=finalize status=ok duration=%s", time.Since(started))
+	return nil
 }
 
 func (u *uploader) waitForReady(ctx context.Context, publicURL string, timeout time.Duration) error {
@@ -719,6 +868,14 @@ func (u *uploader) waitForReady(ctx context.Context, publicURL string, timeout t
 		return errFinalizeTimeout
 	}
 	return nil
+}
+
+type finalizationProbeResult struct {
+	ready         bool
+	failed        bool
+	finalURL      string
+	retryAfter    time.Duration
+	retryAfterSet bool
 }
 
 func (u *uploader) waitForReadyAttempt(ctx context.Context, publicURL string, timeout time.Duration) (bool, error) {
@@ -744,43 +901,55 @@ func (u *uploader) waitForReadyAttempt(ctx context.Context, publicURL string, ti
 		}
 
 		polls++
+		var probe finalizationProbeResult
 		if fileID != "" {
 			finalizeWait := remaining
 			if finalizeWait > defaultMetadataWaitMax {
 				finalizeWait = defaultMetadataWaitMax
 			}
-			ready, failed, _, err := u.requestFinalizeUpload(waitCtx, fileID, finalizeWait)
+			var err error
+			probe, err = u.requestFinalizeUpload(waitCtx, fileID, finalizeWait)
 			if err != nil {
 				return false, err
 			}
-			if ready {
+			if probe.ready {
 				if u.opts.verbose || u.opts.debug {
 					stderrLogf("finalize_ready file=%s polls=%d elapsed=%s", fileID, polls, time.Since(pollStart))
 				}
 				return true, nil
 			}
-			if failed {
+			if probe.failed {
 				return false, errors.New("server marked upload as failed")
 			}
 			if u.opts.debug && polls%5 == 0 {
 				stderrLogf("finalize_poll file=%s polls=%d elapsed=%s waiting_for=finalize_api", fileID, polls, time.Since(pollStart))
 			}
 		} else {
-			ready, failed, err := u.probeHead(waitCtx, publicURL)
+			var err error
+			probe, err = u.probeHead(waitCtx, publicURL)
 			if err != nil {
 				return false, err
 			}
-			if ready {
+			if probe.ready {
 				return true, nil
 			}
-			if failed {
+			if probe.failed {
 				return false, errors.New("final URL is not accessible")
 			}
 		}
 
+		if deadline, ok := waitCtx.Deadline(); ok {
+			remaining = time.Until(deadline)
+		}
+		if remaining <= 0 {
+			return false, nil
+		}
 		sleep := u.opts.finalizePollInterval
 		if sleep <= 0 {
 			sleep = 100 * time.Millisecond
+		}
+		if probe.retryAfterSet && probe.retryAfter > sleep {
+			sleep = probe.retryAfter
 		}
 		if sleep > remaining {
 			sleep = remaining
@@ -798,43 +967,87 @@ func (u *uploader) waitForReadyAttempt(ctx context.Context, publicURL string, ti
 	}
 }
 
-func (u *uploader) requestFinalizeUpload(ctx context.Context, fileID string, wait time.Duration) (ready bool, failed bool, finalURL string, err error) {
+func (u *uploader) requestFinalizeUpload(ctx context.Context, fileID string, wait time.Duration) (finalizationProbeResult, error) {
+	var result finalizationProbeResult
 	if strings.TrimSpace(fileID) == "" {
-		return false, false, "", nil
+		return result, nil
 	}
 	endpoint := buildFinalizeURLWithWait(u.opts.serverBase, fileID, wait)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
 	if err != nil {
-		return false, false, "", err
+		return result, err
 	}
 	req.Header.Set(headerCacheControl, cacheControlNoStoreNoCache)
 	if u.opts.uploadKey != "" {
 		req.Header.Set(headerUploadKey, u.opts.uploadKey)
+	}
+	target := uploadRouteTarget{rawURL: endpoint, parsedURL: req.URL}
+	u.ensureRouteState()
+	if err := u.waitUploadCooldown(ctx, target); err != nil {
+		if shouldFailFinalizeProbe(ctx, err) {
+			return result, err
+		}
+		return result, nil
 	}
 
 	resp, err := u.client.Do(req)
 	if err != nil {
 		if shouldFailFinalizeProbe(ctx, err) {
 			if ctx != nil && ctx.Err() != nil {
-				return false, false, "", ctx.Err()
+				return result, ctx.Err()
 			}
-			return false, false, "", err
+			return result, err
 		}
 		// Network/API blips can happen while finalization is still in progress.
-		return false, false, "", nil
+		return result, nil
 	}
 	defer resp.Body.Close()
+	responseAt := time.Now()
+	if statusMayStillFinalize(resp.StatusCode) {
+		result.retryAfter, result.retryAfterSet = retryAfterFromResponse(resp, responseAt)
+		if resp.StatusCode == http.StatusTooManyRequests && (!result.retryAfterSet || result.retryAfter <= 0) {
+			result.retryAfter = u.finalizationRateLimitDelay()
+			result.retryAfterSet = true
+		}
+		if result.retryAfterSet && result.retryAfter > 0 {
+			u.observeUploadCooldown(target, &requestError{
+				status:        resp.StatusCode,
+				retryAfter:    result.retryAfter,
+				retryAfterSet: true,
+				rateBucket:    uploadCooldownHeaderValue(resp.Header, "X-RateLimit-Bucket"),
+				rateScope:     uploadCooldownHeaderValue(resp.Header, "X-RateLimit-Scope"),
+			}, responseAt)
+		}
+	}
 	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 	bodyText := strings.TrimSpace(string(bodyBytes))
 
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-		return true, false, bodyText, nil
+		result.ready = true
+		result.finalURL = bodyText
+		return result, nil
 	case statusMayStillFinalize(resp.StatusCode):
-		return false, false, "", nil
+		return result, nil
 	default:
-		return false, true, "", nil
+		result.failed = true
+		return result, nil
 	}
+}
+
+func (u *uploader) finalizationPollDelay() time.Duration {
+	if u != nil && u.opts.finalizePollInterval > 0 {
+		return u.opts.finalizePollInterval
+	}
+	return 100 * time.Millisecond
+}
+
+func (u *uploader) finalizationRateLimitDelay() time.Duration {
+	delay := u.finalizationPollDelay()
+	if delay < time.Second {
+		return time.Second
+	}
+	return delay
 }
 
 func (u *uploader) probeMetadata(ctx context.Context, fileID string, wait time.Duration) (ready bool, failed bool, err error) {
@@ -887,35 +1100,63 @@ func (u *uploader) probeMetadata(ctx context.Context, fileID string, wait time.D
 	}
 }
 
-func (u *uploader) probeHead(ctx context.Context, publicURL string) (ready bool, failed bool, err error) {
+func (u *uploader) probeHead(ctx context.Context, publicURL string) (finalizationProbeResult, error) {
+	var result finalizationProbeResult
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, publicURL, nil)
 	if err != nil {
-		return false, false, err
+		return result, err
 	}
 	req.Header.Set(headerCacheControl, cacheControlNoStoreNoCache)
 	if u.opts.password != "" {
 		req.Header.Set(headerDownloadPassword, u.opts.password)
+	}
+	target := uploadRouteTarget{rawURL: publicURL, parsedURL: req.URL}
+	u.ensureRouteState()
+	if err := u.waitUploadCooldown(ctx, target); err != nil {
+		if shouldFailFinalizeProbe(ctx, err) {
+			return result, err
+		}
+		return result, nil
 	}
 
 	resp, err := u.client.Do(req)
 	if err != nil {
 		if shouldFailFinalizeProbe(ctx, err) {
 			if ctx != nil && ctx.Err() != nil {
-				return false, false, ctx.Err()
+				return result, ctx.Err()
 			}
-			return false, false, err
+			return result, err
 		}
-		return false, false, nil
+		return result, nil
 	}
 	defer resp.Body.Close()
+	responseAt := time.Now()
+	if statusMayStillFinalize(resp.StatusCode) {
+		result.retryAfter, result.retryAfterSet = retryAfterFromResponse(resp, responseAt)
+		if resp.StatusCode == http.StatusTooManyRequests && (!result.retryAfterSet || result.retryAfter <= 0) {
+			result.retryAfter = u.finalizationRateLimitDelay()
+			result.retryAfterSet = true
+		}
+		if result.retryAfterSet && result.retryAfter > 0 {
+			u.observeUploadCooldown(target, &requestError{
+				status:        resp.StatusCode,
+				retryAfter:    result.retryAfter,
+				retryAfterSet: true,
+				rateBucket:    uploadCooldownHeaderValue(resp.Header, "X-RateLimit-Bucket"),
+				rateScope:     uploadCooldownHeaderValue(resp.Header, "X-RateLimit-Scope"),
+			}, responseAt)
+		}
+	}
 
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 400:
-		return true, false, nil
+		result.ready = true
+		return result, nil
 	case statusMayStillFinalize(resp.StatusCode):
-		return false, false, nil
+		return result, nil
 	default:
-		return false, true, nil
+		result.failed = true
+		return result, nil
 	}
 }
 

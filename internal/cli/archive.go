@@ -32,13 +32,6 @@ type archivePathSpec struct {
 	rootName  string
 }
 
-// openArchiveSource starts a backpressured tar+LZ4 stream. The pipe means no
-// temporary archive is created: compression advances only while the upload
-// pipeline is able to accept more bytes.
-func openArchiveSource(sourcePath string, opts options) (*sourceFile, func(), error) {
-	return openArchiveSources([]string{sourcePath}, opts)
-}
-
 func openArchiveSources(sourcePaths []string, opts options) (*sourceFile, func(), error) {
 	expandedPaths, err := expandArchivePathPatterns(sourcePaths, runtime.GOOS == "windows")
 	if err != nil {
@@ -213,10 +206,6 @@ func waitForArchiveProducer(done <-chan struct{}, grace time.Duration) {
 	}
 }
 
-func writeTarLZ4(ctx context.Context, dst io.Writer, sourcePath, rootName string) error {
-	return writeTarLZ4Paths(ctx, dst, []archivePathSpec{{absPath: sourcePath, rootName: rootName}})
-}
-
 func writeTarLZ4Paths(ctx context.Context, dst io.Writer, paths []archivePathSpec) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -336,10 +325,6 @@ func automaticArchivePrefetchPolicy(available int64, gomaxprocs int) archivePref
 		return archivePrefetchPolicy{}
 	}
 	return archivePrefetchPolicy{workers: workers, maxFileBytes: maxFileBytes}
-}
-
-func writeTarPath(ctx context.Context, tarWriter *tar.Writer, sourcePath, rootName string) error {
-	return writeTarPaths(ctx, tarWriter, []archivePathSpec{{absPath: sourcePath, rootName: rootName}})
 }
 
 func writeTarPaths(ctx context.Context, tarWriter *tar.Writer, paths []archivePathSpec) error {
