@@ -8,11 +8,17 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/mydearniko/idoud/internal/mountcore"
+)
+
+const (
+	maximumGrantFetchAttempts = 3
+	maximumGrantRetryWait     = 30 * time.Second
 )
 
 type remoteVersion struct {
@@ -81,26 +87,43 @@ func (source *remoteVersion) ReadAt(ctx context.Context, target []byte, offset i
 	}
 	written := 0
 	for written < len(requested) {
-		chunkLength := min(int64(len(requested)-written), source.backend.readChunkSize)
-		release, err := source.backend.reads.acquire(ctx, chunkLength)
+		logicalOffset := offset + int64(written)
+		blockOffset := logicalOffset / source.backend.readChunkSize * source.backend.readChunkSize
+		blockLength := min(source.backend.readChunkSize, source.size-blockOffset)
+		block, err := source.backend.blocks.load(ctx, cleanBlockKey{
+			versionID: source.versionID,
+			offset:    blockOffset,
+		}, func() ([]byte, error) {
+			release, acquireErr := source.backend.reads.acquire(ctx, blockLength)
+			if acquireErr != nil {
+				return nil, acquireErr
+			}
+			defer release()
+			handle, handleErr := source.usableHandle(ctx)
+			if handleErr != nil {
+				return nil, handleErr
+			}
+			data := make([]byte, blockLength)
+			count, readErr := source.readExact(ctx, handle, data, blockOffset)
+			if readErr != nil {
+				return nil, readErr
+			}
+			if count != len(data) {
+				return nil, io.ErrUnexpectedEOF
+			}
+			return data, nil
+		})
 		if err != nil {
 			return written, err
 		}
-		handle, err := source.usableHandle(ctx)
-		if err == nil {
-			var count int
-			count, err = source.readExact(
-				ctx,
-				handle,
-				requested[written:written+int(chunkLength)],
-				offset+int64(written),
-			)
-			written += count
+		withinBlock := logicalOffset - blockOffset
+		available := int64(len(block)) - withinBlock
+		if available < 1 {
+			return written, ErrInvalidProtocol
 		}
-		release()
-		if err != nil {
-			return written, err
-		}
+		amount := min(int64(len(requested)-written), available)
+		copy(requested[written:written+int(amount)], block[withinBlock:withinBlock+amount])
+		written += int(amount)
 	}
 	if partialEOF {
 		return written, io.EOF
@@ -207,9 +230,28 @@ func (b *Backend) fetchGrant(ctx context.Context, rawURL string, grantToken stri
 	if origin != b.selectedNodeOrigin || (parsed.Scheme != "https" && !(b.allowHTTP && parsed.Scheme == "http")) {
 		return ErrInvalidProtocol
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	for attempt := 0; attempt < maximumGrantFetchAttempts; attempt++ {
+		retry, delay, err := b.fetchGrantAttempt(ctx, parsed.String(), grantToken, target, attempt)
+		if err == nil || !retry || attempt == maximumGrantFetchAttempts-1 {
+			return err
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return ErrInvalidProtocol
+}
+
+func (b *Backend) fetchGrantAttempt(ctx context.Context, rawURL string, grantToken string, target []byte, attempt int) (bool, time.Duration, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return err
+		return false, 0, err
 	}
 	request.Header.Set("Authorization", "Bearer "+grantToken)
 	request.Header.Set("Accept", "application/octet-stream")
@@ -219,27 +261,85 @@ func (b *Backend) fetchGrant(ctx context.Context, rawURL string, grantToken stri
 	}
 	response, err := b.client.Do(request)
 	if err != nil {
-		return err
+		if ctx.Err() != nil {
+			return false, 0, ctx.Err()
+		}
+		delay := grantRetryDelay("", b.clock(), attempt)
+		return delay >= 0, delay, err
 	}
-	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return &APIError{Status: response.StatusCode, Code: "blocked_auth", Message: "scoped data grant was rejected"}
+		_ = response.Body.Close()
+		apiError := &APIError{Status: response.StatusCode, RetryAfter: response.Header.Get("Retry-After")}
+		switch response.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
+			apiError.Code = "blocked_auth"
+			apiError.Message = "scoped data grant was rejected"
+			return false, 0, apiError
+		}
+		apiError.Code = "data_unavailable"
+		apiError.Message = "selected data node is temporarily unavailable"
+		if grantStatusRetryable(response.StatusCode) {
+			delay := grantRetryDelay(apiError.RetryAfter, b.clock(), attempt)
+			return delay >= 0, delay, apiError
+		}
+		return false, 0, apiError
 	}
 	if length, present := parseContentLength(response.Header); !present || length != int64(len(target)) {
-		return fmt.Errorf("%w: scoped data length", ErrInvalidProtocol)
+		_ = response.Body.Close()
+		return false, 0, fmt.Errorf("%w: scoped data length", ErrInvalidProtocol)
 	}
 	read, err := io.ReadFull(response.Body, target)
 	if err != nil {
-		return err
+		_ = response.Body.Close()
+		if ctx.Err() != nil {
+			return false, 0, ctx.Err()
+		}
+		delay := grantRetryDelay("", b.clock(), attempt)
+		return delay >= 0, delay, err
 	}
 	var extra [1]byte
-	if count, extraErr := response.Body.Read(extra[:]); count != 0 || (extraErr != nil && !errors.Is(extraErr, io.EOF)) {
-		return ErrInvalidProtocol
+	count, extraErr := response.Body.Read(extra[:])
+	_ = response.Body.Close()
+	if count != 0 {
+		return false, 0, ErrInvalidProtocol
+	}
+	if extraErr != nil && !errors.Is(extraErr, io.EOF) {
+		if ctx.Err() != nil {
+			return false, 0, ctx.Err()
+		}
+		delay := grantRetryDelay("", b.clock(), attempt)
+		return delay >= 0, delay, extraErr
 	}
 	if read != len(target) {
-		return ErrInvalidProtocol
+		return false, 0, ErrInvalidProtocol
 	}
-	return nil
+	return false, 0, nil
+}
+
+func grantStatusRetryable(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooEarly ||
+		status == http.StatusTooManyRequests ||
+		(status >= http.StatusInternalServerError && status <= 599)
+}
+
+func grantRetryDelay(raw string, now time.Time, attempt int) time.Duration {
+	delay := time.Duration(1<<min(attempt, 5)) * 100 * time.Millisecond
+	raw = strings.TrimSpace(raw)
+	if seconds, err := strconv.ParseInt(raw, 10, 64); err == nil && seconds >= 0 {
+		if seconds > int64(maximumGrantRetryWait/time.Second) {
+			return -1
+		}
+		delay = time.Duration(seconds) * time.Second
+	} else if deadline, err := http.ParseTime(raw); err == nil {
+		delay = deadline.Sub(now)
+		if delay < 0 {
+			delay = 0
+		}
+	}
+	if delay > maximumGrantRetryWait {
+		return -1
+	}
+	return delay
 }
 
 func (source *remoteVersion) Close() error {

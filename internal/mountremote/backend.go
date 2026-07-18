@@ -84,6 +84,7 @@ type Backend struct {
 	maximumEntries     int
 	readChunkSize      int64
 	reads              *readLimiter
+	blocks             *cleanBlockCache
 
 	mu              sync.RWMutex
 	sessionToken    string
@@ -308,6 +309,7 @@ func New(ctx context.Context, config Config) (*Backend, error) {
 			mounted.SchedulerPlan.MaxInflightRequests,
 			mounted.SchedulerPlan.MaxInflightBytes,
 		),
+		blocks:       newCleanBlockCache(mounted.SchedulerPlan.MaxInflightBytes),
 		sessionToken: mounted.SessionToken, currentSequence: descriptor.Folder.Sequence,
 		sources: make(map[*remoteVersion]struct{}),
 	}
@@ -485,6 +487,7 @@ func (b *Backend) Close() error {
 	token := b.sessionToken
 	b.sessionToken = ""
 	b.reads.close()
+	b.blocks.close()
 	sources := make([]*remoteVersion, 0, len(b.sources))
 	for source := range b.sources {
 		sources = append(sources, source)

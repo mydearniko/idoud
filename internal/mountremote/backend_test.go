@@ -30,27 +30,31 @@ const (
 )
 
 type remoteFixture struct {
-	t             *testing.T
-	server        *httptest.Server
-	origin        string
-	now           int64
-	payload       []byte
-	mu            sync.Mutex
-	grants        map[string][]byte
-	grantRanges   [][2]int64
-	refreshes     int
-	closes        int
-	urlLeak       bool
-	failChanges   bool
-	badDataOrigin bool
-	badDataLength bool
-	maxRequests   int
-	maxBytes      int64
-	blockSize     int64
-	dataGate      chan struct{}
-	dataEntered   chan struct{}
-	activeData    int
-	maximumActive int
+	t              *testing.T
+	server         *httptest.Server
+	origin         string
+	now            int64
+	payload        []byte
+	mu             sync.Mutex
+	grants         map[string][]byte
+	grantRanges    [][2]int64
+	refreshes      int
+	closes         int
+	urlLeak        bool
+	failChanges    bool
+	badDataOrigin  bool
+	badDataLength  bool
+	maxRequests    int
+	maxBytes       int64
+	blockSize      int64
+	dataGate       chan struct{}
+	dataEntered    chan struct{}
+	activeData     int
+	maximumActive  int
+	dataFailures   int
+	dataStatus     int
+	dataRetryAfter string
+	dataRequests   int
 }
 
 func newRemoteFixture(t *testing.T) *remoteFixture {
@@ -245,7 +249,14 @@ func (fixture *remoteFixture) writeData(w http.ResponseWriter, r *http.Request) 
 	badLength := fixture.badDataLength
 	gate := fixture.dataGate
 	entered := fixture.dataEntered
-	if found && gate != nil {
+	fixture.dataRequests++
+	failureStatus := 0
+	retryAfter := fixture.dataRetryAfter
+	if found && fixture.dataFailures > 0 {
+		fixture.dataFailures--
+		failureStatus = fixture.dataStatus
+	}
+	if found && failureStatus == 0 && gate != nil {
 		fixture.activeData++
 		if fixture.activeData > fixture.maximumActive {
 			fixture.maximumActive = fixture.activeData
@@ -254,6 +265,13 @@ func (fixture *remoteFixture) writeData(w http.ResponseWriter, r *http.Request) 
 	fixture.mu.Unlock()
 	if !found || token == "" {
 		writeRemoteError(w, http.StatusUnauthorized, "blocked_auth", "unknown grant")
+		return
+	}
+	if failureStatus != 0 {
+		if retryAfter != "" {
+			w.Header().Set("Retry-After", retryAfter)
+		}
+		writeRemoteError(w, failureStatus, "data_unavailable", "synthetic node outage")
 		return
 	}
 	if gate != nil {
@@ -398,8 +416,9 @@ func TestBackendNegotiatesListsPinsReadsChangesAndRedacts(t *testing.T) {
 	}
 	fixture.mu.Lock()
 	defer fixture.mu.Unlock()
-	if fixture.refreshes != 1 || fixture.closes != 1 || fixture.urlLeak {
-		t.Fatalf("refreshes=%d closes=%d urlLeak=%v", fixture.refreshes, fixture.closes, fixture.urlLeak)
+	if fixture.refreshes != 1 || fixture.closes != 1 || fixture.urlLeak ||
+		fmt.Sprint(fixture.grantRanges) != fmt.Sprint([][2]int64{{0, int64(len(fixture.payload))}}) {
+		t.Fatalf("refreshes=%d closes=%d urlLeak=%v grantRanges=%v", fixture.refreshes, fixture.closes, fixture.urlLeak, fixture.grantRanges)
 	}
 }
 
@@ -512,6 +531,163 @@ func TestBackendEnforcesNegotiatedReadBudgetsAndChunks(t *testing.T) {
 	wantRanges := [][2]int64{{0, 4}, {4, 8}, {8, 12}, {12, 16}}
 	if fmt.Sprint(ranges) != fmt.Sprint(wantRanges) {
 		t.Fatalf("chunked grant ranges=%v want=%v", ranges, wantRanges)
+	}
+}
+
+func TestBackendSingleflightsConcurrentReadsWithinImmutableBlock(t *testing.T) {
+	fixture := newRemoteFixture(t)
+	fixture.payload = []byte("abcdefghijklmnop")
+	fixture.maxRequests = 2
+	fixture.maxBytes = 16
+	fixture.blockSize = 8
+	fixture.dataGate = make(chan struct{})
+	fixture.dataEntered = make(chan struct{}, 2)
+	ctx := context.Background()
+	backend, err := New(ctx, Config{
+		BaseURL: fixture.origin, ShareID: testShareID, SessionToken: testOrdinaryToken,
+		AllowHTTP: true, Clock: func() time.Time { return time.Unix(fixture.now, 0) },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer backend.Close()
+	core, err := mountcore.New(ctx, backend)
+	if err != nil {
+		t.Fatalf("mountcore.New: %v", err)
+	}
+	defer core.Close()
+	if _, _, err := core.ListDirectory(ctx, testRootID); err != nil {
+		t.Fatalf("ListDirectory: %v", err)
+	}
+	handle, err := core.Open(ctx, testFileID)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	type result struct {
+		offset int64
+		data   []byte
+		err    error
+	}
+	results := make(chan result, 2)
+	for _, offset := range []int64{0, 4} {
+		offset := offset
+		go func() {
+			data := make([]byte, 4)
+			count, readErr := core.Read(ctx, handle.ID, data, offset)
+			results <- result{offset: offset, data: data[:count], err: readErr}
+		}()
+	}
+	select {
+	case <-fixture.dataEntered:
+	case <-time.After(2 * time.Second):
+		close(fixture.dataGate)
+		t.Fatal("immutable block loader did not start")
+	}
+	select {
+	case <-fixture.dataEntered:
+		close(fixture.dataGate)
+		t.Fatal("same immutable block started a duplicate provider request")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(fixture.dataGate)
+	for range 2 {
+		select {
+		case outcome := <-results:
+			if outcome.err != nil || !bytes.Equal(outcome.data, fixture.payload[outcome.offset:outcome.offset+4]) {
+				t.Fatalf("read offset=%d data=%q err=%v", outcome.offset, outcome.data, outcome.err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("singleflight readers did not complete")
+		}
+	}
+	fixture.mu.Lock()
+	ranges := append([][2]int64(nil), fixture.grantRanges...)
+	maximumActive := fixture.maximumActive
+	fixture.mu.Unlock()
+	if fmt.Sprint(ranges) != fmt.Sprint([][2]int64{{0, 8}}) || maximumActive != 1 {
+		t.Fatalf("singleflight ranges=%v maximumActive=%d", ranges, maximumActive)
+	}
+	if err := backend.blocks.validateBound(); err != nil {
+		t.Fatalf("cache bound: %v", err)
+	}
+}
+
+func TestBackendRetriesBoundedTransientGrantFailures(t *testing.T) {
+	fixture := newRemoteFixture(t)
+	fixture.payload = []byte("abcdefghijklmnop")
+	fixture.maxBytes = 16
+	fixture.blockSize = 8
+	fixture.dataFailures = 2
+	fixture.dataStatus = http.StatusServiceUnavailable
+	fixture.dataRetryAfter = "0"
+	backend, err := New(context.Background(), Config{
+		BaseURL: fixture.origin, ShareID: testShareID, SessionToken: testOrdinaryToken,
+		AllowHTTP: true, Clock: func() time.Time { return time.Unix(fixture.now, 0) },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer backend.Close()
+	source, err := backend.OpenVersion(context.Background(), mountcore.Entry{ID: testFileID, Kind: mountcore.KindFile, Size: int64(len(fixture.payload))})
+	if err != nil {
+		t.Fatalf("OpenVersion: %v", err)
+	}
+	target := make([]byte, 4)
+	if count, err := source.ReadAt(context.Background(), target, 0); err != nil || count != len(target) || !bytes.Equal(target, fixture.payload[:4]) {
+		t.Fatalf("retried read count=%d data=%q err=%v", count, target, err)
+	}
+	fixture.mu.Lock()
+	requests := fixture.dataRequests
+	fixture.mu.Unlock()
+	if requests != maximumGrantFetchAttempts {
+		t.Fatalf("transient data requests=%d, want %d", requests, maximumGrantFetchAttempts)
+	}
+}
+
+func TestBackendDoesNotRetryRejectedGrant(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			fixture := newRemoteFixture(t)
+			fixture.payload = []byte("abcdefghijklmnop")
+			fixture.maxBytes = 16
+			fixture.blockSize = 8
+			fixture.dataFailures = maximumGrantFetchAttempts
+			fixture.dataStatus = status
+			backend, err := New(context.Background(), Config{
+				BaseURL: fixture.origin, ShareID: testShareID, SessionToken: testOrdinaryToken,
+				AllowHTTP: true, Clock: func() time.Time { return time.Unix(fixture.now, 0) },
+			})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			defer backend.Close()
+			source, err := backend.OpenVersion(context.Background(), mountcore.Entry{ID: testFileID, Kind: mountcore.KindFile, Size: int64(len(fixture.payload))})
+			if err != nil {
+				t.Fatalf("OpenVersion: %v", err)
+			}
+			if _, err := source.ReadAt(context.Background(), make([]byte, 4), 0); !errors.Is(err, ErrBlockedAuth) {
+				t.Fatalf("rejected grant error=%v", err)
+			}
+			fixture.mu.Lock()
+			requests := fixture.dataRequests
+			fixture.mu.Unlock()
+			if requests != 1 {
+				t.Fatalf("rejected grant requests=%d, want 1", requests)
+			}
+		})
+	}
+}
+
+func TestGrantRetryDelayHonorsBoundedServerDeadline(t *testing.T) {
+	now := time.Unix(10_000, 0).UTC()
+	if delay := grantRetryDelay("7", now, 0); delay != 7*time.Second {
+		t.Fatalf("delay-seconds retry=%s", delay)
+	}
+	if delay := grantRetryDelay(now.Add(9*time.Second).Format(http.TimeFormat), now, 0); delay != 9*time.Second {
+		t.Fatalf("HTTP-date retry=%s", delay)
+	}
+	if delay := grantRetryDelay("31", now, 0); delay >= 0 {
+		t.Fatalf("excessive server retry remained enabled: %s", delay)
 	}
 }
 
