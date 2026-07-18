@@ -128,13 +128,14 @@ func (source *remoteVersion) ReadAt(ctx context.Context, target []byte, offset i
 func (source *remoteVersion) shouldSpeculate(offset int64, length int64) bool {
 	source.scheduleMu.Lock()
 	defer source.scheduleMu.Unlock()
+	initialStartRead := source.lastReadEnd == 0 && offset == 0
 	if offset == source.lastReadEnd && source.lastReadEnd > 0 {
 		source.sequentialReads++
 	} else {
 		source.sequentialReads = 0
 	}
 	source.lastReadEnd = offset + length
-	return length >= minimumSpeculativeRead || source.sequentialReads >= 2
+	return initialStartRead || length >= minimumSpeculativeRead || source.sequentialReads >= 2
 }
 
 func (source *remoteVersion) loadBlock(ctx context.Context, blockOffset int64, speculate bool) ([]byte, error) {

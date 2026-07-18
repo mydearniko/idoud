@@ -550,6 +550,7 @@ func TestBackendSingleflightsConcurrentReadsWithinImmutableBlock(t *testing.T) {
 	fixture.maxRequests = 2
 	fixture.maxBytes = 16
 	fixture.blockSize = 8
+	fixture.maxSpeculativeLead = 0
 	fixture.dataGate = make(chan struct{})
 	fixture.dataEntered = make(chan struct{}, 2)
 	ctx := context.Background()
@@ -921,7 +922,7 @@ func TestBackendFetchesIndependentGrantPartsConcurrently(t *testing.T) {
 
 func TestBackendDoesNotSpeculateOnInitialSmallRandomRead(t *testing.T) {
 	fixture := newRemoteFixture(t)
-	fixture.payload = bytes.Repeat([]byte("abcdefgh"), 2<<10)
+	fixture.payload = bytes.Repeat([]byte("abcdefgh"), 3<<10)
 	fixture.maxRequests = 2
 	fixture.maxBytes = 16 << 10
 	fixture.blockSize = 8 << 10
@@ -939,15 +940,73 @@ func TestBackendDoesNotSpeculateOnInitialSmallRandomRead(t *testing.T) {
 		t.Fatalf("OpenVersion: %v", err)
 	}
 	target := make([]byte, 4<<10)
-	if count, err := source.ReadAt(context.Background(), target, 0); err != nil || count != len(target) || !bytes.Equal(target, fixture.payload[:len(target)]) {
+	if count, err := source.ReadAt(context.Background(), target, 8<<10); err != nil || count != len(target) || !bytes.Equal(target, fixture.payload[8<<10:12<<10]) {
 		t.Fatalf("small random read count=%d err=%v", count, err)
 	}
 	time.Sleep(50 * time.Millisecond)
 	fixture.mu.Lock()
 	ranges := append([][2]int64(nil), fixture.grantRanges...)
 	fixture.mu.Unlock()
-	if fmt.Sprint(ranges) != fmt.Sprint([][2]int64{{0, 8 << 10}}) {
+	if fmt.Sprint(ranges) != fmt.Sprint([][2]int64{{8 << 10, 16 << 10}}) {
 		t.Fatalf("small random read speculated ranges=%v", ranges)
+	}
+}
+
+func TestBackendSpeculatesOneBlockForInitialSmallStartRead(t *testing.T) {
+	fixture := newRemoteFixture(t)
+	fixture.payload = bytes.Repeat([]byte("abcdefgh"), 2<<10)
+	fixture.maxRequests = 2
+	fixture.maxBytes = 16 << 10
+	fixture.blockSize = 8 << 10
+	fixture.maxSpeculativeLead = 8 << 10
+	fixture.dataGate = make(chan struct{})
+	fixture.dataEntered = make(chan struct{}, 2)
+	backend, err := New(context.Background(), Config{
+		BaseURL: fixture.origin, ShareID: testShareID, SessionToken: testOrdinaryToken,
+		AllowHTTP: true, Clock: func() time.Time { return time.Unix(fixture.now, 0) },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer backend.Close()
+	source, err := backend.OpenVersion(context.Background(), mountcore.Entry{ID: testFileID, Kind: mountcore.KindFile, Size: int64(len(fixture.payload))})
+	if err != nil {
+		t.Fatalf("OpenVersion: %v", err)
+	}
+	target := make([]byte, 4<<10)
+	type readResult struct {
+		count int
+		err   error
+	}
+	result := make(chan readResult, 1)
+	go func() {
+		count, readErr := source.ReadAt(context.Background(), target, 0)
+		result <- readResult{count: count, err: readErr}
+	}()
+	for range 2 {
+		select {
+		case <-fixture.dataEntered:
+		case <-time.After(2 * time.Second):
+			close(fixture.dataGate)
+			t.Fatal("initial small start read did not overlap one speculative block")
+		}
+	}
+	close(fixture.dataGate)
+	select {
+	case outcome := <-result:
+		if outcome.err != nil || outcome.count != len(target) || !bytes.Equal(target, fixture.payload[:len(target)]) {
+			t.Fatalf("initial small start read count=%d err=%v", outcome.count, outcome.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial small start read did not complete")
+	}
+	fixture.mu.Lock()
+	ranges := append([][2]int64(nil), fixture.grantRanges...)
+	maximumActive := fixture.maximumActive
+	fixture.mu.Unlock()
+	sort.Slice(ranges, func(left int, right int) bool { return ranges[left][0] < ranges[right][0] })
+	if fmt.Sprint(ranges) != fmt.Sprint([][2]int64{{0, 8 << 10}, {8 << 10, 16 << 10}}) || maximumActive != 2 {
+		t.Fatalf("initial small start ranges=%v maximumActive=%d", ranges, maximumActive)
 	}
 }
 
@@ -956,6 +1015,7 @@ func TestBackendRetriesBoundedTransientGrantFailures(t *testing.T) {
 	fixture.payload = []byte("abcdefghijklmnop")
 	fixture.maxBytes = 16
 	fixture.blockSize = 8
+	fixture.maxSpeculativeLead = 0
 	fixture.dataFailures = 2
 	fixture.dataStatus = http.StatusServiceUnavailable
 	fixture.dataRetryAfter = "0"
@@ -990,6 +1050,7 @@ func TestBackendDoesNotRetryRejectedGrant(t *testing.T) {
 			fixture.payload = []byte("abcdefghijklmnop")
 			fixture.maxBytes = 16
 			fixture.blockSize = 8
+			fixture.maxSpeculativeLead = 0
 			fixture.dataFailures = maximumGrantFetchAttempts
 			fixture.dataStatus = status
 			backend, err := New(context.Background(), Config{
