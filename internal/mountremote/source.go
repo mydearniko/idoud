@@ -19,6 +19,7 @@ import (
 const (
 	maximumGrantFetchAttempts = 3
 	maximumGrantRetryWait     = 30 * time.Second
+	minimumSpeculativeRead    = 128 << 10
 )
 
 type remoteVersion struct {
@@ -34,6 +35,11 @@ type remoteVersion struct {
 	handleToken string
 	expiresAt   int64
 	closed      bool
+
+	scheduleMu      sync.Mutex
+	lastReadEnd     int64
+	sequentialReads int
+	prefetching     bool
 }
 
 type dataGrantResponse struct {
@@ -85,34 +91,12 @@ func (source *remoteVersion) ReadAt(ctx context.Context, target []byte, offset i
 		requested = requested[:int(remaining)]
 		partialEOF = true
 	}
+	speculate := source.shouldSpeculate(offset, int64(len(requested)))
 	written := 0
 	for written < len(requested) {
 		logicalOffset := offset + int64(written)
 		blockOffset := logicalOffset / source.backend.readChunkSize * source.backend.readChunkSize
-		blockLength := min(source.backend.readChunkSize, source.size-blockOffset)
-		block, err := source.backend.blocks.load(ctx, cleanBlockKey{
-			versionID: source.versionID,
-			offset:    blockOffset,
-		}, func() ([]byte, error) {
-			release, acquireErr := source.backend.reads.acquire(ctx, blockLength)
-			if acquireErr != nil {
-				return nil, acquireErr
-			}
-			defer release()
-			handle, handleErr := source.usableHandle(ctx)
-			if handleErr != nil {
-				return nil, handleErr
-			}
-			data := make([]byte, blockLength)
-			count, readErr := source.readExact(ctx, handle, data, blockOffset)
-			if readErr != nil {
-				return nil, readErr
-			}
-			if count != len(data) {
-				return nil, io.ErrUnexpectedEOF
-			}
-			return data, nil
-		})
+		block, err := source.loadBlock(ctx, blockOffset, speculate)
 		if err != nil {
 			return written, err
 		}
@@ -124,11 +108,80 @@ func (source *remoteVersion) ReadAt(ctx context.Context, target []byte, offset i
 		amount := min(int64(len(requested)-written), available)
 		copy(requested[written:written+int(amount)], block[withinBlock:withinBlock+amount])
 		written += int(amount)
+		if speculate {
+			source.startPrefetch(blockOffset + int64(len(block)))
+		}
 	}
 	if partialEOF {
 		return written, io.EOF
 	}
 	return written, nil
+}
+
+func (source *remoteVersion) shouldSpeculate(offset int64, length int64) bool {
+	source.scheduleMu.Lock()
+	defer source.scheduleMu.Unlock()
+	if offset == source.lastReadEnd && source.lastReadEnd > 0 {
+		source.sequentialReads++
+	} else {
+		source.sequentialReads = 0
+	}
+	source.lastReadEnd = offset + length
+	return length >= minimumSpeculativeRead || source.sequentialReads >= 2
+}
+
+func (source *remoteVersion) loadBlock(ctx context.Context, blockOffset int64, speculate bool) ([]byte, error) {
+	blockLength := min(source.backend.readChunkSize, source.size-blockOffset)
+	if blockOffset < 0 || blockLength < 1 {
+		return nil, ErrInvalidProtocol
+	}
+	return source.backend.blocks.load(ctx, cleanBlockKey{
+		versionID: source.versionID,
+		offset:    blockOffset,
+	}, func() ([]byte, error) {
+		release, err := source.backend.reads.acquire(ctx, blockLength)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+		handle, err := source.usableHandle(ctx)
+		if err != nil {
+			return nil, err
+		}
+		data := make([]byte, blockLength)
+		var onExactReady func()
+		if speculate {
+			onExactReady = func() { source.startPrefetch(blockOffset + blockLength) }
+		}
+		count, err := source.readExact(ctx, handle, data, blockOffset, onExactReady)
+		if err != nil {
+			return nil, err
+		}
+		if count != len(data) {
+			return nil, io.ErrUnexpectedEOF
+		}
+		return data, nil
+	})
+}
+
+func (source *remoteVersion) startPrefetch(blockOffset int64) {
+	if blockOffset < 0 || blockOffset >= source.size ||
+		source.backend.negotiation.Scheduler.MaxSpeculativeLead < source.backend.readChunkSize {
+		return
+	}
+	source.scheduleMu.Lock()
+	if source.prefetching {
+		source.scheduleMu.Unlock()
+		return
+	}
+	source.prefetching = true
+	source.scheduleMu.Unlock()
+	go func() {
+		_, _ = source.loadBlock(source.backend.ctx, blockOffset, false)
+		source.scheduleMu.Lock()
+		source.prefetching = false
+		source.scheduleMu.Unlock()
+	}()
 }
 
 func (source *remoteVersion) usableHandle(ctx context.Context) (string, error) {
@@ -175,7 +228,13 @@ func (source *remoteVersion) refreshIfNeededLocked(ctx context.Context) error {
 	return nil
 }
 
-func (source *remoteVersion) readExact(ctx context.Context, handle string, target []byte, offset int64) (int, error) {
+func (source *remoteVersion) readExact(
+	ctx context.Context,
+	handle string,
+	target []byte,
+	offset int64,
+	onExactReady func(),
+) (int, error) {
 	end := offset + int64(len(target))
 	body, _ := json.Marshal(map[string]int64{"start": offset, "end": end})
 	var grant dataGrantResponse
@@ -190,6 +249,12 @@ func (source *remoteVersion) readExact(ctx context.Context, handle string, targe
 		return 0, ErrInvalidProtocol
 	}
 	cursor := offset
+	type fetchTask struct {
+		target []byte
+		url    string
+		token  string
+	}
+	tasks := make([]fetchTask, 0, len(grant.Parts))
 	written := 0
 	for _, part := range grant.Parts {
 		if part.LogicalOffset != cursor || part.Length < 1 || part.Length > int64(len(target)-written) {
@@ -207,15 +272,61 @@ func (source *remoteVersion) readExact(ctx context.Context, handle string, targe
 				part.ExpiresAt > source.backend.negotiation.SessionExpiry {
 				return written, ErrInvalidProtocol
 			}
-			if err := source.backend.fetchGrant(ctx, part.DataURL, part.GrantToken, segment); err != nil {
-				return written, err
-			}
+			tasks = append(tasks, fetchTask{target: segment, url: part.DataURL, token: part.GrantToken})
 		}
 		written += len(segment)
 		cursor += part.Length
 	}
 	if written != len(target) || cursor != end {
 		return written, ErrInvalidProtocol
+	}
+	if len(tasks) == 0 {
+		if onExactReady != nil {
+			onExactReady()
+		}
+		return written, nil
+	}
+
+	// Reserve capacity for the exact read before admitting speculative work.
+	// The remaining grant parts still run concurrently within the negotiated
+	// request and byte ceilings.
+	fetchContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	firstRelease, err := source.backend.fetches.acquire(fetchContext, int64(len(tasks[0].target)))
+	if err != nil {
+		return 0, err
+	}
+	if onExactReady != nil {
+		onExactReady()
+	}
+	var firstError error
+	var firstErrorOnce sync.Once
+	var wait sync.WaitGroup
+	for index, task := range tasks {
+		index, task := index, task
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			release := firstRelease
+			var fetchErr error
+			if index != 0 {
+				release, fetchErr = source.backend.fetches.acquire(fetchContext, int64(len(task.target)))
+			}
+			if fetchErr == nil {
+				fetchErr = source.backend.fetchGrant(fetchContext, task.url, task.token, task.target)
+				release()
+			}
+			if fetchErr != nil {
+				firstErrorOnce.Do(func() {
+					firstError = fetchErr
+					cancel()
+				})
+			}
+		}()
+	}
+	wait.Wait()
+	if firstError != nil {
+		return 0, firstError
 	}
 	return written, nil
 }

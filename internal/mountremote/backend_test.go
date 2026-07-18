@@ -30,38 +30,43 @@ const (
 )
 
 type remoteFixture struct {
-	t              *testing.T
-	server         *httptest.Server
-	origin         string
-	now            int64
-	payload        []byte
-	mu             sync.Mutex
-	grants         map[string][]byte
-	grantRanges    [][2]int64
-	refreshes      int
-	closes         int
-	urlLeak        bool
-	failChanges    bool
-	badDataOrigin  bool
-	badDataLength  bool
-	maxRequests    int
-	maxBytes       int64
-	blockSize      int64
-	dataGate       chan struct{}
-	dataEntered    chan struct{}
-	activeData     int
-	maximumActive  int
-	dataFailures   int
-	dataStatus     int
-	dataRetryAfter string
-	dataRequests   int
+	t                  *testing.T
+	server             *httptest.Server
+	origin             string
+	now                int64
+	payload            []byte
+	mu                 sync.Mutex
+	grants             map[string][]byte
+	grantPartRanges    map[string][2]int64
+	grantRanges        [][2]int64
+	dataRanges         [][2]int64
+	refreshes          int
+	closes             int
+	urlLeak            bool
+	failChanges        bool
+	badDataOrigin      bool
+	badDataLength      bool
+	maxRequests        int
+	maxBytes           int64
+	blockSize          int64
+	dataGate           chan struct{}
+	dataEntered        chan struct{}
+	activeData         int
+	maximumActive      int
+	dataFailures       int
+	dataStatus         int
+	dataRetryAfter     string
+	dataRequests       int
+	maxSpeculativeLead int64
 }
 
 func newRemoteFixture(t *testing.T) *remoteFixture {
 	t.Helper()
 	fixture := &remoteFixture{
 		t: t, now: 1_000, payload: []byte{'a', 'b', 'c', 0, 0, 'd', 'e'},
-		grants: make(map[string][]byte), maxRequests: 8, maxBytes: 8, blockSize: 8,
+		grants: make(map[string][]byte), grantPartRanges: make(map[string][2]int64),
+		maxRequests: 8, maxBytes: 8, blockSize: 8,
+		maxSpeculativeLead: 32,
 	}
 	fixture.server = httptest.NewServer(http.HandlerFunc(fixture.serveHTTP))
 	fixture.origin = fixture.server.URL
@@ -153,7 +158,7 @@ func (fixture *remoteFixture) mountSession(maximumRequests int, maximumBytes int
 		"selectedNode": map[string]any{"name": "benchmark-host", "url": fixture.origin},
 		"schedulerPlan": map[string]any{
 			"maxInflightRequests": maximumRequests, "maxInflightBytes": maximumBytes,
-			"recommendedBlockSize": blockSize, "maxSpeculativeLead": 32, "replicationFactor": 2,
+			"recommendedBlockSize": blockSize, "maxSpeculativeLead": fixture.maxSpeculativeLead, "replicationFactor": 2,
 		},
 		"capabilities": map[string]any{
 			"immutableOpenHandles": true, "openHandleHeader": mountHandleHeader,
@@ -222,6 +227,7 @@ func (fixture *remoteFixture) writeGrant(w http.ResponseWriter, r *http.Request)
 		token := fmt.Sprintf("grant-token-secure-capability-%d-%d-000000000000", start, end)
 		fixture.mu.Lock()
 		fixture.grants[token] = append([]byte(nil), fixture.payload[start:end]...)
+		fixture.grantPartRanges[token] = [2]int64{start, end}
 		fixture.mu.Unlock()
 		parts = append(parts, map[string]any{
 			"logicalOffset": start, "length": end - start, "zero": false,
@@ -246,6 +252,10 @@ func (fixture *remoteFixture) writeData(w http.ResponseWriter, r *http.Request) 
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	fixture.mu.Lock()
 	payload, found := fixture.grants[token]
+	logicalRange := fixture.grantPartRanges[token]
+	if found {
+		fixture.dataRanges = append(fixture.dataRanges, logicalRange)
+	}
 	badLength := fixture.badDataLength
 	gate := fixture.dataGate
 	entered := fixture.dataEntered
@@ -609,6 +619,246 @@ func TestBackendSingleflightsConcurrentReadsWithinImmutableBlock(t *testing.T) {
 	}
 	if err := backend.blocks.validateBound(); err != nil {
 		t.Fatalf("cache bound: %v", err)
+	}
+}
+
+func TestBackendSpeculatesOneNegotiatedImmutableBlock(t *testing.T) {
+	fixture := newRemoteFixture(t)
+	fixture.payload = bytes.Repeat([]byte("abcdefgh"), 32<<10)
+	fixture.maxRequests = 2
+	fixture.maxBytes = 256 << 10
+	fixture.blockSize = 128 << 10
+	fixture.maxSpeculativeLead = 128 << 10
+	fixture.dataGate = make(chan struct{})
+	fixture.dataEntered = make(chan struct{}, 3)
+	backend, err := New(context.Background(), Config{
+		BaseURL: fixture.origin, ShareID: testShareID, SessionToken: testOrdinaryToken,
+		AllowHTTP: true, Clock: func() time.Time { return time.Unix(fixture.now, 0) },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer backend.Close()
+	source, err := backend.OpenVersion(context.Background(), mountcore.Entry{ID: testFileID, Kind: mountcore.KindFile, Size: int64(len(fixture.payload))})
+	if err != nil {
+		t.Fatalf("OpenVersion: %v", err)
+	}
+	target := make([]byte, 128<<10)
+	type readResult struct {
+		count int
+		err   error
+	}
+	result := make(chan readResult, 1)
+	go func() {
+		count, readErr := source.ReadAt(context.Background(), target, 0)
+		result <- readResult{count: count, err: readErr}
+	}()
+	for range 2 {
+		select {
+		case <-fixture.dataEntered:
+		case <-time.After(2 * time.Second):
+			close(fixture.dataGate)
+			t.Fatal("exact and speculative blocks did not overlap")
+		}
+	}
+	select {
+	case <-fixture.dataEntered:
+		close(fixture.dataGate)
+		t.Fatal("more than one speculative block started")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(fixture.dataGate)
+	select {
+	case outcome := <-result:
+		if outcome.err != nil || outcome.count != len(target) || !bytes.Equal(target, fixture.payload[:len(target)]) {
+			t.Fatalf("speculative first read count=%d err=%v", outcome.count, outcome.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("speculative first read did not complete")
+	}
+	second := make([]byte, 128<<10)
+	if count, err := source.ReadAt(context.Background(), second, 128<<10); err != nil || count != len(second) || !bytes.Equal(second, fixture.payload[len(target):]) {
+		t.Fatalf("prefetched second read count=%d err=%v", count, err)
+	}
+	fixture.mu.Lock()
+	ranges := append([][2]int64(nil), fixture.grantRanges...)
+	requests := fixture.dataRequests
+	maximumActive := fixture.maximumActive
+	fixture.mu.Unlock()
+	sort.Slice(ranges, func(left int, right int) bool { return ranges[left][0] < ranges[right][0] })
+	if fmt.Sprint(ranges) != fmt.Sprint([][2]int64{{0, 128 << 10}, {128 << 10, 256 << 10}}) || requests != 2 || maximumActive != 2 {
+		t.Fatalf("speculative ranges=%v requests=%d maximumActive=%d", ranges, requests, maximumActive)
+	}
+	if err := backend.reads.validateIdle(); err != nil {
+		t.Fatalf("block limiter: %v", err)
+	}
+	if err := backend.fetches.validateIdle(); err != nil {
+		t.Fatalf("fetch limiter: %v", err)
+	}
+}
+
+func TestBackendPrioritizesExactBlockBeforeSpeculation(t *testing.T) {
+	fixture := newRemoteFixture(t)
+	fixture.payload = bytes.Repeat([]byte("abcdefgh"), 32<<10)
+	fixture.maxRequests = 1
+	fixture.maxBytes = 128 << 10
+	fixture.blockSize = 128 << 10
+	fixture.maxSpeculativeLead = 128 << 10
+	fixture.dataGate = make(chan struct{})
+	fixture.dataEntered = make(chan struct{}, 2)
+	backend, err := New(context.Background(), Config{
+		BaseURL: fixture.origin, ShareID: testShareID, SessionToken: testOrdinaryToken,
+		AllowHTTP: true, Clock: func() time.Time { return time.Unix(fixture.now, 0) },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer backend.Close()
+	source, err := backend.OpenVersion(context.Background(), mountcore.Entry{ID: testFileID, Kind: mountcore.KindFile, Size: int64(len(fixture.payload))})
+	if err != nil {
+		t.Fatalf("OpenVersion: %v", err)
+	}
+	target := make([]byte, 128<<10)
+	type readResult struct {
+		count int
+		err   error
+	}
+	result := make(chan readResult, 1)
+	go func() {
+		count, readErr := source.ReadAt(context.Background(), target, 0)
+		result <- readResult{count: count, err: readErr}
+	}()
+	select {
+	case <-fixture.dataEntered:
+	case <-time.After(2 * time.Second):
+		close(fixture.dataGate)
+		t.Fatal("exact block did not start")
+	}
+	fixture.mu.Lock()
+	firstDataRanges := append([][2]int64(nil), fixture.dataRanges...)
+	fixture.mu.Unlock()
+	if fmt.Sprint(firstDataRanges) != fmt.Sprint([][2]int64{{0, 128 << 10}}) {
+		close(fixture.dataGate)
+		t.Fatalf("speculative data ran before exact data: %v", firstDataRanges)
+	}
+	select {
+	case <-fixture.dataEntered:
+		close(fixture.dataGate)
+		t.Fatal("speculative data bypassed the one-request negotiated limit")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(fixture.dataGate)
+	select {
+	case outcome := <-result:
+		if outcome.err != nil || outcome.count != len(target) || !bytes.Equal(target, fixture.payload[:len(target)]) {
+			t.Fatalf("priority read count=%d err=%v", outcome.count, outcome.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("priority read did not complete")
+	}
+	select {
+	case <-fixture.dataEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("speculative block did not resume after the exact block")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for backend.fetches.validateIdle() != nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if err := backend.fetches.validateIdle(); err != nil {
+		t.Fatalf("fetch limiter: %v", err)
+	}
+	fixture.mu.Lock()
+	dataRanges := append([][2]int64(nil), fixture.dataRanges...)
+	maximumActive := fixture.maximumActive
+	fixture.mu.Unlock()
+	if fmt.Sprint(dataRanges) != fmt.Sprint([][2]int64{{0, 128 << 10}, {128 << 10, 256 << 10}}) || maximumActive != 1 {
+		t.Fatalf("priority data ranges=%v maximumActive=%d", dataRanges, maximumActive)
+	}
+}
+
+func TestBackendFetchesIndependentGrantPartsConcurrently(t *testing.T) {
+	fixture := newRemoteFixture(t)
+	fixture.maxRequests = 2
+	fixture.maxBytes = 8
+	fixture.blockSize = 8
+	fixture.maxSpeculativeLead = 0
+	fixture.dataGate = make(chan struct{})
+	fixture.dataEntered = make(chan struct{}, 2)
+	backend, err := New(context.Background(), Config{
+		BaseURL: fixture.origin, ShareID: testShareID, SessionToken: testOrdinaryToken,
+		AllowHTTP: true, Clock: func() time.Time { return time.Unix(fixture.now, 0) },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer backend.Close()
+	source, err := backend.OpenVersion(context.Background(), mountcore.Entry{ID: testFileID, Kind: mountcore.KindFile, Size: int64(len(fixture.payload))})
+	if err != nil {
+		t.Fatalf("OpenVersion: %v", err)
+	}
+	target := make([]byte, len(fixture.payload))
+	result := make(chan error, 1)
+	go func() {
+		count, readErr := source.ReadAt(context.Background(), target, 0)
+		if readErr == nil && count != len(target) {
+			readErr = io.ErrUnexpectedEOF
+		}
+		result <- readErr
+	}()
+	for range 2 {
+		select {
+		case <-fixture.dataEntered:
+		case <-time.After(2 * time.Second):
+			close(fixture.dataGate)
+			t.Fatal("independent grant parts did not overlap")
+		}
+	}
+	close(fixture.dataGate)
+	if err := <-result; err != nil || !bytes.Equal(target, fixture.payload) {
+		t.Fatalf("parallel part read data=%q err=%v", target, err)
+	}
+	fixture.mu.Lock()
+	requests := fixture.dataRequests
+	maximumActive := fixture.maximumActive
+	fixture.mu.Unlock()
+	if requests != 2 || maximumActive != 2 {
+		t.Fatalf("parallel parts requests=%d maximumActive=%d", requests, maximumActive)
+	}
+	if err := backend.fetches.validateIdle(); err != nil {
+		t.Fatalf("fetch limiter: %v", err)
+	}
+}
+
+func TestBackendDoesNotSpeculateOnInitialSmallRandomRead(t *testing.T) {
+	fixture := newRemoteFixture(t)
+	fixture.payload = bytes.Repeat([]byte("abcdefgh"), 2<<10)
+	fixture.maxRequests = 2
+	fixture.maxBytes = 16 << 10
+	fixture.blockSize = 8 << 10
+	fixture.maxSpeculativeLead = 8 << 10
+	backend, err := New(context.Background(), Config{
+		BaseURL: fixture.origin, ShareID: testShareID, SessionToken: testOrdinaryToken,
+		AllowHTTP: true, Clock: func() time.Time { return time.Unix(fixture.now, 0) },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer backend.Close()
+	source, err := backend.OpenVersion(context.Background(), mountcore.Entry{ID: testFileID, Kind: mountcore.KindFile, Size: int64(len(fixture.payload))})
+	if err != nil {
+		t.Fatalf("OpenVersion: %v", err)
+	}
+	target := make([]byte, 4<<10)
+	if count, err := source.ReadAt(context.Background(), target, 0); err != nil || count != len(target) || !bytes.Equal(target, fixture.payload[:len(target)]) {
+		t.Fatalf("small random read count=%d err=%v", count, err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	fixture.mu.Lock()
+	ranges := append([][2]int64(nil), fixture.grantRanges...)
+	fixture.mu.Unlock()
+	if fmt.Sprint(ranges) != fmt.Sprint([][2]int64{{0, 8 << 10}}) {
+		t.Fatalf("small random read speculated ranges=%v", ranges)
 	}
 }
 

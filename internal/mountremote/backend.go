@@ -73,6 +73,8 @@ type Negotiation struct {
 }
 
 type Backend struct {
+	ctx                context.Context
+	cancel             context.CancelFunc
 	baseURL            string
 	shareID            string
 	client             *http.Client
@@ -84,6 +86,7 @@ type Backend struct {
 	maximumEntries     int
 	readChunkSize      int64
 	reads              *readLimiter
+	fetches            *readLimiter
 	blocks             *cleanBlockCache
 
 	mu              sync.RWMutex
@@ -300,12 +303,18 @@ func New(ctx context.Context, config Config) (*Backend, error) {
 			ReplicationFactor:    mounted.SchedulerPlan.ReplicationFactor,
 		},
 	}
+	backendContext, cancelBackend := context.WithCancel(ctx)
 	backend := &Backend{
+		ctx: backendContext, cancel: cancelBackend,
 		baseURL: baseURL, shareID: shareID, client: client, clock: clock,
 		allowHTTP: config.AllowHTTP, selectedNodeOrigin: nodeOrigin,
 		negotiation: negotiation, maximumEntries: maximumEntries,
 		readChunkSize: min(mounted.SchedulerPlan.RecommendedBlockSize, mounted.SchedulerPlan.MaxInflightBytes),
 		reads: newReadLimiter(
+			mounted.SchedulerPlan.MaxInflightRequests,
+			mounted.SchedulerPlan.MaxInflightBytes,
+		),
+		fetches: newReadLimiter(
 			mounted.SchedulerPlan.MaxInflightRequests,
 			mounted.SchedulerPlan.MaxInflightBytes,
 		),
@@ -484,9 +493,11 @@ func (b *Backend) Close() error {
 		return nil
 	}
 	b.closed = true
+	b.cancel()
 	token := b.sessionToken
 	b.sessionToken = ""
 	b.reads.close()
+	b.fetches.close()
 	b.blocks.close()
 	sources := make([]*remoteVersion, 0, len(b.sources))
 	for source := range b.sources {
