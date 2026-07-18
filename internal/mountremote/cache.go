@@ -20,8 +20,10 @@ type cleanBlockEntry struct {
 }
 
 type cleanBlockFlight struct {
-	done chan struct{}
-	err  error
+	done          chan struct{}
+	err           error
+	ready         bool
+	readyCallback func()
 }
 
 // cleanBlockCache is a bounded process-memory cache for immutable version
@@ -36,6 +38,60 @@ type cleanBlockCache struct {
 	inflight     map[cleanBlockKey]*cleanBlockFlight
 	recency      *list.List
 	closed       bool
+}
+
+// whenReady schedules callback once an existing immutable block loader has
+// reserved exact-fetch capacity. It returns false when no cached or in-flight
+// block exists, leaving a new loader responsible for signaling readiness.
+func (cache *cleanBlockCache) whenReady(ctx context.Context, key cleanBlockKey, callback func()) bool {
+	if cache == nil || key.versionID == "" || key.offset < 0 || callback == nil {
+		return false
+	}
+	cache.mu.Lock()
+	if cache.closed {
+		cache.mu.Unlock()
+		return false
+	}
+	ready := cache.entries[key] != nil
+	if flight := cache.inflight[key]; flight != nil {
+		ready = flight.ready
+		if !ready {
+			// Every waiter for this immutable block asks for the same next
+			// aligned block. Retain only the newest live waiter so callback
+			// memory remains bounded independently of reader count.
+			flight.readyCallback = func() {
+				if ctx.Err() == nil {
+					callback()
+				}
+			}
+			cache.mu.Unlock()
+			return true
+		}
+	}
+	cache.mu.Unlock()
+	if ready && ctx.Err() == nil {
+		callback()
+	}
+	return ready
+}
+
+func (cache *cleanBlockCache) markReady(key cleanBlockKey) {
+	if cache == nil {
+		return
+	}
+	cache.mu.Lock()
+	flight := cache.inflight[key]
+	if cache.closed || flight == nil || flight.ready {
+		cache.mu.Unlock()
+		return
+	}
+	flight.ready = true
+	callback := flight.readyCallback
+	flight.readyCallback = nil
+	cache.mu.Unlock()
+	if callback != nil {
+		callback()
+	}
 }
 
 func newCleanBlockCache(maximumBytes int64) *cleanBlockCache {
@@ -140,6 +196,7 @@ func (cache *cleanBlockCache) close() {
 	cache.recency.Init()
 	for _, flight := range cache.inflight {
 		flight.err = ErrClosed
+		flight.readyCallback = nil
 	}
 	cache.mu.Unlock()
 }

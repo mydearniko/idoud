@@ -96,6 +96,13 @@ func (source *remoteVersion) ReadAt(ctx context.Context, target []byte, offset i
 	for written < len(requested) {
 		logicalOffset := offset + int64(written)
 		blockOffset := logicalOffset / source.backend.readChunkSize * source.backend.readChunkSize
+		blockLength := min(source.backend.readChunkSize, source.size-blockOffset)
+		blockKey := cleanBlockKey{versionID: source.versionID, offset: blockOffset}
+		if speculate {
+			source.backend.blocks.whenReady(ctx, blockKey, func() {
+				source.startPrefetch(blockOffset + blockLength)
+			})
+		}
 		block, err := source.loadBlock(ctx, blockOffset, speculate)
 		if err != nil {
 			return written, err
@@ -139,6 +146,7 @@ func (source *remoteVersion) loadBlock(ctx context.Context, blockOffset int64, s
 		versionID: source.versionID,
 		offset:    blockOffset,
 	}, func() ([]byte, error) {
+		blockKey := cleanBlockKey{versionID: source.versionID, offset: blockOffset}
 		release, err := source.backend.reads.acquire(ctx, blockLength)
 		if err != nil {
 			return nil, err
@@ -149,9 +157,11 @@ func (source *remoteVersion) loadBlock(ctx context.Context, blockOffset int64, s
 			return nil, err
 		}
 		data := make([]byte, blockLength)
-		var onExactReady func()
-		if speculate {
-			onExactReady = func() { source.startPrefetch(blockOffset + blockLength) }
+		onExactReady := func() {
+			source.backend.blocks.markReady(blockKey)
+			if speculate {
+				source.startPrefetch(blockOffset + blockLength)
+			}
 		}
 		count, err := source.readExact(ctx, handle, data, blockOffset, onExactReady)
 		if err != nil {

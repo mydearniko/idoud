@@ -777,6 +777,95 @@ func TestBackendPrioritizesExactBlockBeforeSpeculation(t *testing.T) {
 	}
 }
 
+func TestBackendActsOnSequentialIntentDuringExactBlockFlight(t *testing.T) {
+	fixture := newRemoteFixture(t)
+	fixture.payload = bytes.Repeat([]byte("abcdefgh"), 32<<10)
+	fixture.maxRequests = 2
+	fixture.maxBytes = 256 << 10
+	fixture.blockSize = 128 << 10
+	fixture.maxSpeculativeLead = 128 << 10
+	fixture.dataGate = make(chan struct{})
+	fixture.dataEntered = make(chan struct{}, 2)
+	backend, err := New(context.Background(), Config{
+		BaseURL: fixture.origin, ShareID: testShareID, SessionToken: testOrdinaryToken,
+		AllowHTTP: true, Clock: func() time.Time { return time.Unix(fixture.now, 0) },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer backend.Close()
+	source, err := backend.OpenVersion(context.Background(), mountcore.Entry{ID: testFileID, Kind: mountcore.KindFile, Size: int64(len(fixture.payload))})
+	if err != nil {
+		t.Fatalf("OpenVersion: %v", err)
+	}
+	remoteSource, ok := source.(*remoteVersion)
+	if !ok {
+		t.Fatalf("OpenVersion source type=%T", source)
+	}
+	type readResult struct {
+		offset int64
+		data   []byte
+		err    error
+	}
+	results := make(chan readResult, 3)
+	startRead := func(offset int64) {
+		go func() {
+			data := make([]byte, 32<<10)
+			count, readErr := source.ReadAt(context.Background(), data, offset)
+			results <- readResult{offset: offset, data: data[:count], err: readErr}
+		}()
+	}
+	startRead(0)
+	select {
+	case <-fixture.dataEntered:
+	case <-time.After(2 * time.Second):
+		close(fixture.dataGate)
+		t.Fatal("initial exact block did not start")
+	}
+	startRead(32 << 10)
+	scheduleDeadline := time.Now().Add(2 * time.Second)
+	for {
+		remoteSource.scheduleMu.Lock()
+		lastReadEnd := remoteSource.lastReadEnd
+		remoteSource.scheduleMu.Unlock()
+		if lastReadEnd == 64<<10 {
+			break
+		}
+		if time.Now().After(scheduleDeadline) {
+			close(fixture.dataGate)
+			t.Fatal("second sequential read did not enter the shared block flight")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	startRead(64 << 10)
+	select {
+	case <-fixture.dataEntered:
+	case <-time.After(2 * time.Second):
+		close(fixture.dataGate)
+		t.Fatal("sequential intent did not start speculation during the exact block flight")
+	}
+	close(fixture.dataGate)
+	for range 3 {
+		select {
+		case outcome := <-results:
+			want := fixture.payload[outcome.offset : outcome.offset+(32<<10)]
+			if outcome.err != nil || !bytes.Equal(outcome.data, want) {
+				t.Fatalf("flight read offset=%d err=%v", outcome.offset, outcome.err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("flight readers did not complete")
+		}
+	}
+	fixture.mu.Lock()
+	ranges := append([][2]int64(nil), fixture.dataRanges...)
+	maximumActive := fixture.maximumActive
+	fixture.mu.Unlock()
+	sort.Slice(ranges, func(left int, right int) bool { return ranges[left][0] < ranges[right][0] })
+	if fmt.Sprint(ranges) != fmt.Sprint([][2]int64{{0, 128 << 10}, {128 << 10, 256 << 10}}) || maximumActive != 2 {
+		t.Fatalf("flight ranges=%v maximumActive=%d", ranges, maximumActive)
+	}
+}
+
 func TestBackendFetchesIndependentGrantPartsConcurrently(t *testing.T) {
 	fixture := newRemoteFixture(t)
 	fixture.maxRequests = 2
