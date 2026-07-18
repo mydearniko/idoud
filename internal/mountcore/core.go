@@ -11,6 +11,9 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unicode"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"golang.org/x/text/cases"
 	"golang.org/x/text/unicode/norm"
@@ -64,6 +67,22 @@ type VersionSource interface {
 	Close() error
 }
 
+// VersionMetadataSource lets a backend report the immutable version captured
+// atomically by a remote open. A namespace replacement may race a prior
+// lookup; in that case the new open is allowed to observe the new current
+// version while an already-open handle remains pinned to its older source.
+type VersionMetadataSource interface {
+	VersionSource
+	VersionMetadata() VersionMetadata
+}
+
+type VersionMetadata struct {
+	VersionID  string
+	Size       int64
+	Mtime      int64
+	Executable bool
+}
+
 type Backend interface {
 	Root(context.Context) (Entry, int64, error)
 	List(context.Context, string) (Listing, error)
@@ -101,7 +120,7 @@ type Handle struct {
 	Version string
 	Size    int64
 	source  VersionSource
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	closed  bool
 }
 
@@ -193,13 +212,18 @@ func (c *Core) ApplyListing(listing Listing) error {
 	if listing.Parent.Kind != currentParent.Kind || (listing.Parent.Kind != KindRoot && listing.Parent.ParentID != currentParent.ParentID) {
 		return ErrInvalidListing
 	}
+	if listing.Parent.EntryRevision < currentParent.EntryRevision ||
+		listing.Parent.ChildSetRevision < currentParent.ChildSetRevision {
+		return ErrStaleListing
+	}
 	listing.Parent.Inode = currentParent.Inode
 	newChildren := make(map[string]string, len(listing.Entries))
+	newEntryIDs := make(map[string]struct{}, len(listing.Entries))
+	newInodeOwners := make(map[uint64]string, len(listing.Entries))
 	normalizedEntries := make([]Entry, 0, len(listing.Entries))
 	for _, entry := range listing.Entries {
 		entry.ID = strings.TrimSpace(entry.ID)
 		entry.ParentID = strings.TrimSpace(entry.ParentID)
-		entry.Name = norm.NFC.String(entry.Name)
 		if !validEntry(entry, false) || entry.ParentID != listing.Parent.ID {
 			return ErrInvalidListing
 		}
@@ -207,13 +231,27 @@ func (c *Core) ApplyListing(listing Listing) error {
 		if _, duplicate := newChildren[key]; duplicate {
 			return ErrInvalidListing
 		}
+		if _, duplicate := newEntryIDs[entry.ID]; duplicate {
+			return ErrInvalidListing
+		}
 		entry.Inode = StableInode(entry.ID)
 		if owner, collision := c.inodeOwners[entry.Inode]; collision && owner != entry.ID {
 			return fmt.Errorf("%w: inode=%d", ErrInodeCollision, entry.Inode)
 		}
-		c.inodeOwners[entry.Inode] = entry.ID
+		if owner, collision := newInodeOwners[entry.Inode]; collision && owner != entry.ID {
+			return fmt.Errorf("%w: inode=%d", ErrInodeCollision, entry.Inode)
+		}
+		if previous, exists := c.entries[entry.ID]; exists &&
+			(entry.EntryRevision < previous.EntryRevision || entry.ChildSetRevision < previous.ChildSetRevision) {
+			return ErrStaleListing
+		}
+		newInodeOwners[entry.Inode] = entry.ID
 		newChildren[key] = entry.ID
+		newEntryIDs[entry.ID] = struct{}{}
 		normalizedEntries = append(normalizedEntries, entry)
+	}
+	for inode, entryID := range newInodeOwners {
+		c.inodeOwners[inode] = entryID
 	}
 	oldChildren := c.children[listing.Parent.ID]
 	for key, oldID := range oldChildren {
@@ -226,6 +264,9 @@ func (c *Core) ApplyListing(listing Listing) error {
 			Kind: InvalidationDelete, ParentID: listing.Parent.ID, EntryID: oldID,
 			Name: oldEntry.Name, Sequence: listing.Sequence,
 		})
+		if _, retained := newEntryIDs[oldID]; !retained && oldEntry.ParentID == listing.Parent.ID {
+			delete(c.entries, oldID)
+		}
 	}
 	for _, entry := range normalizedEntries {
 		if previous, exists := c.entries[entry.ID]; exists && previous.ParentID != "" && previous.ParentID != entry.ParentID {
@@ -239,7 +280,15 @@ func (c *Core) ApplyListing(listing Listing) error {
 		}
 		previous, exists := c.entries[entry.ID]
 		oldID, sameName := oldChildren[portableNameKey(entry.Name)]
-		if !sameName || oldID != entry.ID {
+		caseOnlyRename := exists && previous.ParentID == entry.ParentID && previous.Name != entry.Name &&
+			portableNameKey(previous.Name) == portableNameKey(entry.Name)
+		if caseOnlyRename {
+			c.publishLocked(Invalidation{
+				Kind: InvalidationDelete, ParentID: previous.ParentID, EntryID: entry.ID,
+				Name: previous.Name, Sequence: listing.Sequence,
+			})
+		}
+		if caseOnlyRename || !sameName || oldID != entry.ID {
 			c.publishLocked(Invalidation{
 				Kind: InvalidationEntry, ParentID: entry.ParentID, EntryID: entry.ID,
 				Name: entry.Name, Sequence: listing.Sequence,
@@ -255,7 +304,6 @@ func (c *Core) ApplyListing(listing Listing) error {
 		}
 		c.entries[entry.ID] = entry
 	}
-	listing.Parent.EntryRevision = maxInt64(listing.Parent.EntryRevision, currentParent.EntryRevision)
 	c.entries[listing.Parent.ID] = listing.Parent
 	if listing.Parent.ID == c.root.ID {
 		c.root = listing.Parent
@@ -318,6 +366,24 @@ func (c *Core) Entry(entryID string) (Entry, error) {
 	return entry, nil
 }
 
+// ResetNamespace discards mutable namespace caches after a change-cursor reset
+// while retaining immutable open handles and stable inode ownership history.
+func (c *Core) ResetNamespace(sequence int64) error {
+	if sequence < 1 {
+		return ErrInvalidListing
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return ErrCoreClosed
+	}
+	c.entries = map[string]Entry{c.root.ID: c.root}
+	c.children = make(map[string]map[string]string)
+	c.directorySequence = map[string]int64{c.root.ID: sequence}
+	c.publishLocked(Invalidation{Kind: InvalidationReset, Sequence: sequence})
+	return nil
+}
+
 func (c *Core) Open(ctx context.Context, entryID string) (*Handle, error) {
 	c.mu.RLock()
 	if c.closed {
@@ -336,15 +402,38 @@ func (c *Core) Open(ctx context.Context, entryID string) (*Handle, error) {
 	if err != nil {
 		return nil, err
 	}
-	if source == nil || source.Size() < 0 || (entry.Size >= 0 && source.Size() != entry.Size) {
+	if source == nil || source.Size() < 0 {
 		if source != nil {
 			_ = source.Close()
 		}
 		return nil, ErrInvalidListing
 	}
-	entry.Size = source.Size()
+	pinnedVersion := entry.VersionID
+	if metadataSource, ok := source.(VersionMetadataSource); ok {
+		metadata := metadataSource.VersionMetadata()
+		if metadata.Size != source.Size() || metadata.Size < 0 ||
+			(metadata.Size > 0 && strings.TrimSpace(metadata.VersionID) == "") {
+			_ = source.Close()
+			return nil, ErrInvalidListing
+		}
+		if entry.Size >= 0 && metadata.VersionID == entry.VersionID && metadata.Size != entry.Size {
+			_ = source.Close()
+			return nil, ErrInvalidListing
+		}
+		pinnedVersion = metadata.VersionID
+		entry.VersionID = metadata.VersionID
+		entry.Size = metadata.Size
+		entry.Mtime = metadata.Mtime
+		entry.Executable = metadata.Executable
+	} else {
+		if entry.Size >= 0 && source.Size() != entry.Size {
+			_ = source.Close()
+			return nil, ErrInvalidListing
+		}
+		entry.Size = source.Size()
+	}
 	handle := &Handle{
-		ID: c.nextHandle.Add(1), Entry: entry, Version: entry.VersionID,
+		ID: c.nextHandle.Add(1), Entry: entry, Version: pinnedVersion,
 		Size: source.Size(), source: source,
 	}
 	c.mu.Lock()
@@ -369,8 +458,8 @@ func (c *Core) Read(ctx context.Context, handleID uint64, target []byte, offset 
 }
 
 func (h *Handle) ReadAt(ctx context.Context, target []byte, offset int64) (int, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 	if h.closed || h.source == nil {
 		return 0, ErrHandleClosed
 	}
@@ -485,21 +574,40 @@ func validEntry(entry Entry, root bool) bool {
 	if root {
 		return entry.Kind == KindRoot
 	}
-	if entry.ParentID == "" || entry.Name == "" || entry.Name != strings.TrimSpace(entry.Name) || strings.ContainsAny(entry.Name, "/\\\x00") {
+	if entry.ParentID == "" || !validPortableComponent(entry.Name) {
 		return false
 	}
 	return entry.Kind == KindDirectory || entry.Kind == KindFile
 }
 
-func portableNameKey(name string) string {
-	return cases.Fold().String(norm.NFC.String(name))
+func validPortableComponent(name string) bool {
+	if name == "" || !utf8.ValidString(name) || !norm.NFC.IsNormalString(name) || name == "." || name == ".." ||
+		strings.HasSuffix(name, ".") || strings.HasSuffix(name, " ") || len([]byte(name)) > 255 ||
+		len(utf16.Encode([]rune(name))) > 255 {
+		return false
+	}
+	for _, char := range name {
+		if unicode.IsControl(char) || strings.ContainsRune(`<>:"/\\|?*`, char) {
+			return false
+		}
+	}
+	base := name
+	if dot := strings.IndexByte(base, '.'); dot >= 0 {
+		base = base[:dot]
+	}
+	upper := strings.ToUpper(base)
+	if upper == "CON" || upper == "PRN" || upper == "AUX" || upper == "NUL" {
+		return false
+	}
+	if len(upper) == 4 && (strings.HasPrefix(upper, "COM") || strings.HasPrefix(upper, "LPT")) &&
+		upper[3] >= '1' && upper[3] <= '9' {
+		return false
+	}
+	return true
 }
 
-func maxInt64(left int64, right int64) int64 {
-	if left > right {
-		return left
-	}
-	return right
+func portableNameKey(name string) string {
+	return cases.Fold().String(norm.NFC.String(name))
 }
 
 type BytesVersion struct {

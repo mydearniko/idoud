@@ -8,8 +8,25 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/mydearniko/idoud/internal/mountadapter"
+	"github.com/mydearniko/idoud/internal/mountsupervisor"
 )
+
+type cliTestMountSession struct {
+	status mountadapter.Status
+	done   chan struct{}
+	once   sync.Once
+}
+
+func (session *cliTestMountSession) Wait()                       { <-session.done }
+func (session *cliTestMountSession) Status() mountadapter.Status { return session.status }
+func (session *cliTestMountSession) Unmount() error {
+	session.once.Do(func() { close(session.done) })
+	return nil
+}
 
 func TestFolderCreateJSONOmitsSecretsAndWritesExplicitCredentialFile(t *testing.T) {
 	const (
@@ -57,6 +74,95 @@ func TestFolderCreateJSONOmitsSecretsAndWritesExplicitCredentialFile(t *testing.
 	}
 	if info, err := os.Stat(keyPath); err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("key file mode=%v err=%v", info.Mode().Perm(), err)
+	}
+}
+
+func TestMountCommandRemainsExplicitReadOnlyAndSecretSafeBeforeNetwork(t *testing.T) {
+	previousBridgeCheck := checkMountBridge
+	checkMountBridge = func() (string, string, bool) { return "", "", false }
+	defer func() { checkMountBridge = previousBridgeCheck }()
+	shareID := "0123456789abcdefghijklmnopqrstuv"
+	exitCode, stdout, stderr := captureRunOutput(t, []string{
+		"mount", shareID, t.TempDir(), "--server", "https://invalid.example", "--write", "--json",
+	})
+	if exitCode != 1 || stderr != "" {
+		t.Fatalf("write mount exit=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	var response struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(stdout), &response) != nil || response.Error.Code != "protocol_upgrade_required" || strings.Contains(stdout, shareID) {
+		t.Fatalf("write mount response=%q", stdout)
+	}
+	exitCode, stdout, stderr = captureRunOutput(t, []string{
+		"mount", "--background", shareID, t.TempDir(), "--server", "https://invalid.example", "--json",
+	})
+	if exitCode != 1 || stderr != "" || json.Unmarshal([]byte(stdout), &response) != nil || response.Error.Code != "protocol_upgrade_required" {
+		t.Fatalf("background mount exit=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	secretURL := "https://files.example.test/v1/folders/" + shareID
+	if detail := mountFailureDetail("mount_failed", fmt.Errorf("GET %s failed", secretURL)); strings.Contains(detail, shareID) || detail != "remote mount request failed" {
+		t.Fatalf("mount failure leaked capability URL: %q", detail)
+	}
+	if detail := mountFailureDetail("protocol_upgrade_required", fmt.Errorf("upgrade %s", secretURL)); strings.Contains(detail, shareID) {
+		t.Fatalf("protocol failure leaked capability URL: %q", detail)
+	}
+}
+
+func TestMountLoopbackHTTPExceptionIsNarrow(t *testing.T) {
+	for _, accepted := range []string{"http://localhost:8080", "http://127.0.0.1", "http://[::1]:9090"} {
+		if !mountLoopbackHTTPAllowed(accepted) {
+			t.Fatalf("loopback URL rejected: %s", accepted)
+		}
+	}
+	for _, rejected := range []string{"https://localhost", "http://localhost.example", "http://192.0.2.1", "not a URL"} {
+		if mountLoopbackHTTPAllowed(rejected) {
+			t.Fatalf("non-loopback HTTP URL accepted: %s", rejected)
+		}
+	}
+}
+
+func TestMountControlCommandsAreFunctionalAndCapabilityFree(t *testing.T) {
+	session := &cliTestMountSession{done: make(chan struct{}), status: mountadapter.Status{
+		Platform: "linux", Mountpoint: t.TempDir(), ReadOnly: true, Sequence: 17,
+		State: "ready", SelectedNode: "benchmark-host", MMapSupported: true,
+	}}
+	control, err := mountsupervisor.Start(session)
+	if err != nil {
+		t.Fatalf("start supervisor: %v", err)
+	}
+	t.Cleanup(func() { _ = control.Close() })
+	mountID := control.Record().MountID
+
+	for _, command := range [][]string{
+		{"mount", "list", "--json"},
+		{"mount", "status", mountID, "--json"},
+	} {
+		exitCode, stdout, stderr := captureRunOutput(t, command)
+		if exitCode != 0 || stderr != "" || !strings.Contains(stdout, mountID) ||
+			strings.Contains(stdout, "shareId") || strings.Contains(stdout, "sessionToken") || strings.Contains(stdout, "handleToken") {
+			t.Fatalf("command=%v exit=%d stdout=%q stderr=%q", command, exitCode, stdout, stderr)
+		}
+		var envelope map[string]any
+		if err := json.Unmarshal([]byte(stdout), &envelope); err != nil || envelope["schema_version"] != float64(folderCLIOutputSchemaVersion) {
+			t.Fatalf("command=%v invalid envelope=%#v err=%v", command, envelope, err)
+		}
+	}
+
+	exitCode, stdout, stderr := captureRunOutput(t, []string{"folder", "flush", mountID, "--json"})
+	if exitCode != 1 || stderr != "" || !strings.Contains(stdout, `"code":"read_only"`) {
+		t.Fatalf("flush exit=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	exitCode, stdout, stderr = captureRunOutput(t, []string{"mount", "unmount", mountID, "--json"})
+	if exitCode != 0 || stderr != "" || !strings.Contains(stdout, `"type":"mount_unmount"`) {
+		t.Fatalf("unmount exit=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+	select {
+	case <-session.done:
+	default:
+		t.Fatal("control command did not unmount the session")
 	}
 }
 

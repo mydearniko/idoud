@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -15,6 +17,33 @@ type fakeBackend struct {
 	listings map[string]Listing
 	versions map[string][]byte
 	opens    []string
+}
+
+type metadataTestSource struct {
+	*BytesVersion
+	metadata VersionMetadata
+	closed   bool
+}
+
+func (source *metadataTestSource) VersionMetadata() VersionMetadata {
+	return source.metadata
+}
+
+func (source *metadataTestSource) Close() error {
+	source.closed = true
+	return source.BytesVersion.Close()
+}
+
+type atomicOpenBackend struct {
+	*fakeBackend
+	source *metadataTestSource
+}
+
+func (backend *atomicOpenBackend) OpenVersion(ctx context.Context, _ Entry) (VersionSource, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return backend.source, nil
 }
 
 func newFakeBackend() *fakeBackend {
@@ -127,11 +156,23 @@ func TestCorePinsImmutableVersionsAcrossRenameReplaceAndTrash(t *testing.T) {
 	if _, err := core.CachedLookup(backend.root.ID, fileV2.Name); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("trashed lookup err=%v", err)
 	}
+	if _, err := core.Entry(fileV2.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("trashed entry remained in mutable namespace err=%v", err)
+	}
 	if n, err := core.Read(ctx, oldHandle.ID, oldBytes, 0); err != nil || n != 11 || !bytes.Equal(oldBytes, []byte("old content")) {
 		t.Fatalf("trash changed open old handle=%q n=%d err=%v", oldBytes, n, err)
 	}
 	if n, err := core.Read(ctx, newHandle.ID, newBytes, 0); err != nil || n != 11 || !bytes.Equal(newBytes, []byte("new content")) {
 		t.Fatalf("trash changed open new handle=%q n=%d err=%v", newBytes, n, err)
+	}
+	if err := core.ResetNamespace(4); err != nil {
+		t.Fatalf("reset namespace: %v", err)
+	}
+	if _, err := core.CachedLookup(backend.root.ID, fileV2.Name); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("reset retained cached namespace err=%v", err)
+	}
+	if n, err := core.Read(ctx, oldHandle.ID, oldBytes, 0); err != nil || n != 11 || !bytes.Equal(oldBytes, []byte("old content")) {
+		t.Fatalf("reset changed immutable old handle=%q n=%d err=%v", oldBytes, n, err)
 	}
 	if err := core.CloseHandle(oldHandle.ID); err != nil {
 		t.Fatalf("close old handle: %v", err)
@@ -142,8 +183,65 @@ func TestCorePinsImmutableVersionsAcrossRenameReplaceAndTrash(t *testing.T) {
 	_ = core.CloseHandle(newHandle.ID)
 
 	events := drainInvalidations(invalidations)
-	if !hasInvalidation(events, InvalidationContent, fileV1.ID) || !hasInvalidation(events, InvalidationDelete, fileV1.ID) {
+	if !hasInvalidation(events, InvalidationContent, fileV1.ID) || !hasInvalidation(events, InvalidationDelete, fileV1.ID) ||
+		!hasInvalidation(events, InvalidationReset, "") ||
+		!hasNamedInvalidation(events, InvalidationDelete, "Report.txt") ||
+		!hasNamedInvalidation(events, InvalidationEntry, "report.txt") {
 		t.Fatalf("invalidations=%+v", events)
+	}
+}
+
+func TestCoreOpenAcceptsAtomicReplacementMetadataAndRejectsSameVersionSizeMismatch(t *testing.T) {
+	ctx := context.Background()
+	base := newFakeBackend()
+	listed := Entry{
+		ID: "atomic-open-file", ParentID: base.root.ID, Name: "atomic.txt", Kind: KindFile,
+		VersionID: "version-one", Size: 3, Mtime: 100, EntryRevision: 1,
+	}
+	base.setListing(Listing{Parent: base.root, Entries: []Entry{listed}, Sequence: 1})
+	replacement := &metadataTestSource{
+		BytesVersion: NewBytesVersion([]byte("second")),
+		metadata: VersionMetadata{
+			VersionID: "version-two", Size: 6, Mtime: 200, Executable: true,
+		},
+	}
+	backend := &atomicOpenBackend{fakeBackend: base, source: replacement}
+	core, err := New(ctx, backend)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer core.Close()
+	if _, err := core.RefreshDirectory(ctx, base.root.ID); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	handle, err := core.Open(ctx, listed.ID)
+	if err != nil {
+		t.Fatalf("open raced replacement: %v", err)
+	}
+	if handle.Version != "version-two" || handle.Size != 6 || handle.Entry.VersionID != "version-two" ||
+		handle.Entry.Mtime != 200 || !handle.Entry.Executable {
+		t.Fatalf("atomic open metadata was not pinned: %+v", handle)
+	}
+	payload := make([]byte, 6)
+	if read, err := core.Read(ctx, handle.ID, payload, 0); err != nil || read != 6 || string(payload) != "second" {
+		t.Fatalf("replacement read=%q count=%d err=%v", payload, read, err)
+	}
+	if err := core.CloseHandle(handle.ID); err != nil {
+		t.Fatalf("close replacement handle: %v", err)
+	}
+
+	mismatch := &metadataTestSource{
+		BytesVersion: NewBytesVersion([]byte("wrong")),
+		metadata: VersionMetadata{
+			VersionID: "version-one", Size: 5, Mtime: 100,
+		},
+	}
+	backend.source = mismatch
+	if _, err := core.Open(ctx, listed.ID); !errors.Is(err, ErrInvalidListing) {
+		t.Fatalf("same-version size mismatch err=%v", err)
+	}
+	if !mismatch.closed {
+		t.Fatal("rejected atomic source was not closed")
 	}
 }
 
@@ -190,6 +288,47 @@ func TestCoreMovesStableInodeAndRejectsStaleOrCollidingNamespace(t *testing.T) {
 	collision.Name = "DATA.BIN"
 	if err := core.ApplyListing(Listing{Parent: directoryB, Entries: []Entry{moved, collision}, Sequence: 3}); !errors.Is(err, ErrInvalidListing) {
 		t.Fatalf("casefold collision err=%v", err)
+	}
+	duplicateID := moved
+	duplicateID.Name = "other.bin"
+	if err := core.ApplyListing(Listing{Parent: directoryB, Entries: []Entry{moved, duplicateID}, Sequence: 3}); !errors.Is(err, ErrInvalidListing) {
+		t.Fatalf("duplicate entry ID err=%v", err)
+	}
+	regressed := moved
+	regressed.EntryRevision = 0
+	if err := core.ApplyListing(Listing{Parent: directoryB, Entries: []Entry{regressed}, Sequence: 3}); !errors.Is(err, ErrStaleListing) {
+		t.Fatalf("regressed entry revision err=%v", err)
+	}
+}
+
+func TestCoreRejectsNonPortableOrSilentlyNormalizedNames(t *testing.T) {
+	ctx := context.Background()
+	backend := newFakeBackend()
+	backend.setListing(Listing{Parent: backend.root, Sequence: 1})
+	core, err := New(ctx, backend)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer core.Close()
+	invalidNames := []string{
+		".", "..", "CON.txt", "com1.log", "bad:name", "bad\\name", "trailing.", "trailing ",
+		"control\x01name", "e\u0301.txt", strings.Repeat("a", 256), strings.Repeat("🙂", 128),
+	}
+	for index, name := range invalidNames {
+		entry := Entry{
+			ID: fmt.Sprintf("invalid-name-%d", index), ParentID: backend.root.ID, Name: name,
+			Kind: KindFile, Size: 0, EntryRevision: 1,
+		}
+		if err := core.ApplyListing(Listing{Parent: backend.root, Entries: []Entry{entry}, Sequence: 2}); !errors.Is(err, ErrInvalidListing) {
+			t.Fatalf("name %q err=%v", name, err)
+		}
+	}
+	valid := Entry{
+		ID: "valid-leading-space", ParentID: backend.root.ID, Name: " leading space.txt",
+		Kind: KindFile, Size: 0, EntryRevision: 1,
+	}
+	if err := core.ApplyListing(Listing{Parent: backend.root, Entries: []Entry{valid}, Sequence: 2}); err != nil {
+		t.Fatalf("portable leading-space name rejected: %v", err)
 	}
 }
 
@@ -243,6 +382,15 @@ func drainInvalidations(channel <-chan Invalidation) []Invalidation {
 func hasInvalidation(events []Invalidation, kind string, entryID string) bool {
 	for _, event := range events {
 		if event.Kind == kind && event.EntryID == entryID {
+			return true
+		}
+	}
+	return false
+}
+
+func hasNamedInvalidation(events []Invalidation, kind string, name string) bool {
+	for _, event := range events {
+		if event.Kind == kind && event.Name == name {
 			return true
 		}
 	}

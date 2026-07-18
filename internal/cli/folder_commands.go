@@ -19,10 +19,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mydearniko/idoud/internal/mountadapter"
+	"github.com/mydearniko/idoud/internal/mountcore"
+	"github.com/mydearniko/idoud/internal/mountremote"
+	"github.com/mydearniko/idoud/internal/mountsupervisor"
 	"golang.org/x/term"
 )
 
 const folderCLIOutputSchemaVersion = 1
+
+var checkMountBridge = missingMountBridge
 
 type folderCLIError struct {
 	SchemaVersion int `json:"schemaVersion"`
@@ -166,8 +172,7 @@ func runFolderCommand(args []string) int {
 	case "pull":
 		return runFolderPull(args[1:])
 	case "flush":
-		fmt.Fprintf(os.Stderr, "idoud: folder %s is gated until its server/client protocol phase is enabled\n", args[0])
-		return 1
+		return runMountControlCommand("flush", args[1:])
 	case "help", "-h", "--help":
 		printFolderUsage(os.Stdout)
 		return 0
@@ -806,44 +811,264 @@ func runFolderRotateWriteKey(args []string) int {
 func runMountCommand(args []string) int {
 	if len(args) > 0 {
 		switch strings.ToLower(strings.TrimSpace(args[0])) {
-		case "list":
-			fmt.Fprintln(os.Stdout, "no active idoud mounts")
-			return 0
-		case "status", "flush", "unmount":
-			fmt.Fprintln(os.Stderr, "idoud: no matching active mount supervisor")
-			return 1
+		case "list", "status", "flush", "unmount":
+			return runMountControlCommand(strings.ToLower(strings.TrimSpace(args[0])), args[1:])
 		}
 	}
-	writeRequested := false
-	backgroundRequested := false
-	positionals := make([]string, 0, 2)
-	for _, arg := range args {
-		switch arg {
-		case "--write":
-			writeRequested = true
-		case "--background":
-			backgroundRequested = true
-		default:
-			positionals = append(positionals, arg)
-		}
-	}
-	if len(positionals) != 2 {
-		fmt.Fprintln(os.Stderr, "idoud: usage: idoud mount FOLDER MOUNTPOINT [--write] [--background]")
+	fs := flag.NewFlagSet("idoud mount", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	server := fs.String("server", defaultServerURL, "idoud server origin")
+	sessionFile := fs.String("session-file", "", "read a derived reader/writer session from a 0600 file")
+	writeRequested := fs.Bool("write", false, "request an explicit writable mount")
+	backgroundRequested := fs.Bool("background", false, "run through the local mount supervisor")
+	jsonOutput := fs.Bool("json", false, "schema-versioned JSON status")
+	debug := fs.Bool("debug", false, "enable platform bridge diagnostics")
+	if err := fs.Parse(normalizeInterspersedArgs(fs, args)); err != nil {
+		fmt.Fprintf(os.Stderr, "idoud: %v\n", err)
 		return 2
 	}
-	if command, link, missing := missingMountBridge(); missing {
-		fmt.Fprintf(os.Stderr, "idoud: bridge_missing: native mount bridge is not installed\ninstall: %s\n%s\n", command, link)
+	if fs.NArg() != 2 {
+		fmt.Fprintln(os.Stderr, "idoud: usage: idoud mount FOLDER MOUNTPOINT [--session-file FILE] [--write] [--background]")
+		return 2
+	}
+	if command, link, missing := checkMountBridge(); missing {
+		printMountFailure(*jsonOutput, "bridge_missing", fmt.Errorf("native mount bridge is not installed; install: %s; %s", command, link))
 		return 1
 	}
-	mode := "read-only foreground"
-	if writeRequested {
-		mode = "writable foreground"
+	if *writeRequested {
+		printMountFailure(*jsonOutput, "protocol_upgrade_required", mountremote.ErrWriteUnsupported)
+		return 1
 	}
-	if backgroundRequested {
-		mode = strings.Replace(mode, "foreground", "background", 1)
+	if *backgroundRequested {
+		printMountFailure(*jsonOutput, "protocol_upgrade_required", errors.New("background mount supervision is not enabled in this build"))
+		return 1
 	}
-	fmt.Fprintf(os.Stderr, "idoud: protocol_upgrade_required: native mount core is gated in this build (%s requested)\n", mode)
-	return 1
+	client, shareID, err := newFolderCLIClient(*server, fs.Arg(0), *sessionFile)
+	if err != nil {
+		printMountFailure(*jsonOutput, "invalid_folder", err)
+		return 2
+	}
+	ctx, stopSignals := newInterruptContext()
+	defer stopSignals()
+	remoteBackend, err := mountremote.New(ctx, mountremote.Config{
+		BaseURL: client.baseURL, ShareID: shareID, SessionToken: client.session,
+		DeviceLabel: "idoud native mount", AllowHTTP: mountLoopbackHTTPAllowed(client.baseURL),
+	})
+	if err != nil {
+		printMountFailure(*jsonOutput, mountErrorCode(err), err)
+		return 1
+	}
+	defer remoteBackend.Close()
+	core, err := mountcore.New(ctx, remoteBackend)
+	if err != nil {
+		printMountFailure(*jsonOutput, mountErrorCode(err), err)
+		return 1
+	}
+	defer core.Close()
+	mounted, err := mountadapter.Mount(ctx, core, remoteBackend, mountadapter.Options{Mountpoint: fs.Arg(1), Debug: *debug})
+	if err != nil {
+		printMountFailure(*jsonOutput, mountErrorCode(err), err)
+		return 1
+	}
+	control, err := mountsupervisor.Start(mounted)
+	if err != nil {
+		_ = mounted.Unmount()
+		printMountFailure(*jsonOutput, "mount_control_failed", err)
+		return 1
+	}
+	defer control.Close()
+	status := mounted.Status()
+	if *jsonOutput {
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"schema_version": folderCLIOutputSchemaVersion, "ok": true, "type": "mount_ready",
+			"result": map[string]any{
+				"mount_id": control.Record().MountID, "mountpoint": status.Mountpoint, "mode": "read_only", "state": status.State,
+				"selected_node": status.SelectedNode, "mmap_supported": status.MMapSupported,
+			},
+		})
+	} else {
+		fmt.Fprintf(os.Stdout, "mounted %q read-only via %s (mount %s); press Ctrl+C to unmount\n", status.Mountpoint, status.SelectedNode, control.Record().MountID)
+	}
+	mounted.Wait()
+	if err := mounted.Unmount(); err != nil {
+		printMountFailure(*jsonOutput, "unmount_failed", err)
+		return 1
+	}
+	return 0
+}
+
+func runMountControlCommand(command string, args []string) int {
+	fs := flag.NewFlagSet("idoud mount "+command, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	jsonOutput := fs.Bool("json", false, "schema-versioned JSON status")
+	if err := fs.Parse(normalizeInterspersedArgs(fs, args)); err != nil {
+		fmt.Fprintf(os.Stderr, "idoud: %v\n", err)
+		return 2
+	}
+	target := ""
+	switch command {
+	case "list":
+		if fs.NArg() != 0 {
+			fmt.Fprintln(os.Stderr, "idoud: usage: idoud mount list [--json]")
+			return 2
+		}
+	case "status":
+		if fs.NArg() > 1 {
+			fmt.Fprintln(os.Stderr, "idoud: usage: idoud mount status [MOUNT|MOUNTPOINT] [--json]")
+			return 2
+		}
+		if fs.NArg() == 1 {
+			target = fs.Arg(0)
+		}
+	case "flush", "unmount":
+		if fs.NArg() != 1 {
+			fmt.Fprintf(os.Stderr, "idoud: usage: idoud mount %s MOUNT|MOUNTPOINT [--json]\n", command)
+			return 2
+		}
+		target = fs.Arg(0)
+	default:
+		fmt.Fprintln(os.Stderr, "idoud: invalid mount control command")
+		return 2
+	}
+
+	var (
+		snapshots []mountsupervisor.Snapshot
+		err       error
+	)
+	switch command {
+	case "list":
+		snapshots, err = mountsupervisor.List()
+	case "status":
+		if target == "" {
+			snapshots, err = mountsupervisor.List()
+		} else {
+			snapshots, err = mountsupervisor.Status(target)
+		}
+	case "flush":
+		snapshots, err = mountsupervisor.Flush(target)
+	case "unmount":
+		snapshots, err = mountsupervisor.Unmount(target)
+	}
+	if err != nil {
+		code := "mount_control_failed"
+		switch {
+		case errors.Is(err, mountsupervisor.ErrNotFound):
+			code = "mount_not_found"
+		case errors.Is(err, mountsupervisor.ErrReadOnly):
+			code = "read_only"
+		case errors.Is(err, mountsupervisor.ErrUnsupported):
+			code = "bridge_missing"
+		}
+		printMountFailure(*jsonOutput, code, err)
+		return 1
+	}
+	printMountControlResult(*jsonOutput, command, snapshots)
+	return 0
+}
+
+func printMountControlResult(jsonOutput bool, command string, snapshots []mountsupervisor.Snapshot) {
+	if jsonOutput {
+		mounts := make([]map[string]any, 0, len(snapshots))
+		for _, snapshot := range snapshots {
+			status := snapshot.Status
+			lastChangeAt := int64(0)
+			if !status.LastChangeAt.IsZero() {
+				lastChangeAt = status.LastChangeAt.Unix()
+			}
+			mounts = append(mounts, map[string]any{
+				"mount_id": snapshot.Record.MountID, "pid": snapshot.Record.PID,
+				"mountpoint": status.Mountpoint, "platform": status.Platform,
+				"mode": "read_only", "state": status.State, "sequence": status.Sequence,
+				"selected_node": status.SelectedNode, "mmap_supported": status.MMapSupported,
+				"last_change_at": lastChangeAt, "last_change_error": status.LastChangeError,
+			})
+		}
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"schema_version": folderCLIOutputSchemaVersion, "ok": true, "type": "mount_" + command,
+			"result": map[string]any{"mounts": mounts},
+		})
+		return
+	}
+	if len(snapshots) == 0 {
+		fmt.Fprintln(os.Stdout, "no active idoud mounts")
+		return
+	}
+	for _, snapshot := range snapshots {
+		status := snapshot.Status
+		fmt.Fprintf(os.Stdout, "%s\t%q\tread_only\t%s\t%s\n", snapshot.Record.MountID, status.Mountpoint, status.State, status.SelectedNode)
+	}
+}
+
+func mountLoopbackHTTPAllowed(raw string) bool {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "http" {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+func mountErrorCode(err error) string {
+	switch {
+	case errors.Is(err, mountadapter.ErrBridgeMissing), errors.Is(err, mountadapter.ErrUnsupported):
+		return "bridge_missing"
+	case errors.Is(err, mountadapter.ErrMountpointInvalid):
+		return "invalid_mountpoint"
+	case errors.Is(err, mountadapter.ErrMMapUnsupported), errors.Is(err, mountadapter.ErrInvalidationMissing),
+		errors.Is(err, mountremote.ErrProtocolUpgradeRequired):
+		return "protocol_upgrade_required"
+	case errors.Is(err, mountremote.ErrBlockedAuth):
+		return "blocked_auth"
+	case errors.Is(err, mountremote.ErrQuarantined):
+		return "quarantined"
+	case errors.Is(err, mountremote.ErrResetRequired):
+		return "reset_required"
+	default:
+		return "mount_failed"
+	}
+}
+
+func printMountFailure(jsonOutput bool, code string, err error) {
+	detail := mountFailureDetail(code, err)
+	if jsonOutput {
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"schema_version": folderCLIOutputSchemaVersion, "ok": false, "type": "mount_error",
+			"error": map[string]string{"code": code, "detail": detail},
+		})
+		return
+	}
+	fmt.Fprintf(os.Stderr, "idoud: %s: %s\n", code, detail)
+}
+
+func mountFailureDetail(code string, err error) string {
+	switch code {
+	case "mount_failed":
+		return "remote mount request failed"
+	case "blocked_auth":
+		return "mount authorization is invalid, expired, or revoked"
+	case "quarantined":
+		return "folder content is quarantined"
+	case "reset_required":
+		return "the remote namespace requires a fresh mount"
+	case "protocol_upgrade_required":
+		return "server or client mount protocol upgrade is required"
+	case "invalid_folder":
+		return "folder reference or server origin is invalid"
+	case "invalid_mountpoint":
+		return "native mountpoint is invalid"
+	case "unmount_failed":
+		return "native mount could not be cleanly unmounted"
+	case "mount_control_failed":
+		return "local mount control request failed"
+	case "mount_not_found":
+		return "no matching active mount supervisor"
+	case "read_only":
+		return "remote flush is not applicable to a read-only mount"
+	}
+	if err == nil {
+		return code
+	}
+	return err.Error()
 }
 
 func missingMountBridge() (command string, link string, missing bool) {
@@ -1361,7 +1586,12 @@ USAGE
   idoud folder rotate-write-key FOLDER --session-file FILE --write-key-file NEW_FILE
   idoud folder push LOCAL_DIR FOLDER
   idoud folder pull FOLDER LOCAL_DIR
+  idoud folder flush MOUNT|MOUNTPOINT
   idoud mount FOLDER MOUNTPOINT [--write] [--background]
+  idoud mount list
+  idoud mount status [MOUNT|MOUNTPOINT]
+  idoud mount flush MOUNT|MOUNTPOINT
+  idoud mount unmount MOUNT|MOUNTPOINT
 
 Folder and mount operations are explicit. Existing idoud FILE, -D, and -z behavior is unchanged.`)
 }

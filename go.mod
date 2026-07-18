@@ -9,6 +9,7 @@ require (
 )
 
 require (
+	github.com/hanwen/go-fuse/v2 v2.10.1
 	golang.org/x/sys v0.41.0
 	modernc.org/sqlite v1.45.0
 )
