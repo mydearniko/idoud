@@ -56,6 +56,21 @@ idoud --download AbC123 --download-output ./archive.zip
 
 # Install the newest release for this operating system and CPU.
 idoud --update
+
+# Create a live mutable folder. The one-time write key and the derived writer
+# session are written only to new mode-0600 files, never to command output.
+idoud folder create Project \
+  --write-key-file ./project.write-key \
+  --session-file ./project.session
+
+# Recursively publish a fully preflighted local directory. A writer session is
+# required; the raw write key is never accepted on the command line.
+idoud folder push ./project https://idoud.cc/f/SHARE_ID \
+  --session-file ./project.session
+
+# Stream the current public namespace into a new or empty local directory.
+# Password-protected folders use a reader session created by `folder auth`.
+idoud folder pull https://idoud.cc/f/SHARE_ID ./project-copy
 ```
 
 Run `idoud --help` for the compact command reference, `idoud --help-all` for
@@ -117,6 +132,20 @@ its existing `--verbose` meaning.
   systems use the sequential path.
 - Diagnostics go to stderr. Successful machine-readable output stays isolated
   on stdout.
+- Live-folder commands are explicit and do not change `idoud FILE`, `-D`, or
+  `-z`. Recursive push validates the complete portable tree and negotiated
+  limits, hashes every file in provider-sized buffers before transmitting any
+  payload, creates writer-only targets before the first provider PUT, and
+  publishes each immutable version only after the server reports its configured
+  replica factor. Concurrent same-path changes are reported as conflict copies,
+  never silently merged or overwritten.
+- `folder pull` paginates direct-child listings, rejects non-portable or special
+  entries, pins every file to the ETag and immutable version observed during
+  preflight, and streams into fsynced temporary files. Final publication is an
+  atomic no-replace operation: the destination must be absent or empty and no
+  existing local entry is deleted or overwritten. Transfer concurrency is
+  bounded by `--parallel` (maximum 8), and JSON output never includes sessions,
+  write keys, provider URLs, or signed data grants.
 - Interactive terminals get a compact idoud-styled transfer display on stderr.
   One progressive heading gains the name, size, and route plan as they become
   available, then remains as the single summary above the progress bar.

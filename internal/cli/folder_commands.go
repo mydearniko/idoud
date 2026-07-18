@@ -35,14 +35,35 @@ type folderCLIError struct {
 type folderCLIDescriptorResponse struct {
 	SchemaVersion int `json:"schemaVersion"`
 	Folder        struct {
-		ShareID         string `json:"shareId"`
-		Name            string `json:"name"`
-		RootEntryID     string `json:"rootEntryId"`
-		Sequence        int64  `json:"sequence"`
-		ReadPolicy      string `json:"readPolicy"`
-		State           string `json:"state"`
-		ShareGeneration int64  `json:"shareGeneration"`
-		WriteGeneration int64  `json:"writeGeneration"`
+		ShareID          string `json:"shareId"`
+		Name             string `json:"name"`
+		RootEntryID      string `json:"rootEntryId"`
+		Sequence         int64  `json:"sequence"`
+		ReadPolicy       string `json:"readPolicy"`
+		State            string `json:"state"`
+		ShareGeneration  int64  `json:"shareGeneration"`
+		WriteGeneration  int64  `json:"writeGeneration"`
+		PermittedActions struct {
+			Browse   bool `json:"browse"`
+			Download bool `json:"download"`
+			Write    bool `json:"write"`
+		} `json:"permittedActions"`
+		Limits struct {
+			MaxComponentUnits    int    `json:"maxComponentUnits"`
+			MaxEncodedPath       int    `json:"maxEncodedPath"`
+			MaxDepth             int    `json:"maxDepth"`
+			MaxActiveEntries     int64  `json:"maxActiveEntries"`
+			MaxDirectChildren    int64  `json:"maxDirectChildren"`
+			MaxMetadataBytes     int64  `json:"maxMetadataBytes"`
+			ProviderPayloadBytes int64  `json:"providerPayloadBytes"`
+			MaxUploadObjects     int    `json:"maxUploadObjects"`
+			MaxUploadBlocks      int    `json:"maxUploadBlocks"`
+			ReplicationFactor    int    `json:"replicationFactor"`
+			DegradedDurability   bool   `json:"degradedDurability"`
+			ActiveEntries        *int64 `json:"activeEntries,omitempty"`
+			RemainingEntries     *int64 `json:"remainingActiveEntries,omitempty"`
+			RetainedEntries      *int64 `json:"retainedEntries,omitempty"`
+		} `json:"limits"`
 	} `json:"folder"`
 }
 
@@ -55,7 +76,9 @@ type folderCLIEntry struct {
 	EntryRevision    int64  `json:"entryRevision"`
 	ChildSetRevision int64  `json:"childSetRevision"`
 	State            string `json:"state"`
+	Visibility       string `json:"visibility"`
 	Mtime            int64  `json:"mtime"`
+	Executable       bool   `json:"executable"`
 }
 
 type folderCLIEntriesResponse struct {
@@ -138,7 +161,11 @@ func runFolderCommand(args []string) int {
 		return runFolderRotateShareID(args[1:])
 	case "rotate-write-key":
 		return runFolderRotateWriteKey(args[1:])
-	case "push", "pull", "flush":
+	case "push":
+		return runFolderPush(args[1:])
+	case "pull":
+		return runFolderPull(args[1:])
+	case "flush":
 		fmt.Fprintf(os.Stderr, "idoud: folder %s is gated until its server/client protocol phase is enabled\n", args[0])
 		return 1
 	case "help", "-h", "--help":
@@ -1091,9 +1118,12 @@ func (c folderCLIClient) jsonRequest(ctx context.Context, method string, path st
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var apiErr folderCLIError
 		if json.Unmarshal(payload, &apiErr) == nil && apiErr.Error.Code != "" {
-			return fmt.Errorf("%s: %s", apiErr.Error.Code, apiErr.Error.Message)
+			return &folderCLIRequestError{
+				Status: resp.StatusCode, Code: apiErr.Error.Code, Message: apiErr.Error.Message,
+				RetryAfter: resp.Header.Get("Retry-After"),
+			}
 		}
-		return fmt.Errorf("server returned HTTP %d", resp.StatusCode)
+		return &folderCLIRequestError{Status: resp.StatusCode, Message: fmt.Sprintf("server returned HTTP %d", resp.StatusCode), RetryAfter: resp.Header.Get("Retry-After")}
 	}
 	if out != nil {
 		if err := json.Unmarshal(payload, out); err != nil {
@@ -1101,6 +1131,37 @@ func (c folderCLIClient) jsonRequest(ctx context.Context, method string, path st
 		}
 	}
 	return nil
+}
+
+type folderCLIRequestError struct {
+	Status     int
+	Code       string
+	Message    string
+	RetryAfter string
+}
+
+func (e *folderCLIRequestError) Error() string {
+	if e == nil {
+		return "folder request failed"
+	}
+	if e.Code != "" && e.Message != "" {
+		return e.Code + ": " + e.Message
+	}
+	if e.Code != "" {
+		return e.Code
+	}
+	if e.Message != "" {
+		return e.Message
+	}
+	return fmt.Sprintf("server returned HTTP %d", e.Status)
+}
+
+func folderCLIErrorCode(err error) string {
+	var requestErr *folderCLIRequestError
+	if errors.As(err, &requestErr) {
+		return requestErr.Code
+	}
+	return ""
 }
 
 func normalizeFolderServer(raw string) (string, error) {
