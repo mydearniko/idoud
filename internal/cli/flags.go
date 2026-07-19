@@ -475,10 +475,6 @@ func compactUsageText() string {
 
 USAGE
   %[1]s [options] FILE
-	%[1]s upload [options] FILE
-	%[1]s download [options] URL_OR_ID
-	%[1]s folder create|ls|status|auth ...
-	%[1]s mount FOLDER MOUNTPOINT [--write] [--background]
   command | %[1]s [-n NAME] [options]
   %[1]s -S [-n NAME] [options]
   %[1]s -z PATH... [options]

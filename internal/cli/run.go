@@ -29,18 +29,6 @@ func RunWithVersion(args []string, currentVersion string) int {
 	if isUpdateCommand(args) {
 		return runSelfUpdate(context.Background(), currentVersion)
 	}
-	if len(args) > 0 {
-		switch strings.ToLower(strings.TrimSpace(args[0])) {
-		case "upload":
-			return runTransfer(args[1:])
-		case "download":
-			return runTransfer(append([]string{"--download"}, args[1:]...))
-		case "folder":
-			return runFolderCommand(args[1:])
-		case "mount":
-			return runMountCommand(args[1:])
-		}
-	}
 	return runTransfer(args)
 }
 
