@@ -112,13 +112,9 @@ func TestTransferUIEmitsAndClearsTabProgressOnFailure(t *testing.T) {
 	failure := terminalTabProgressSequence(terminalTabProgressError, 50)
 	hidden := terminalTabProgressSequence(terminalTabProgressHidden, 0)
 	for _, want := range []string{normal, failure, hidden, "transfer stopped"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("output %q does not contain %q", got, want)
-		}
+		failIf(t, !strings.Contains(got, want), "output %q does not contain %q", got, want)
 	}
-	if !(strings.Index(got, normal) < strings.Index(got, failure) && strings.Index(got, failure) < strings.LastIndex(got, hidden)) {
-		t.Fatalf("tab progress lifecycle is out of order: %q", got)
-	}
+	failIf(t, !(strings.Index(got, normal) < strings.Index(got, failure) && strings.Index(got, failure) < strings.LastIndex(got, hidden)), "tab progress lifecycle is out of order: %q", got)
 }
 
 func TestTransferUICompletesUnknownTabProgressAndPlainModeStaysClean(t *testing.T) {
@@ -142,9 +138,7 @@ func TestTransferUICompletesUnknownTabProgressAndPlainModeStaysClean(t *testing.
 		terminalTabProgressSequence(terminalTabProgressNormal, 100),
 		terminalTabProgressSequence(terminalTabProgressHidden, 0),
 	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("unknown progress output %q does not contain %q", got, want)
-		}
+		failIf(t, !strings.Contains(got, want), "unknown progress output %q does not contain %q", got, want)
 	}
 
 	var plain bytes.Buffer

@@ -16,9 +16,8 @@ import (
 
 func TestApplyUploadPreparePlanUsesServerChunkSize(t *testing.T) {
 	base, err := url.Parse("https://idoud.cc")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	u := &uploader{
 		opts: options{
 			serverBase: base,
@@ -42,9 +41,8 @@ func TestApplyUploadPreparePlanUsesServerChunkSize(t *testing.T) {
 			{ID: "node-b", PublicURL: "https://b.idoud.cc:1225", Weight: 1},
 		},
 	})
-	if err != nil {
-		t.Fatalf("applyUploadPreparePlan returned error: %v", err)
-	}
+	requireNoError(t, err, "applyUploadPreparePlan returned error: %v")
+
 	if u.opts.chunkSize != 10485689 {
 		t.Fatalf("chunkSize=%d, want 10485689", u.opts.chunkSize)
 	}
@@ -58,16 +56,10 @@ func TestApplyUploadPreparePlanUsesServerChunkSize(t *testing.T) {
 		t.Fatalf("uploadURLs[0]=%q", src.uploadURLs[0])
 	}
 	chunk0URL, _ := src.uploadTargetForChunk(0)
-	if !strings.HasPrefix(chunk0URL, "https://b.idoud.cc:1225/AbC123/file.bin") {
-		t.Fatalf("chunk0URL=%q, want schedule target node-b", chunk0URL)
-	}
+	failIf(t, !strings.HasPrefix(chunk0URL, "https://b.idoud.cc:1225/AbC123/file.bin"), "chunk0URL=%q, want schedule target node-b", chunk0URL)
 	chunk1URL, _ := src.uploadTargetForChunk(1)
-	if !strings.HasPrefix(chunk1URL, "https://a.idoud.cc:1225/AbC123/file.bin") {
-		t.Fatalf("chunk1URL=%q, want schedule target node-a", chunk1URL)
-	}
-	if u.subdomains != nil {
-		t.Fatal("subdomains not disabled after prepare plan")
-	}
+	failIf(t, !strings.HasPrefix(chunk1URL, "https://a.idoud.cc:1225/AbC123/file.bin"), "chunk1URL=%q, want schedule target node-a", chunk1URL)
+	fatalIf(t, u.subdomains != nil, "subdomains not disabled after prepare plan")
 }
 
 func TestApplyUploadPreparePlanRejectsExplicitChunkSizeMismatch(t *testing.T) {
@@ -85,12 +77,8 @@ func TestApplyUploadPreparePlanRejectsExplicitChunkSizeMismatch(t *testing.T) {
 		FileID:     "AbC123",
 		ChunkSize:  10485689,
 	})
-	if err == nil {
-		t.Fatal("expected explicit chunk-size mismatch error")
-	}
-	if !strings.Contains(err.Error(), "server selected chunk size 10485689 bytes") {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	fatalIf(t, err == nil, "expected explicit chunk-size mismatch error")
+	failIf(t, !strings.Contains(err.Error(), "server selected chunk size 10485689 bytes"), "unexpected error: %v", err)
 }
 
 func TestApplyUploadPreparePlanCapsConcurrencyToAdvertisedFleetCapacity(t *testing.T) {
@@ -106,9 +94,8 @@ func TestApplyUploadPreparePlanCapsConcurrencyToAdvertisedFleetCapacity(t *testi
 			{ID: "route-b", PublicURL: "https://b.example", MaxParallel: 24},
 		},
 	})
-	if err != nil {
-		t.Fatalf("applyUploadPreparePlan returned error: %v", err)
-	}
+	requireNoError(t, err, "applyUploadPreparePlan returned error: %v")
+
 	if got := u.effectiveUploadParallel(); got != 64 {
 		t.Fatalf("effective parallel=%d, want advertised aggregate 64", got)
 	}
@@ -126,9 +113,8 @@ func TestApplyUploadPreparePlanKeepsRequestedConcurrencyForLegacyPlans(t *testin
 			{ID: "legacy", PublicURL: "https://legacy.example"},
 		},
 	})
-	if err != nil {
-		t.Fatalf("applyUploadPreparePlan returned error: %v", err)
-	}
+	requireNoError(t, err, "applyUploadPreparePlan returned error: %v")
+
 	if got := u.effectiveUploadParallel(); got != 512 {
 		t.Fatalf("effective parallel=%d, want requested legacy value 512", got)
 	}
@@ -136,9 +122,8 @@ func TestApplyUploadPreparePlanKeepsRequestedConcurrencyForLegacyPlans(t *testin
 
 func TestApplyUploadPreparePlanKeepsStandbyOutOfPrimarySchedule(t *testing.T) {
 	base, err := url.Parse("https://idoud.cc")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	u := &uploader{opts: options{serverBase: base, parallel: 384, chunkSize: defaultChunkSize}}
 	src := &sourceFile{uploadName: "file.bin"}
 	err = u.applyUploadPreparePlan(src, protocol.UploadPrepareResponse{
@@ -154,9 +139,8 @@ func TestApplyUploadPreparePlanKeepsStandbyOutOfPrimarySchedule(t *testing.T) {
 			{ID: "standby", PublicURL: "https://standby.example", MaxParallel: 320, FailoverPriority: 100},
 		},
 	})
-	if err != nil {
-		t.Fatalf("applyUploadPreparePlan returned error: %v", err)
-	}
+	requireNoError(t, err, "applyUploadPreparePlan returned error: %v")
+
 	if len(src.uploadRouteTargets) != 2 || len(src.uploadFallbackTargets) != 1 {
 		t.Fatalf("primary routes=%d fallback routes=%d", len(src.uploadRouteTargets), len(src.uploadFallbackTargets))
 	}
@@ -165,23 +149,17 @@ func TestApplyUploadPreparePlanKeepsStandbyOutOfPrimarySchedule(t *testing.T) {
 	}
 	for i := int64(0); i < 8; i++ {
 		target, selectErr := u.selectUploadRoute(src, i)
-		if selectErr != nil {
-			t.Fatal(selectErr)
-		}
-		if target.fallback || target.nodeID != "primary" {
-			t.Fatalf("chunk %d selected standby during healthy operation: %+v", i, target)
-		}
+		requireNoError(t, selectErr, "")
+
+		failIf(t, target.fallback || target.nodeID != "primary", "chunk %d selected standby during healthy operation: %+v", i, target)
 	}
 	u.ensureRouteState()
 	u.routes.failure(src.uploadRouteTargets[0].rawURL, http.StatusBadGateway, nil)
 	u.routes.failure(src.uploadRouteTargets[1].rawURL, http.StatusBadGateway, nil)
 	target, err := u.selectUploadRoute(src, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !target.fallback || target.nodeID != "standby" {
-		t.Fatalf("selected target=%+v, want direct standby", target)
-	}
+	requireNoError(t, err, "")
+
+	failIf(t, !target.fallback || target.nodeID != "standby", "selected target=%+v, want direct standby", target)
 }
 
 func TestPrepareUploadRetriesTransientMasterFailure(t *testing.T) {
@@ -200,17 +178,13 @@ func TestPrepareUploadRetriesTransientMasterFailure(t *testing.T) {
 	}))
 	defer server.Close()
 	base, err := url.Parse(server.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	u := &uploader{opts: options{serverBase: base, chunkSize: defaultChunkSize, requestTimeout: time.Second, resumeTimeout: time.Second, retries: 6, uploadKey: "key"}, client: server.Client()}
 	src := &sourceFile{uploadName: "file.bin", knownSize: true, size: 4}
-	if err := u.prepareUpload(context.Background(), src); err != nil {
-		t.Fatalf("prepareUpload: %v", err)
-	}
-	if requests != 2 {
-		t.Fatalf("prepare requests=%d, want 2", requests)
-	}
+	requireNoError(t, u.prepareUpload(context.Background(), src), "prepareUpload: %v")
+
+	failIf(t, requests != 2, "prepare requests=%d, want 2", requests)
 }
 
 func TestPrepareUploadRefreshesCompletedAutomaticResumeTarget(t *testing.T) {
@@ -218,17 +192,14 @@ func TestPrepareUploadRefreshesCompletedAutomaticResumeTarget(t *testing.T) {
 	const resumeID = "completed-upload-resume"
 	const previousKey = "completed-upload-key"
 	statePath, err := uploadResumeStatePath()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := saveUploadResumeState(statePath, uploadResumeState{
+	requireNoError(t, err, "")
+
+	requireNoError(t, saveUploadResumeState(statePath, uploadResumeState{
 		Version: uploadResumeStateVersion,
 		Records: map[string]uploadResumeRecord{
 			resumeID: {UploadKey: previousKey, UpdatedAt: time.Now().Unix()},
 		},
-	}); err != nil {
-		t.Fatalf("save resume state: %v", err)
-	}
+	}), "save resume state: %v")
 
 	var requestKeys []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -245,9 +216,8 @@ func TestPrepareUploadRefreshesCompletedAutomaticResumeTarget(t *testing.T) {
 	}))
 	defer server.Close()
 	base, err := url.Parse(server.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	u := &uploader{
 		resumeID: resumeID,
 		opts: options{
@@ -269,9 +239,8 @@ func TestPrepareUploadRefreshesCompletedAutomaticResumeTarget(t *testing.T) {
 	u.ui.start()
 	defer u.ui.stop(false)
 	src := &sourceFile{uploadName: "file.bin", knownSize: true, size: 4}
-	if err := u.prepareUpload(context.Background(), src); err != nil {
-		t.Fatalf("prepareUpload: %v", err)
-	}
+	requireNoError(t, u.prepareUpload(context.Background(), src), "prepareUpload: %v")
+
 	u.ui.stop(true)
 	if len(requestKeys) != 2 {
 		t.Fatalf("prepare requests=%d, want 2", len(requestKeys))
@@ -299,9 +268,8 @@ func TestPrepareUploadKeepsExplicitCompletedTargetStrict(t *testing.T) {
 	}))
 	defer server.Close()
 	base, err := url.Parse(server.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	u := &uploader{
 		resumeID: "managed-resume-that-must-not-be-used",
 		opts: options{
@@ -311,15 +279,9 @@ func TestPrepareUploadKeepsExplicitCompletedTargetStrict(t *testing.T) {
 		client: server.Client(),
 	}
 	err = u.prepareUpload(context.Background(), &sourceFile{uploadName: "file.bin", knownSize: true, size: 4})
-	if err == nil {
-		t.Fatal("prepareUpload succeeded")
-	}
-	if requests != 1 {
-		t.Fatalf("prepare requests=%d, want 1", requests)
-	}
-	if !strings.Contains(err.Error(), "http status 400: "+uploadPrepareTargetAlreadyExists) {
-		t.Fatalf("error=%q, want public server explanation", err)
-	}
+	fatalIf(t, err == nil, "prepareUpload succeeded")
+	failIf(t, requests != 1, "prepare requests=%d, want 1", requests)
+	failIf(t, !strings.Contains(err.Error(), "http status 400: "+uploadPrepareTargetAlreadyExists), "error=%q, want public server explanation", err)
 }
 
 func TestPrepareUploadDoesNotRetryPermanentFailure(t *testing.T) {
@@ -330,18 +292,11 @@ func TestPrepareUploadDoesNotRetryPermanentFailure(t *testing.T) {
 	}))
 	defer server.Close()
 	base, err := url.Parse(server.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	u := &uploader{opts: options{serverBase: base, chunkSize: defaultChunkSize, requestTimeout: time.Second, resumeTimeout: time.Second, retries: 6, uploadKey: "key"}, client: server.Client()}
 	err = u.prepareUpload(context.Background(), &sourceFile{uploadName: "file.bin", knownSize: true, size: 4})
-	if err == nil {
-		t.Fatal("prepareUpload succeeded")
-	}
-	if requests != 1 {
-		t.Fatalf("prepare requests=%d, want 1", requests)
-	}
-	if strings.Contains(err.Error(), "bad request") {
-		t.Fatalf("unrecognized server body leaked in error: %q", err)
-	}
+	fatalIf(t, err == nil, "prepareUpload succeeded")
+	failIf(t, requests != 1, "prepare requests=%d, want 1", requests)
+	failIf(t, strings.Contains(err.Error(), "bad request"), "unrecognized server body leaked in error: %q", err)
 }

@@ -13,9 +13,8 @@ func TestRetryLogIncludesRequestMetadataBeforeRetryBudgetExhaustion(t *testing.T
 	t.Setenv("NO_COLOR", "1")
 	oldStderr := os.Stderr
 	reader, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	os.Stderr = writer
 	defer func() {
 		os.Stderr = oldStderr
@@ -46,15 +45,10 @@ func TestRetryLogIncludesRequestMetadataBeforeRetryBudgetExhaustion(t *testing.T
 			return "https://idoud.cc/Test01/file", 200, nil
 		},
 	)
-	if uploadErr != nil {
-		t.Fatalf("retry upload failed: %v", uploadErr)
-	}
+	requireNoError(t, uploadErr, "retry upload failed: %v")
+
 	_ = writer.Close()
 	logged := <-outputCh
-	if !strings.Contains(logged, "attempt=1") || !strings.Contains(logged, "backpressure=true") || !strings.Contains(logged, "route=https://node.example") {
-		t.Fatalf("first retry log omitted request metadata: %q", logged)
-	}
-	if strings.Contains(logged, "secret-path") {
-		t.Fatalf("retry log exposed route path: %q", logged)
-	}
+	failIf(t, !strings.Contains(logged, "attempt=1") || !strings.Contains(logged, "backpressure=true") || !strings.Contains(logged, "route=https://node.example"), "first retry log omitted request metadata: %q", logged)
+	failIf(t, strings.Contains(logged, "secret-path"), "retry log exposed route path: %q", logged)
 }

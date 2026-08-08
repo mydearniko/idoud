@@ -8,23 +8,15 @@ import (
 func TestStreamBufferLimitScalesWithHeadroom(t *testing.T) {
 	low := automaticStreamMemoryBudget(256 * 1024 * 1024)
 	high := automaticStreamMemoryBudget(8 * 1024 * 1024 * 1024)
-	if low >= high {
-		t.Fatalf("budgets low=%d high=%d, want scaling", low, high)
-	}
-	if high != maximumAutoStreamMemory {
-		t.Fatalf("high budget=%d, want cap %d", high, maximumAutoStreamMemory)
-	}
+	failIf(t, low >= high, "budgets low=%d high=%d, want scaling", low, high)
+	failIf(t, high != maximumAutoStreamMemory, "high budget=%d, want cap %d", high, maximumAutoStreamMemory)
 }
 
 func TestStreamBufferLimitHonorsConfiguredBudgetAndWorkerCap(t *testing.T) {
 	got := streamBufferLimit(512, browserChunkSize, 64*1024*1024, 0)
-	if got != int((64*1024*1024)/browserChunkSize) {
-		t.Fatalf("stream buffer count=%d", got)
-	}
+	failIf(t, got != int((64*1024*1024)/browserChunkSize), "stream buffer count=%d", got)
 	got = streamBufferLimit(3, browserChunkSize, 4*1024*1024*1024, 0)
-	if got != 4 {
-		t.Fatalf("worker-capped buffers=%d, want 4", got)
-	}
+	failIf(t, got != 4, "worker-capped buffers=%d, want 4", got)
 }
 
 func TestStreamBufferPoolAllocatesLazilyAndShrinks(t *testing.T) {
@@ -36,9 +28,8 @@ func TestStreamBufferPoolAllocatesLazilyAndShrinks(t *testing.T) {
 	bufs := make([][]byte, 0, 8)
 	for range 8 {
 		buf, err := pool.acquire(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err, "")
+
 		bufs = append(bufs, buf)
 	}
 	if _, allocated := pool.stats(); allocated != 8 {
@@ -70,15 +61,11 @@ func TestAdaptiveStreamControllerRampsAndBacksOff(t *testing.T) {
 	controller.mu.Lock()
 	grown := controller.activeTarget
 	controller.mu.Unlock()
-	if grown != 128 {
-		t.Fatalf("grown target=%d, want 128", grown)
-	}
+	failIf(t, grown != 128, "grown target=%d, want 128", grown)
 
 	controller.observeRetry(429)
 	controller.mu.Lock()
 	reduced := controller.activeTarget
 	controller.mu.Unlock()
-	if reduced != 64 {
-		t.Fatalf("reduced target=%d, want 64", reduced)
-	}
+	failIf(t, reduced != 64, "reduced target=%d, want 64", reduced)
 }

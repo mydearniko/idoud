@@ -10,8 +10,8 @@ import (
 
 func TestAvgRateWindow(t *testing.T) {
 	t.Run("empty window", func(t *testing.T) {
-		if got := avgRateWindow(nil, 7); got != 0 {
-			t.Fatalf("avgRateWindow(nil, 7) = %v, want 0", got)
+		if got := avgRateWindow(nil); got != 0 {
+			t.Fatalf("avgRateWindow(nil) = %v, want 0", got)
 		}
 	})
 
@@ -20,20 +20,16 @@ func TestAvgRateWindow(t *testing.T) {
 		window = pushRate(window, 700, 7)
 		window = pushRate(window, 0, 7)
 
-		got := avgRateWindow(window, 7)
+		got := avgRateWindow(window)
 		want := 100.0 // (700 + 0 + 5*0) / 7
-		if got != want {
-			t.Fatalf("avgRateWindow(startup) = %v, want %v", got, want)
-		}
+		failIf(t, got != want, "avgRateWindow(startup) = %v, want %v", got, want)
 	})
 
 	t.Run("full window", func(t *testing.T) {
 		window := []float64{700, 700, 700, 700, 700, 700, 700}
-		got := avgRateWindow(window, 7)
+		got := avgRateWindow(window)
 		want := 700.0
-		if got != want {
-			t.Fatalf("avgRateWindow(full) = %v, want %v", got, want)
-		}
+		failIf(t, got != want, "avgRateWindow(full) = %v, want %v", got, want)
 	})
 }
 
@@ -77,25 +73,17 @@ func TestUploadBackpressureDoesNotOpenRouteCircuit(t *testing.T) {
 		retryAfterSet: true,
 		backpressure:  true,
 	}
-	if routeFailure(backpressure.status, backpressure) {
-		t.Fatal("explicit upload backpressure was classified as a dead route")
-	}
-	if !uploadBackpressureResponse(backpressure.status, backpressure.body, backpressure.retryAfterSet) {
-		t.Fatal("explicit upload backpressure response was not recognized")
-	}
+	fatalIf(t, routeFailure(backpressure.status, backpressure), "explicit upload backpressure was classified as a dead route")
+	fatalIf(t, !uploadBackpressureResponse(backpressure.status, backpressure.body, backpressure.retryAfterSet), "explicit upload backpressure response was not recognized")
 
 	genuineFailure := &requestError{status: http.StatusServiceUnavailable, body: "upstream unavailable"}
-	if !routeFailure(genuineFailure.status, genuineFailure) {
-		t.Fatal("genuine 503 was not classified as a dead route")
-	}
+	fatalIf(t, !routeFailure(genuineFailure.status, genuineFailure), "genuine 503 was not classified as a dead route")
 }
 
 func TestIsRetryableStatus(t *testing.T) {
 	t.Run("attempt timeout is retryable while parent context is active", func(t *testing.T) {
 		err := &requestError{cause: context.DeadlineExceeded}
-		if !isRetryableStatus(context.Background(), 0, err) {
-			t.Fatal("isRetryableStatus returned false, want true")
-		}
+		fatalIf(t, !isRetryableStatus(context.Background(), 0, err), "isRetryableStatus returned false, want true")
 	})
 
 	t.Run("parent canceled context is not retryable", func(t *testing.T) {
@@ -103,8 +91,6 @@ func TestIsRetryableStatus(t *testing.T) {
 		cancel()
 
 		err := &requestError{cause: context.DeadlineExceeded}
-		if isRetryableStatus(ctx, 0, err) {
-			t.Fatal("isRetryableStatus returned true, want false")
-		}
+		fatalIf(t, isRetryableStatus(ctx, 0, err), "isRetryableStatus returned true, want false")
 	})
 }

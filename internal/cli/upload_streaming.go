@@ -30,7 +30,7 @@ func (u *uploader) uploadKnownSizeStreamChunked(ctx context.Context, src *source
 		return finalURL, nil
 	}
 
-	totalChunks := int64((src.size + u.opts.chunkSize - 1) / u.opts.chunkSize)
+	totalChunks := (src.size + u.opts.chunkSize - 1) / u.opts.chunkSize
 	if totalChunks <= 0 {
 		return "", errors.New("invalid chunk count")
 	}
@@ -103,7 +103,7 @@ readLoop:
 			break readLoop
 		}
 
-		expected := int64(u.opts.chunkSize)
+		expected := u.opts.chunkSize
 		if remaining < expected {
 			expected = remaining
 		}
@@ -119,7 +119,9 @@ readLoop:
 		if acquireErr != nil {
 			break readLoop
 		}
-		u.debugPoolWait(time.Since(poolWaitStart))
+		if d, dbg := time.Since(poolWaitStart), u.dbg; dbg != nil {
+			debugRecordDuration(&dbg.poolWaitNanos, &dbg.poolWaitCount, &dbg.poolWaitMaxNanos, d)
+		}
 		if len(buf) < int(expected) {
 			pool.release(buf)
 			cancel()
@@ -128,7 +130,9 @@ readLoop:
 
 		readStart := time.Now()
 		_, readErr := io.ReadFull(streamReader, buf[:int(expected)])
-		u.debugReadWait(time.Since(readStart))
+		if d, dbg := time.Since(readStart), u.dbg; dbg != nil {
+			debugRecordDuration(&dbg.readNanos, &dbg.readCount, &dbg.readMaxNanos, d)
+		}
 		if readErr != nil {
 			pool.release(buf)
 			cancel()
@@ -163,7 +167,9 @@ readLoop:
 				pool.release(buf)
 				break readLoop
 			case jobs <- task:
-				u.debugQueueWait(time.Since(queueWaitStart))
+				if d, dbg := time.Since(queueWaitStart), u.dbg; dbg != nil {
+					debugRecordDuration(&dbg.queueWaitNanos, &dbg.queueWaitCount, &dbg.queueWaitMaxNanos, d)
+				}
 			}
 		}
 
@@ -177,7 +183,6 @@ readLoop:
 	if finalTask != nil {
 		u.debugMarkStdinClosed(false)
 		task := *finalTask
-		finalTask = nil
 		finalErrCh = make(chan error, 1)
 		go func() {
 			err := u.uploadPreparedChunkWithRetry(ctx, src, task, true, urls)
@@ -343,12 +348,16 @@ func (u *uploader) scatterReadStdin(
 			}
 			return
 		}
-		u.debugPoolWait(time.Since(poolStart))
+		if d, dbg := time.Since(poolStart), u.dbg; dbg != nil {
+			debugRecordDuration(&dbg.poolWaitNanos, &dbg.poolWaitCount, &dbg.poolWaitMaxNanos, d)
+		}
 
 		// Read directly into the chunk buffer without an intermediate copy.
 		readStart := time.Now()
 		n, err := io.ReadFull(src, buf[:chunkSize])
-		u.debugReadWait(time.Since(readStart))
+		if d, dbg := time.Since(readStart), u.dbg; dbg != nil {
+			debugRecordDuration(&dbg.readNanos, &dbg.readCount, &dbg.readMaxNanos, d)
+		}
 
 		if n > 0 {
 			u.debugAddRead(int64(n))
@@ -513,7 +522,9 @@ drainLoop:
 			readErr = ctx.Err()
 			break drainLoop
 		case jobs <- res.chunk:
-			u.debugQueueWait(time.Since(queueWaitStart))
+			if d, dbg := time.Since(queueWaitStart), u.dbg; dbg != nil {
+				debugRecordDuration(&dbg.queueWaitNanos, &dbg.queueWaitCount, &dbg.queueWaitMaxNanos, d)
+			}
 		}
 	}
 

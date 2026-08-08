@@ -18,9 +18,8 @@ func TestStreamFinalChunkStartsBeforeNonFinalConfirmation(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			target, err := url.Parse("https://node.example/Resume1/file.bin")
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err, "")
+
 			nonFinalStarted := make(chan struct{}, 1)
 			finalStarted := make(chan struct{}, 1)
 			releaseNonFinal := make(chan struct{})
@@ -99,9 +98,7 @@ func TestStreamFinalChunkStartsBeforeNonFinalConfirmation(t *testing.T) {
 			released = true
 			select {
 			case uploadErr := <-result:
-				if uploadErr != nil {
-					t.Fatalf("stream upload failed: %v", uploadErr)
-				}
+				failIf(t, uploadErr != nil, "stream upload failed: %v", uploadErr)
 			case <-time.After(2 * time.Second):
 				t.Fatal("stream upload did not finish")
 			}

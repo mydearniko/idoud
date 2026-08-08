@@ -40,9 +40,8 @@ func TestSniffFileExtensionCommonFormats(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			prefix, extension, err := sniffFileExtension(bytes.NewReader(test.data))
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err, "")
+
 			if extension != test.want {
 				t.Fatalf("extension=%q, want %q", extension, test.want)
 			}
@@ -69,9 +68,7 @@ func FuzzExtensionFromPrefix(f *testing.F) {
 			data = data[:maximumFileSniffSize]
 		}
 		extension, _ := extensionFromPrefix(data, complete)
-		if extension != "" && (!strings.HasPrefix(extension, ".") || strings.ContainsAny(extension, "/\\")) {
-			t.Fatalf("unsafe extension %q", extension)
-		}
+		failIf(t, extension != "" && (!strings.HasPrefix(extension, ".") || strings.ContainsAny(extension, "/\\")), "unsafe extension %q", extension)
 	})
 }
 
@@ -83,9 +80,7 @@ func TestSniffFileExtensionDetectsTarAndCompressedTar(t *testing.T) {
 	if _, err := gzipWriter.Write(tarData); err != nil {
 		t.Fatal(err)
 	}
-	if err := gzipWriter.Close(); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, gzipWriter.Close(), "")
 
 	lz4Data := compressTestLZ4(t, tarData)
 	tests := []struct {
@@ -102,16 +97,14 @@ func TestSniffFileExtensionDetectsTarAndCompressedTar(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			reader := bytes.NewReader(test.data)
 			prefix, extension, err := sniffFileExtension(reader)
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err, "")
+
 			if extension != test.want {
 				t.Fatalf("extension=%q, want %q", extension, test.want)
 			}
 			replayed, err := io.ReadAll(io.MultiReader(bytes.NewReader(prefix), reader))
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err, "")
+
 			if !bytes.Equal(replayed, test.data) {
 				t.Fatalf("sniffing changed replayed stream: got %d bytes, want %d", len(replayed), len(test.data))
 			}
@@ -132,12 +125,9 @@ func TestSniffTarLZ4NeedsOnlySmallPrefixOfLargeBlock(t *testing.T) {
 
 	reader := bytes.NewReader(lz4Data)
 	prefix, extension, err := sniffFileExtension(reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if extension != ".tar.lz4" {
-		t.Fatalf("extension=%q, want .tar.lz4", extension)
-	}
+	requireNoError(t, err, "")
+
+	failIf(t, extension != ".tar.lz4", "extension=%q, want .tar.lz4", extension)
 	if len(prefix) > 4*1024 {
 		t.Fatalf("sniff buffered %d bytes, want at most 4 KiB for the large LZ4 block", len(prefix))
 	}
@@ -166,9 +156,8 @@ func TestOpenStdinSourceDetectsNameAndReplaysPipe(t *testing.T) {
 	tarData := makeTestTar(t, []byte("streamed idoud data"))
 	payload := compressTestLZ4(t, tarData)
 	reader, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	defer reader.Close()
 	writeDone := make(chan error, 1)
 	go func() {
@@ -177,24 +166,20 @@ func TestOpenStdinSourceDetectsNameAndReplaysPipe(t *testing.T) {
 	}()
 
 	opts, _, err := parseFlags([]string{"--stdin", "--name", "hello"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	src, cleanup, err := openStdinSource(reader, opts)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	defer cleanup()
 	if src.uploadName != "hello.tar.lz4" {
 		t.Fatalf("uploadName=%q, want hello.tar.lz4", src.uploadName)
 	}
 	got, err := io.ReadAll(src.stream)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := <-writeDone; err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
+	requireNoError(t, <-writeDone, "")
+
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("uploaded stream changed: got %d bytes, want %d", len(got), len(payload))
 	}
@@ -202,9 +187,8 @@ func TestOpenStdinSourceDetectsNameAndReplaysPipe(t *testing.T) {
 
 func TestKnownSizeStdinSniffDoesNotWaitForPipeClose(t *testing.T) {
 	reader, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	defer reader.Close()
 	writeDone := make(chan error, 1)
 	closeWriter := make(chan struct{})
@@ -239,9 +223,8 @@ func TestKnownSizeStdinSniffDoesNotWaitForPipeClose(t *testing.T) {
 		t.Fatal("known-size stdin type detection waited for pipe close")
 	}
 	close(closeWriter)
-	if err := <-writeDone; err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, <-writeDone, "")
+
 	if result.err != nil {
 		t.Fatal(result.err)
 	}
@@ -254,17 +237,14 @@ func TestKnownSizeStdinSniffDoesNotWaitForPipeClose(t *testing.T) {
 func TestOpenFileSourceDetectsExtensionlessNameOverride(t *testing.T) {
 	payload := compressTestLZ4(t, makeTestTar(t, []byte("file payload")))
 	filePath := filepath.Join(t.TempDir(), "opaque")
-	if err := os.WriteFile(filePath, payload, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(filePath, payload, 0o600), "")
+
 	opts, parsedPath, err := parseFlags([]string{"--name", "hello", filePath})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	src, cleanup, err := openSource(parsedPath, opts)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	defer cleanup()
 	if src.uploadName != "hello.tar.lz4" {
 		t.Fatalf("uploadName=%q, want hello.tar.lz4", src.uploadName)
@@ -276,15 +256,13 @@ func makeTestTar(t *testing.T, payload []byte) []byte {
 	var output bytes.Buffer
 	writer := tar.NewWriter(&output)
 	header := &tar.Header{Name: "payload.bin", Mode: 0o600, Size: int64(len(payload))}
-	if err := writer.WriteHeader(header); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, writer.WriteHeader(header), "")
+
 	if _, err := writer.Write(payload); err != nil {
 		t.Fatal(err)
 	}
-	if err := writer.Close(); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, writer.Close(), "")
+
 	return output.Bytes()
 }
 
@@ -292,20 +270,18 @@ func compressTestLZ4(t *testing.T, input []byte) []byte {
 	t.Helper()
 	var output bytes.Buffer
 	writer := lz4.NewWriter(&output)
-	if err := writer.Apply(
+	requireNoError(t, writer.Apply(
 		lz4.BlockSizeOption(lz4.Block4Mb),
 		lz4.BlockChecksumOption(false),
 		lz4.ChecksumOption(true),
 		lz4.CompressionLevelOption(lz4.Fast),
 		lz4.ConcurrencyOption(1),
-	); err != nil {
-		t.Fatal(err)
-	}
+	), "")
+
 	if _, err := writer.Write(input); err != nil {
 		t.Fatal(err)
 	}
-	if err := writer.Close(); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, writer.Close(), "")
+
 	return output.Bytes()
 }

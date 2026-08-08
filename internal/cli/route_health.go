@@ -129,13 +129,13 @@ func routeFailure(status int, err error) bool {
 	}
 }
 
-func (s *routeCircuitSet) failure(raw string, status int, err error) bool {
+func (s *routeCircuitSet) failure(raw string, status int, err error) {
 	if s == nil || !routeFailure(status, err) {
-		return false
+		return
 	}
 	key := routeOriginKey(raw)
 	if key == "" {
-		return false
+		return
 	}
 	now := time.Now()
 	s.mu.Lock()
@@ -155,7 +155,6 @@ func (s *routeCircuitSet) failure(raw string, status int, err error) bool {
 	}
 	s.states[key] = state
 	s.mu.Unlock()
-	return true
 }
 
 func (s *routeCircuitSet) probing(raw string, until time.Time) {

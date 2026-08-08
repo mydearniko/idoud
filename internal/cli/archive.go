@@ -287,7 +287,7 @@ func automaticArchivePrefetchPolicy(available int64, gomaxprocs int) archivePref
 	if workers > 16 {
 		workers = 16
 	}
-	budget := archivePrefetchMaxBytes
+	var budget int64
 	switch {
 	case available <= 0:
 		if workers > 2 {

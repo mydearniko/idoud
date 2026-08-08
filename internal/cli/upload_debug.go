@@ -227,8 +227,8 @@ func (d *uploadDebugStats) startLoop() {
 					0,
 					0,
 					0,
-					avgRateWindow(readRateWindow, rateAvgWindow),
-					avgRateWindow(uploadRateWindow, rateAvgWindow),
+					avgRateWindow(readRateWindow),
+					avgRateWindow(uploadRateWindow),
 				)
 				d.printRouteSummaries()
 				return
@@ -260,8 +260,8 @@ func (d *uploadDebugStats) startLoop() {
 					deltaAttempts,
 					deltaDone,
 					interval,
-					avgRateWindow(readRateWindow, rateAvgWindow),
-					avgRateWindow(uploadRateWindow, rateAvgWindow),
+					avgRateWindow(readRateWindow),
+					avgRateWindow(uploadRateWindow),
 				)
 
 				lastTick = now
@@ -542,7 +542,7 @@ func (u *uploader) upload(ctx context.Context, src *sourceFile) (finalURL string
 		return finalURL, nil
 	}
 
-	totalChunks := int64((src.size + u.opts.chunkSize - 1) / u.opts.chunkSize)
+	totalChunks := (src.size + u.opts.chunkSize - 1) / u.opts.chunkSize
 	if totalChunks <= 0 {
 		return "", errors.New("invalid chunk count")
 	}
@@ -730,108 +730,6 @@ func debugRecordDuration(total *int64, count *int64, max *int64, d time.Duration
 		if nanos <= currentMax || atomic.CompareAndSwapInt64(max, currentMax, nanos) {
 			return
 		}
-	}
-}
-
-func (u *uploader) debugPoolWait(d time.Duration) {
-	if dbg := u.dbg; dbg != nil {
-		debugRecordDuration(&dbg.poolWaitNanos, &dbg.poolWaitCount, &dbg.poolWaitMaxNanos, d)
-	}
-}
-
-func (u *uploader) debugQueueWait(d time.Duration) {
-	if dbg := u.dbg; dbg != nil {
-		debugRecordDuration(&dbg.queueWaitNanos, &dbg.queueWaitCount, &dbg.queueWaitMaxNanos, d)
-	}
-}
-
-func (u *uploader) debugReadWait(d time.Duration) {
-	if dbg := u.dbg; dbg != nil {
-		debugRecordDuration(&dbg.readNanos, &dbg.readCount, &dbg.readMaxNanos, d)
-	}
-}
-
-func (u *uploader) debugRequestBuild(d time.Duration) {
-	if dbg := u.dbg; dbg != nil {
-		debugRecordDuration(&dbg.reqBuildNanos, &dbg.reqBuildCount, &dbg.reqBuildMaxNanos, d)
-	}
-}
-
-func (u *uploader) debugHTTPRoundTrip(d time.Duration) {
-	if dbg := u.dbg; dbg != nil {
-		debugRecordDuration(&dbg.httpNanos, &dbg.httpCount, &dbg.httpMaxNanos, d)
-	}
-}
-
-func (u *uploader) debugResponseRead(d time.Duration) {
-	if dbg := u.dbg; dbg != nil {
-		debugRecordDuration(&dbg.respReadNanos, &dbg.respReadCount, &dbg.respReadMaxNanos, d)
-	}
-}
-
-func (u *uploader) debugRetrySleep(d time.Duration) {
-	if dbg := u.dbg; dbg != nil {
-		debugRecordDuration(&dbg.retrySleepNanos, &dbg.retrySleepCount, &dbg.retrySleepMaxNanos, d)
-	}
-}
-
-func (u *uploader) debugRouteWait(d time.Duration) {
-	if dbg := u.dbg; dbg != nil {
-		debugRecordDuration(&dbg.routeWaitNanos, &dbg.routeWaitCount, &dbg.routeWaitMaxNanos, d)
-	}
-}
-
-func (u *uploader) debugBodyGateWait(d time.Duration) {
-	if dbg := u.dbg; dbg != nil {
-		debugRecordDuration(&dbg.bodyGateNanos, &dbg.bodyGateCount, &dbg.bodyGateMaxNanos, d)
-	}
-}
-
-func (u *uploader) debugCooldownWait(d time.Duration) {
-	if dbg := u.dbg; dbg != nil {
-		debugRecordDuration(&dbg.cooldownWaitNanos, &dbg.cooldownWaitCount, &dbg.cooldownWaitMaxNanos, d)
-	}
-}
-
-func (u *uploader) debugConnectionAcquire(d time.Duration) {
-	if dbg := u.dbg; dbg != nil {
-		debugRecordDuration(&dbg.connAcquireNanos, &dbg.connAcquireCount, &dbg.connAcquireMaxNanos, d)
-	}
-}
-
-func (u *uploader) debugConnectionPoolWait(d time.Duration) {
-	if dbg := u.dbg; dbg != nil {
-		debugRecordDuration(&dbg.connPoolNanos, &dbg.connPoolCount, &dbg.connPoolMaxNanos, d)
-	}
-}
-
-func (u *uploader) debugDNS(d time.Duration) {
-	if dbg := u.dbg; dbg != nil {
-		debugRecordDuration(&dbg.dnsNanos, &dbg.dnsCount, &dbg.dnsMaxNanos, d)
-	}
-}
-
-func (u *uploader) debugConnect(d time.Duration) {
-	if dbg := u.dbg; dbg != nil {
-		debugRecordDuration(&dbg.connectNanos, &dbg.connectCount, &dbg.connectMaxNanos, d)
-	}
-}
-
-func (u *uploader) debugTLS(d time.Duration) {
-	if dbg := u.dbg; dbg != nil {
-		debugRecordDuration(&dbg.tlsNanos, &dbg.tlsCount, &dbg.tlsMaxNanos, d)
-	}
-}
-
-func (u *uploader) debugBodySend(d time.Duration) {
-	if dbg := u.dbg; dbg != nil {
-		debugRecordDuration(&dbg.bodySendNanos, &dbg.bodySendCount, &dbg.bodySendMaxNanos, d)
-	}
-}
-
-func (u *uploader) debugProviderWait(d time.Duration) {
-	if dbg := u.dbg; dbg != nil {
-		debugRecordDuration(&dbg.providerWaitNanos, &dbg.providerWaitCount, &dbg.providerWaitMaxNanos, d)
 	}
 }
 

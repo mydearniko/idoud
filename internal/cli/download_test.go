@@ -66,16 +66,12 @@ func TestDownloadPlanToFileResumesOnlyMissingRanges(t *testing.T) {
 	}
 
 	phaseOne = false
-	if err := d.downloadPlanToFile(context.Background(), plan, outputPath); err != nil {
-		t.Fatalf("resume download: %v", err)
-	}
+	requireNoError(t, d.downloadPlanToFile(context.Background(), plan, outputPath), "resume download: %v")
+
 	got, err := os.ReadFile(outputPath)
-	if err != nil {
-		t.Fatalf("read output: %v", err)
-	}
-	if string(got) != string(payload) {
-		t.Fatalf("output=%q", got)
-	}
+	requireNoError(t, err, "read output: %v")
+
+	failIf(t, string(got) != string(payload), "output=%q", got)
 	if requests["bytes=0-3"] != 1 {
 		t.Fatalf("completed range was downloaded %d times", requests["bytes=0-3"])
 	}
@@ -148,25 +144,14 @@ func TestRunDownloadUsesPlanRanges(t *testing.T) {
 		"--download-output", outputPath,
 		server.URL + "/" + fileID + "/" + fileName,
 	})
-	if exitCode != 0 {
-		t.Fatalf("Run exitCode=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
-	}
-	if stdout != outputPath+"\n" {
-		t.Fatalf("stdout=%q, want output path", stdout)
-	}
-	if stderr != "" {
-		t.Fatalf("stderr=%q, want empty", stderr)
-	}
+	failIf(t, exitCode != 0, "Run exitCode=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
+	failIf(t, stdout != outputPath+"\n", "stdout=%q, want output path", stdout)
+	failIf(t, stderr != "", "stderr=%q, want empty", stderr)
 	got, err := os.ReadFile(outputPath)
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-	if string(got) != string(payload) {
-		t.Fatalf("downloaded body=%q", got)
-	}
-	if rangeRequests != 2 {
-		t.Fatalf("rangeRequests=%d, want 2", rangeRequests)
-	}
+	requireNoError(t, err, "ReadFile: %v")
+
+	failIf(t, string(got) != string(payload), "downloaded body=%q", got)
+	failIf(t, rangeRequests != 2, "rangeRequests=%d, want 2", rangeRequests)
 
 	plainOutputPath := filepath.Join(t.TempDir(), "plain-out.bin")
 	exitCode, stdout, stderr = captureRunOutput(t, []string{
@@ -177,28 +162,18 @@ func TestRunDownloadUsesPlanRanges(t *testing.T) {
 		"--download-output", plainOutputPath,
 		server.URL + "/" + fileID + "/" + fileName,
 	})
-	if exitCode != 0 {
-		t.Fatalf("plain Run exitCode=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
-	}
-	if stdout != plainOutputPath+"\n" {
-		t.Fatalf("plain stdout=%q, want output path", stdout)
-	}
+	failIf(t, exitCode != 0, "plain Run exitCode=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
+	failIf(t, stdout != plainOutputPath+"\n", "plain stdout=%q, want output path", stdout)
 	for _, want := range []string{
 		"idoud transfer=download event=start",
 		"progress_semantics=disk_written",
 		"event=info label=\"save\"",
 		"event=complete result=success",
 	} {
-		if !strings.Contains(stderr, want) {
-			t.Fatalf("plain download stderr=%q, want %q", stderr, want)
-		}
+		failIf(t, !strings.Contains(stderr, want), "plain download stderr=%q, want %q", stderr, want)
 	}
-	if strings.Contains(stderr, "\r") || strings.Contains(stderr, "\x1b[") {
-		t.Fatalf("plain download stderr contains terminal controls: %q", stderr)
-	}
-	if rangeRequests != 4 {
-		t.Fatalf("rangeRequests=%d after plain download, want 4", rangeRequests)
-	}
+	failIf(t, strings.Contains(stderr, "\r") || strings.Contains(stderr, "\x1b["), "plain download stderr contains terminal controls: %q", stderr)
+	failIf(t, rangeRequests != 4, "rangeRequests=%d after plain download, want 4", rangeRequests)
 }
 
 func TestRunDownloadFallsBackThroughMirrorsInPlanOrder(t *testing.T) {
@@ -276,19 +251,12 @@ func TestRunDownloadFallsBackThroughMirrorsInPlanOrder(t *testing.T) {
 		"--download-output", outputPath,
 		server.URL + "/" + fileID + "/" + fileName,
 	})
-	if exitCode != 0 {
-		t.Fatalf("Run exitCode=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
-	}
+	failIf(t, exitCode != 0, "Run exitCode=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
 	got, err := os.ReadFile(outputPath)
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-	if string(got) != string(payload) {
-		t.Fatalf("downloaded body=%q", got)
-	}
-	if len(hits) != 2 || hits[0] != "mirror-b" || hits[1] != "mirror-a" {
-		t.Fatalf("mirror hits=%v, want [mirror-b mirror-a]", hits)
-	}
+	requireNoError(t, err, "ReadFile: %v")
+
+	failIf(t, string(got) != string(payload), "downloaded body=%q", got)
+	failIf(t, len(hits) != 2 || hits[0] != "mirror-b" || hits[1] != "mirror-a", "mirror hits=%v, want [mirror-b mirror-a]", hits)
 }
 
 func TestRunDownloadRejectsHTTP200ForRangedMirror(t *testing.T) {
@@ -350,18 +318,10 @@ func TestRunDownloadRejectsHTTP200ForRangedMirror(t *testing.T) {
 		"--download-output", outputPath,
 		server.URL + "/" + fileID + "/" + fileName,
 	})
-	if exitCode == 0 {
-		t.Fatalf("Run succeeded stdout=%q stderr=%q, want HTTP 200 ranged mirror rejection", stdout, stderr)
-	}
-	if !strings.Contains(stderr, "mirror returned http status 200") {
-		t.Fatalf("stderr=%q, want HTTP 200 rejection", stderr)
-	}
-	if mirrorRequests != 1 {
-		t.Fatalf("mirrorRequests=%d, want 1", mirrorRequests)
-	}
-	if gotRange != "bytes=0-"+strconv.Itoa(len(payload)-1) {
-		t.Fatalf("Range=%q", gotRange)
-	}
+	failIf(t, exitCode == 0, "Run succeeded stdout=%q stderr=%q, want HTTP 200 ranged mirror rejection", stdout, stderr)
+	failIf(t, !strings.Contains(stderr, "mirror returned http status 200"), "stderr=%q, want HTTP 200 rejection", stderr)
+	failIf(t, mirrorRequests != 1, "mirrorRequests=%d, want 1", mirrorRequests)
+	failIf(t, gotRange != "bytes=0-"+strconv.Itoa(len(payload)-1), "Range=%q", gotRange)
 	if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
 		t.Fatalf("output file err=%v, want removed missing file", err)
 	}
@@ -417,19 +377,12 @@ func TestRunDownloadCreatesEmptyFileWithoutMirrorRequest(t *testing.T) {
 		"--download-output", outputPath,
 		server.URL + "/" + fileID + "/" + fileName,
 	})
-	if exitCode != 0 {
-		t.Fatalf("Run exitCode=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
-	}
-	if stdout != outputPath+"\n" {
-		t.Fatalf("stdout=%q, want output path", stdout)
-	}
-	if mirrorRequests != 0 {
-		t.Fatalf("mirrorRequests=%d, want 0", mirrorRequests)
-	}
+	failIf(t, exitCode != 0, "Run exitCode=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
+	failIf(t, stdout != outputPath+"\n", "stdout=%q, want output path", stdout)
+	failIf(t, mirrorRequests != 0, "mirrorRequests=%d, want 0", mirrorRequests)
 	info, err := os.Stat(outputPath)
-	if err != nil {
-		t.Fatalf("Stat output: %v", err)
-	}
+	requireNoError(t, err, "Stat output: %v")
+
 	if info.Size() != 0 {
 		t.Fatalf("output size=%d, want 0", info.Size())
 	}
@@ -458,15 +411,9 @@ func TestRunDownloadHTTPErrorDoesNotExposePrivateProviderDetails(t *testing.T) {
 		"--download-output", outputPath,
 		server.URL + "/" + fileID + "/" + fileName,
 	})
-	if exitCode == 0 {
-		t.Fatalf("Run succeeded stdout=%q stderr=%q, want download failure", stdout, stderr)
-	}
-	if stdout != "" {
-		t.Fatalf("stdout=%q, want empty", stdout)
-	}
-	if !strings.Contains(stderr, "download failed") || !strings.Contains(stderr, "http status 502") {
-		t.Fatalf("stderr=%q, want generic download failure with status", stderr)
-	}
+	failIf(t, exitCode == 0, "Run succeeded stdout=%q stderr=%q, want download failure", stdout, stderr)
+	failIf(t, stdout != "", "stdout=%q, want empty", stdout)
+	failIf(t, !strings.Contains(stderr, "download failed") || !strings.Contains(stderr, "http status 502"), "stderr=%q, want generic download failure with status", stderr)
 	assertNoPublicPrivateBoundaryTerms(t, "download error", stderr)
 	if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
 		t.Fatalf("output file err=%v, want missing file", err)
@@ -526,13 +473,10 @@ func TestDownloadPlanProbesDeadPrimariesAndUsesDirectStandby(t *testing.T) {
 	}
 	out := filepath.Join(t.TempDir(), "file.bin")
 	d := &downloader{opts: options{parallel: 4, retries: 0, requestTimeout: time.Second}, client: http.DefaultClient}
-	if err := d.downloadPlanToFile(context.Background(), plan, out); err != nil {
-		t.Fatalf("downloadPlanToFile: %v", err)
-	}
+	requireNoError(t, d.downloadPlanToFile(context.Background(), plan, out), "downloadPlanToFile: %v")
+
 	got, err := os.ReadFile(out)
-	if err != nil || string(got) != string(payload) {
-		t.Fatalf("downloaded=%q err=%v", got, err)
-	}
+	failIf(t, err != nil || string(got) != string(payload), "downloaded=%q err=%v", got, err)
 	mu.Lock()
 	defer mu.Unlock()
 	for _, name := range []string{"primary-a", "primary-b", "standby", "master"} {
@@ -540,12 +484,8 @@ func TestDownloadPlanProbesDeadPrimariesAndUsesDirectStandby(t *testing.T) {
 			t.Fatalf("health hits %s=%d, want 1", name, healthHits[name])
 		}
 	}
-	if rangeHits["primary-a"] != 0 || rangeHits["primary-b"] != 0 {
-		t.Fatalf("dead primaries received range requests: %v", rangeHits)
-	}
-	if rangeHits["standby"] != 1 || rangeHits["master"] != 0 {
-		t.Fatalf("range hits=%v, want standby only", rangeHits)
-	}
+	failIf(t, rangeHits["primary-a"] != 0 || rangeHits["primary-b"] != 0, "dead primaries received range requests: %v", rangeHits)
+	failIf(t, rangeHits["standby"] != 1 || rangeHits["master"] != 0, "range hits=%v, want standby only", rangeHits)
 }
 
 func TestDownloadProgressRollsBackPartialRange(t *testing.T) {
@@ -558,9 +498,8 @@ func TestDownloadProgressRollsBackPartialRange(t *testing.T) {
 	defer server.Close()
 
 	output, err := os.Create(filepath.Join(t.TempDir(), "partial.bin"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	defer output.Close()
 	ui := newTransferUI(transferUIConfig{})
 	d := &downloader{
@@ -569,9 +508,7 @@ func TestDownloadProgressRollsBackPartialRange(t *testing.T) {
 		ui:     ui,
 	}
 	err = d.downloadRangeOnce(context.Background(), output, protocol.DownloadMirror{URL: server.URL}, protocol.DownloadRange{Offset: 0, End: 7, Size: 8})
-	if err == nil {
-		t.Fatal("partial range unexpectedly succeeded")
-	}
+	fatalIf(t, err == nil, "partial range unexpectedly succeeded")
 	if got := ui.transferred.Load(); got != 0 {
 		t.Fatalf("partial failed range left progress at %d bytes, want 0", got)
 	}

@@ -15,22 +15,21 @@ import (
 	"time"
 )
 
+func decodeJSONEnvelope(t *testing.T, stdout string) jsonEnvelope {
+	t.Helper()
+	var payload jsonEnvelope
+	requireNoError(t, json.Unmarshal([]byte(stdout), &payload), "stdout is not valid JSON: %v")
+
+	return payload
+}
+
 func TestRunJSONHelp(t *testing.T) {
 	exitCode, stdout, stderr := captureRunOutput(t, []string{"--json", "--help"})
-	if exitCode != 0 {
-		t.Fatalf("Run exitCode=%d, want 0", exitCode)
-	}
-	if stderr != "" {
-		t.Fatalf("stderr=%q, want empty", stderr)
-	}
+	failIf(t, exitCode != 0, "Run exitCode=%d, want 0", exitCode)
+	failIf(t, stderr != "", "stderr=%q, want empty", stderr)
 
-	var payload jsonEnvelope
-	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
-		t.Fatalf("stdout is not valid JSON: %v", err)
-	}
-	if !payload.OK || payload.Type != "help" {
-		t.Fatalf("payload=%+v, want ok help", payload)
-	}
+	payload := decodeJSONEnvelope(t, stdout)
+	failIf(t, !payload.OK || payload.Type != "help", "payload=%+v, want ok help", payload)
 	if payload.Help == nil || !strings.Contains(payload.Help.Text, "idoud — fast, resumable file transfers") {
 		t.Fatalf("help payload=%+v, want usage text", payload.Help)
 	}
@@ -42,12 +41,8 @@ func TestRunStandaloneVersionAliases(t *testing.T) {
 	for _, arg := range []string{"-v", "-V", "--version"} {
 		t.Run(arg, func(t *testing.T) {
 			exitCode, stdout, stderr := captureRunOutput(t, []string{arg})
-			if exitCode != 0 {
-				t.Fatalf("Run exitCode=%d, want 0", exitCode)
-			}
-			if stdout != "idoud dev\n" || stderr != "" {
-				t.Fatalf("stdout=%q stderr=%q, want standalone version", stdout, stderr)
-			}
+			failIf(t, exitCode != 0, "Run exitCode=%d, want 0", exitCode)
+			failIf(t, stdout != "idoud dev\n" || stderr != "", "stdout=%q stderr=%q, want standalone version", stdout, stderr)
 		})
 	}
 }
@@ -61,15 +56,9 @@ func TestRunTextHelpDoesNotExposePrivateBoundaryTerms(t *testing.T) {
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			exitCode, stdout, stderr := captureRunOutput(t, args)
-			if exitCode != 0 {
-				t.Fatalf("Run exitCode=%d, want 0", exitCode)
-			}
-			if stdout == "" || !strings.Contains(stdout, "idoud — fast, resumable file transfers") {
-				t.Fatalf("stdout=%q, want public help text", stdout)
-			}
-			if stderr != "" {
-				t.Fatalf("stderr=%q, want empty", stderr)
-			}
+			failIf(t, exitCode != 0, "Run exitCode=%d, want 0", exitCode)
+			failIf(t, stdout == "" || !strings.Contains(stdout, "idoud — fast, resumable file transfers"), "stdout=%q, want public help text", stdout)
+			failIf(t, stderr != "", "stderr=%q, want empty", stderr)
 			for _, want := range []string{
 				"command | idoud [-n NAME]",
 				"piped stdin is automatic",
@@ -78,15 +67,11 @@ func TestRunTextHelpDoesNotExposePrivateBoundaryTerms(t *testing.T) {
 				"update                 Update, or upload file ./update",
 				"-v, -V, --version",
 			} {
-				if !strings.Contains(stdout, want) {
-					t.Fatalf("text help missing %q in %q", want, stdout)
-				}
+				failIf(t, !strings.Contains(stdout, want), "text help missing %q in %q", want, stdout)
 			}
 			assertNoPublicPrivateBoundaryTerms(t, "text help", stdout)
 			for _, hiddenFlag := range []string{"--chunk-size", "--subdomains", "--ips", "--interface", "--no-ipv6"} {
-				if strings.Contains(stdout, hiddenFlag) {
-					t.Fatalf("text help exposed operator compatibility flag %q in %q", hiddenFlag, stdout)
-				}
+				failIf(t, strings.Contains(stdout, hiddenFlag), "text help exposed operator compatibility flag %q in %q", hiddenFlag, stdout)
 			}
 		})
 	}
@@ -102,12 +87,8 @@ func TestRunHelpAllIncludesEveryAdvancedOption(t *testing.T) {
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			exitCode, stdout, stderr := captureRunOutput(t, args)
-			if exitCode != 0 {
-				t.Fatalf("Run exitCode=%d, want 0", exitCode)
-			}
-			if stderr != "" {
-				t.Fatalf("stderr=%q, want empty", stderr)
-			}
+			failIf(t, exitCode != 0, "Run exitCode=%d, want 0", exitCode)
+			failIf(t, stderr != "", "stderr=%q, want empty", stderr)
 			for _, want := range []string{
 				"ADVANCED",
 				"-c, --chunk-size",
@@ -120,9 +101,7 @@ func TestRunHelpAllIncludesEveryAdvancedOption(t *testing.T) {
 				"-4, --no-ipv6",
 				"-U, --no-subdomains",
 			} {
-				if !strings.Contains(stdout, want) {
-					t.Fatalf("full help missing %q in %q", want, stdout)
-				}
+				failIf(t, !strings.Contains(stdout, want), "full help missing %q in %q", want, stdout)
 			}
 		})
 	}
@@ -130,20 +109,11 @@ func TestRunHelpAllIncludesEveryAdvancedOption(t *testing.T) {
 
 func TestRunJSONHelpAllWithShortAliases(t *testing.T) {
 	exitCode, stdout, stderr := captureRunOutput(t, []string{"-j", "-A"})
-	if exitCode != 0 {
-		t.Fatalf("Run exitCode=%d, want 0", exitCode)
-	}
-	if stderr != "" {
-		t.Fatalf("stderr=%q, want empty", stderr)
-	}
+	failIf(t, exitCode != 0, "Run exitCode=%d, want 0", exitCode)
+	failIf(t, stderr != "", "stderr=%q, want empty", stderr)
 
-	var payload jsonEnvelope
-	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
-		t.Fatalf("stdout is not valid JSON: %v", err)
-	}
-	if !payload.OK || payload.Type != "help" || payload.Help == nil {
-		t.Fatalf("payload=%+v, want JSON help", payload)
-	}
+	payload := decodeJSONEnvelope(t, stdout)
+	failIf(t, !payload.OK || payload.Type != "help" || payload.Help == nil, "payload=%+v, want JSON help", payload)
 	if !strings.Contains(payload.Help.Text, "ADVANCED") || !strings.Contains(payload.Help.Text, "--chunk-size") {
 		t.Fatalf("help payload=%+v, want full help", payload.Help)
 	}
@@ -152,92 +122,49 @@ func TestRunJSONHelpAllWithShortAliases(t *testing.T) {
 func TestRunHelpOperatorEnvironmentRemainsCompatible(t *testing.T) {
 	t.Setenv("IDOUD_SHOW_OPERATOR_FLAGS", "1")
 	exitCode, stdout, stderr := captureRunOutput(t, []string{"--help"})
-	if exitCode != 0 || stderr != "" {
-		t.Fatalf("Run exitCode=%d stderr=%q, want clean help", exitCode, stderr)
-	}
-	if !strings.Contains(stdout, "ADVANCED") || !strings.Contains(stdout, "--chunk-size") {
-		t.Fatalf("stdout=%q, want full compatibility help", stdout)
-	}
+	failIf(t, exitCode != 0 || stderr != "", "Run exitCode=%d stderr=%q, want clean help", exitCode, stderr)
+	failIf(t, !strings.Contains(stdout, "ADVANCED") || !strings.Contains(stdout, "--chunk-size"), "stdout=%q, want full compatibility help", stdout)
 }
 
 func TestRunJSONUsageError(t *testing.T) {
 	exitCode, stdout, stderr := captureRunOutput(t, []string{"--json"})
-	if exitCode != 2 {
-		t.Fatalf("Run exitCode=%d, want 2", exitCode)
-	}
-	if stderr != "" {
-		t.Fatalf("stderr=%q, want empty", stderr)
-	}
+	failIf(t, exitCode != 2, "Run exitCode=%d, want 2", exitCode)
+	failIf(t, stderr != "", "stderr=%q, want empty", stderr)
 
-	var payload jsonEnvelope
-	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
-		t.Fatalf("stdout is not valid JSON: %v", err)
-	}
-	if payload.OK || payload.Type != "error" {
-		t.Fatalf("payload=%+v, want error payload", payload)
-	}
+	payload := decodeJSONEnvelope(t, stdout)
+	failIf(t, payload.OK || payload.Type != "error", "payload=%+v, want error payload", payload)
 	if payload.Error == nil || payload.Error.Code != "usage_error" {
 		t.Fatalf("error payload=%+v, want usage_error", payload.Error)
 	}
-	if payload.Error.Detail == "" {
-		t.Fatal("expected JSON error detail")
-	}
-	if payload.Error.Hint == "" {
-		t.Fatal("expected usage hint in JSON error output")
-	}
+	fatalIf(t, payload.Error.Detail == "", "expected JSON error detail")
+	fatalIf(t, payload.Error.Hint == "", "expected usage hint in JSON error output")
 	legacyKey := `"mes` + `sage"`
-	if strings.Contains(stdout, legacyKey) {
-		t.Fatalf("stdout contains legacy error text field: %q", stdout)
-	}
+	failIf(t, strings.Contains(stdout, legacyKey), "stdout contains legacy error text field: %q", stdout)
+}
+
+func testRunJSONUsageErrorArgs(t *testing.T, args []string) {
+	t.Helper()
+	exitCode, stdout, stderr := captureRunOutput(t, args)
+	failIf(t, exitCode != 2, "Run exitCode=%d, want 2", exitCode)
+	failIf(t, stderr != "", "stderr=%q, want empty", stderr)
+
+	payload := decodeJSONEnvelope(t, stdout)
+	failIf(t, payload.Error == nil || payload.Error.Code != "usage_error", "payload=%+v, want JSON usage error", payload)
 }
 
 func TestRunJSONUsageErrorOnConflictingOutputOrder1(t *testing.T) {
-	exitCode, stdout, stderr := captureRunOutput(t, []string{"--json", "--output", "none", "file.bin"})
-	if exitCode != 2 {
-		t.Fatalf("Run exitCode=%d, want 2", exitCode)
-	}
-	if stderr != "" {
-		t.Fatalf("stderr=%q, want empty", stderr)
-	}
-
-	var payload jsonEnvelope
-	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
-		t.Fatalf("stdout is not valid JSON: %v", err)
-	}
-	if payload.Error == nil || payload.Error.Code != "usage_error" {
-		t.Fatalf("payload=%+v, want JSON usage error", payload)
-	}
+	testRunJSONUsageErrorArgs(t, []string{"--json", "--output", "none", "file.bin"})
 }
 
 func TestRunJSONUsageErrorOnConflictingOutputOrder2(t *testing.T) {
-	exitCode, stdout, stderr := captureRunOutput(t, []string{"--output", "none", "--json", "file.bin"})
-	if exitCode != 2 {
-		t.Fatalf("Run exitCode=%d, want 2", exitCode)
-	}
-	if stderr != "" {
-		t.Fatalf("stderr=%q, want empty", stderr)
-	}
-
-	var payload jsonEnvelope
-	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
-		t.Fatalf("stdout is not valid JSON: %v", err)
-	}
-	if payload.Error == nil || payload.Error.Code != "usage_error" {
-		t.Fatalf("payload=%+v, want JSON usage error", payload)
-	}
+	testRunJSONUsageErrorArgs(t, []string{"--output", "none", "--json", "file.bin"})
 }
 
 func TestRunNameValueJsonLikeTokenDoesNotForceJSONUsageError(t *testing.T) {
 	exitCode, stdout, stderr := captureRunOutput(t, []string{"--name", "--json"})
-	if exitCode != 2 {
-		t.Fatalf("Run exitCode=%d, want 2", exitCode)
-	}
-	if stdout != "" {
-		t.Fatalf("stdout=%q, want empty", stdout)
-	}
-	if !strings.Contains(stderr, "missing input") {
-		t.Fatalf("stderr=%q, want usage error text", stderr)
-	}
+	failIf(t, exitCode != 2, "Run exitCode=%d, want 2", exitCode)
+	failIf(t, stdout != "", "stdout=%q, want empty", stdout)
+	failIf(t, !strings.Contains(stderr, "missing input"), "stderr=%q, want usage error text", stderr)
 }
 
 func TestRunJSONSuccess(t *testing.T) {
@@ -247,20 +174,11 @@ func TestRunJSONSuccess(t *testing.T) {
 	filePath := writeUploadFixture(t, "archive.zip", []byte("hello, automation"))
 
 	exitCode, stdout, stderr := captureRunOutput(t, []string{"--json", "--server", server.URL, filePath})
-	if exitCode != 0 {
-		t.Fatalf("Run exitCode=%d, want 0", exitCode)
-	}
-	if stderr != "" {
-		t.Fatalf("stderr=%q, want empty", stderr)
-	}
+	failIf(t, exitCode != 0, "Run exitCode=%d, want 0", exitCode)
+	failIf(t, stderr != "", "stderr=%q, want empty", stderr)
 
-	var payload jsonEnvelope
-	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
-		t.Fatalf("stdout is not valid JSON: %v", err)
-	}
-	if !payload.OK || payload.Type != "result" || payload.Result == nil {
-		t.Fatalf("payload=%+v, want success result", payload)
-	}
+	payload := decodeJSONEnvelope(t, stdout)
+	failIf(t, !payload.OK || payload.Type != "result" || payload.Result == nil, "payload=%+v, want success result", payload)
 	if payload.Result.URL != server.URL+"/AbC123" {
 		t.Fatalf("result.URL=%q, want %q", payload.Result.URL, server.URL+"/AbC123")
 	}
@@ -281,9 +199,8 @@ func TestRunAutomaticallyUploadsPipedStdin(t *testing.T) {
 
 	oldStdin := os.Stdin
 	stdinReader, stdinWriter, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	os.Stdin = stdinReader
 	t.Cleanup(func() {
 		os.Stdin = oldStdin
@@ -297,16 +214,10 @@ func TestRunAutomaticallyUploadsPipedStdin(t *testing.T) {
 	}()
 
 	exitCode, stdout, stderr := captureRunOutput(t, []string{"--json", "--server", server.URL})
-	if err := <-writeDone; err != nil {
-		t.Fatal(err)
-	}
-	if exitCode != 0 || stderr != "" {
-		t.Fatalf("Run exitCode=%d stderr=%q, want successful automatic stdin upload", exitCode, stderr)
-	}
-	var result jsonEnvelope
-	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, <-writeDone, "")
+
+	failIf(t, exitCode != 0 || stderr != "", "Run exitCode=%d stderr=%q, want successful automatic stdin upload", exitCode, stderr)
+	result := decodeJSONEnvelope(t, stdout)
 	if result.Result == nil || result.Result.Source != "stdin" || result.Result.Name != "stdin.png" || result.Result.KnownSize {
 		t.Fatalf("result=%+v, want unknown-size stdin.png upload", result.Result)
 	}
@@ -319,15 +230,11 @@ func TestRunURLSuccessPrintsOnlyURL(t *testing.T) {
 	filePath := writeUploadFixture(t, "archive.zip", []byte("url-only"))
 
 	exitCode, stdout, stderr := captureRunOutput(t, []string{"--output", "url", "--server", server.URL, filePath})
-	if exitCode != 0 {
-		t.Fatalf("Run exitCode=%d, want 0", exitCode)
-	}
+	failIf(t, exitCode != 0, "Run exitCode=%d, want 0", exitCode)
 	if stdout != server.URL+"/AbC123\n" {
 		t.Fatalf("stdout=%q, want %q", stdout, server.URL+"/AbC123\n")
 	}
-	if stderr != "" {
-		t.Fatalf("stderr=%q, want empty", stderr)
-	}
+	failIf(t, stderr != "", "stderr=%q, want empty", stderr)
 }
 
 func TestRunPlainProgressPreservesURLStdout(t *testing.T) {
@@ -338,25 +245,17 @@ func TestRunPlainProgressPreservesURLStdout(t *testing.T) {
 	exitCode, stdout, stderr := captureRunOutput(t, []string{
 		"--non-interactive", "--server", server.URL, filePath,
 	})
-	if exitCode != 0 {
-		t.Fatalf("Run exitCode=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
-	}
-	if stdout != server.URL+"/AbC123\n" {
-		t.Fatalf("stdout=%q, want only URL", stdout)
-	}
+	failIf(t, exitCode != 0, "Run exitCode=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
+	failIf(t, stdout != server.URL+"/AbC123\n", "stdout=%q, want only URL", stdout)
 	for _, want := range []string{
 		"idoud transfer=upload event=start",
 		"progress_semantics=provider_confirmed",
 		"event=info label=\"plan\"",
 		"event=complete result=success",
 	} {
-		if !strings.Contains(stderr, want) {
-			t.Fatalf("plain stderr=%q, want %q", stderr, want)
-		}
+		failIf(t, !strings.Contains(stderr, want), "plain stderr=%q, want %q", stderr, want)
 	}
-	if strings.Contains(stderr, "\r") || strings.Contains(stderr, "\x1b[") {
-		t.Fatalf("plain stderr contains terminal controls: %q", stderr)
-	}
+	failIf(t, strings.Contains(stderr, "\r") || strings.Contains(stderr, "\x1b["), "plain stderr contains terminal controls: %q", stderr)
 }
 
 func TestRunLineProgressPreservesURLStdout(t *testing.T) {
@@ -367,20 +266,12 @@ func TestRunLineProgressPreservesURLStdout(t *testing.T) {
 	exitCode, stdout, stderr := captureRunOutput(t, []string{
 		"--progress=lines", "--server", server.URL, filePath,
 	})
-	if exitCode != 0 {
-		t.Fatalf("Run exitCode=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
-	}
-	if stdout != server.URL+"/AbC123\n" {
-		t.Fatalf("stdout=%q, want only URL", stdout)
-	}
+	failIf(t, exitCode != 0, "Run exitCode=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
+	failIf(t, stdout != server.URL+"/AbC123\n", "stdout=%q, want only URL", stdout)
 	for _, want := range []string{"idoud · upload · archive.zip", "1 route · up to 1 parallel", "complete"} {
-		if !strings.Contains(stderr, want) {
-			t.Fatalf("line stderr=%q, want %q", stderr, want)
-		}
+		failIf(t, !strings.Contains(stderr, want), "line stderr=%q, want %q", stderr, want)
 	}
-	if strings.Contains(stderr, "\r") || strings.Contains(stderr, "event=progress") || strings.Contains(stderr, "\x1b[") {
-		t.Fatalf("line stderr contains dynamic, diagnostic, or ANSI output: %q", stderr)
-	}
+	failIf(t, strings.Contains(stderr, "\r") || strings.Contains(stderr, "event=progress") || strings.Contains(stderr, "\x1b["), "line stderr contains dynamic, diagnostic, or ANSI output: %q", stderr)
 	for _, line := range strings.Split(strings.TrimSpace(stderr), "\n") {
 		firstField := strings.Fields(line)[0]
 		if _, err := time.Parse(time.RFC3339Nano, firstField); err != nil {
@@ -397,18 +288,10 @@ func TestRunLineProgressShowsLiveSentBytesBeforeStorageConfirmation(t *testing.T
 	exitCode, stdout, stderr := captureRunOutput(t, []string{
 		"-g", "lines", "--parallel", "1", "--server", server.URL, filePath,
 	})
-	if exitCode != 0 {
-		t.Fatalf("Run exitCode=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
-	}
-	if stdout != server.URL+"/AbC123\n" {
-		t.Fatalf("stdout=%q, want only URL", stdout)
-	}
-	if !strings.Contains(stderr, "sent ") || !strings.Contains(stderr, "stored ") {
-		t.Fatalf("line progress did not separate live sent and stored bytes: %q", stderr)
-	}
-	if strings.Contains(stderr, "body_sent_bytes=") || strings.Contains(stderr, "\r") {
-		t.Fatalf("line progress fell back to diagnostic or dynamic output: %q", stderr)
-	}
+	failIf(t, exitCode != 0, "Run exitCode=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
+	failIf(t, stdout != server.URL+"/AbC123\n", "stdout=%q, want only URL", stdout)
+	failIf(t, !strings.Contains(stderr, "sent ") || !strings.Contains(stderr, "stored "), "line progress did not separate live sent and stored bytes: %q", stderr)
+	failIf(t, strings.Contains(stderr, "body_sent_bytes=") || strings.Contains(stderr, "\r"), "line progress fell back to diagnostic or dynamic output: %q", stderr)
 }
 
 func TestRunOutputNoneSuccess(t *testing.T) {
@@ -418,33 +301,18 @@ func TestRunOutputNoneSuccess(t *testing.T) {
 	filePath := writeUploadFixture(t, "archive.zip", []byte("quiet"))
 
 	exitCode, stdout, stderr := captureRunOutput(t, []string{"--output", "none", "--server", server.URL, filePath})
-	if exitCode != 0 {
-		t.Fatalf("Run exitCode=%d, want 0", exitCode)
-	}
-	if stdout != "" {
-		t.Fatalf("stdout=%q, want empty", stdout)
-	}
-	if stderr != "" {
-		t.Fatalf("stderr=%q, want empty", stderr)
-	}
+	failIf(t, exitCode != 0, "Run exitCode=%d, want 0", exitCode)
+	failIf(t, stdout != "", "stdout=%q, want empty", stdout)
+	failIf(t, stderr != "", "stderr=%q, want empty", stderr)
 }
 
 func TestRunJSONInputError(t *testing.T) {
 	exitCode, stdout, stderr := captureRunOutput(t, []string{"--json", "/definitely/missing/file.bin"})
-	if exitCode != 1 {
-		t.Fatalf("Run exitCode=%d, want 1", exitCode)
-	}
-	if stderr != "" {
-		t.Fatalf("stderr=%q, want empty", stderr)
-	}
+	failIf(t, exitCode != 1, "Run exitCode=%d, want 1", exitCode)
+	failIf(t, stderr != "", "stderr=%q, want empty", stderr)
 
-	var payload jsonEnvelope
-	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
-		t.Fatalf("stdout is not valid JSON: %v", err)
-	}
-	if payload.OK || payload.Type != "error" || payload.Error == nil {
-		t.Fatalf("payload=%+v, want input error payload", payload)
-	}
+	payload := decodeJSONEnvelope(t, stdout)
+	failIf(t, payload.OK || payload.Type != "error" || payload.Error == nil, "payload=%+v, want input error payload", payload)
 	if payload.Error.Code != "input_error" {
 		t.Fatalf("error.Code=%q, want input_error", payload.Error.Code)
 	}
@@ -458,16 +326,10 @@ func TestRunDirectoryInputSuggestsArchiveOnOneLine(t *testing.T) {
 	}
 
 	exitCode, stdout, stderr := captureRunOutput(t, []string{directory})
-	if exitCode != 1 {
-		t.Fatalf("Run exitCode=%d, want 1", exitCode)
-	}
-	if stdout != "" {
-		t.Fatalf("stdout=%q, want empty", stdout)
-	}
+	failIf(t, exitCode != 1, "Run exitCode=%d, want 1", exitCode)
+	failIf(t, stdout != "", "stdout=%q, want empty", stdout)
 	want := fmt.Sprintf("error: %s is a directory; use `idoud -z %s` to upload it as mihomo.tar.lz4\n", directory, directory)
-	if stderr != want {
-		t.Fatalf("stderr=%q, want %q", stderr, want)
-	}
+	failIf(t, stderr != want, "stderr=%q, want %q", stderr, want)
 }
 
 func TestRunUploadPrepareHTTPErrorDoesNotExposePrivateProviderDetails(t *testing.T) {
@@ -484,15 +346,9 @@ func TestRunUploadPrepareHTTPErrorDoesNotExposePrivateProviderDetails(t *testing
 
 	filePath := writeUploadFixture(t, "archive.zip", []byte("blocked"))
 	exitCode, stdout, stderr := captureRunOutput(t, []string{"--server", server.URL, filePath})
-	if exitCode == 0 {
-		t.Fatalf("Run succeeded stdout=%q stderr=%q, want upload failure", stdout, stderr)
-	}
-	if stdout != "" {
-		t.Fatalf("stdout=%q, want empty", stdout)
-	}
-	if !strings.Contains(stderr, "upload failed") || !strings.Contains(stderr, "http status 403") {
-		t.Fatalf("stderr=%q, want generic upload failure with status", stderr)
-	}
+	failIf(t, exitCode == 0, "Run succeeded stdout=%q stderr=%q, want upload failure", stdout, stderr)
+	failIf(t, stdout != "", "stdout=%q, want empty", stdout)
+	failIf(t, !strings.Contains(stderr, "upload failed") || !strings.Contains(stderr, "http status 403"), "stderr=%q, want generic upload failure with status", stderr)
 	assertNoPublicPrivateBoundaryTerms(t, "upload prepare error", stderr)
 }
 
@@ -503,20 +359,11 @@ func TestRunJSONUploadFailure(t *testing.T) {
 	filePath := writeUploadFixture(t, "archive.zip", []byte("broken"))
 
 	exitCode, stdout, stderr := captureRunOutput(t, []string{"--json", "--resume-timeout", "1ms", "--server", server.URL, filePath})
-	if exitCode != 1 {
-		t.Fatalf("Run exitCode=%d, want 1", exitCode)
-	}
-	if stderr != "" {
-		t.Fatalf("stderr=%q, want empty", stderr)
-	}
+	failIf(t, exitCode != 1, "Run exitCode=%d, want 1", exitCode)
+	failIf(t, stderr != "", "stderr=%q, want empty", stderr)
 
-	var payload jsonEnvelope
-	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
-		t.Fatalf("stdout is not valid JSON: %v", err)
-	}
-	if payload.OK || payload.Type != "error" || payload.Error == nil {
-		t.Fatalf("payload=%+v, want upload error payload", payload)
-	}
+	payload := decodeJSONEnvelope(t, stdout)
+	failIf(t, payload.OK || payload.Type != "error" || payload.Error == nil, "payload=%+v, want upload error payload", payload)
 	if payload.Error.Code != "upload_failed" {
 		t.Fatalf("error.Code=%q, want upload_failed", payload.Error.Code)
 	}
@@ -529,20 +376,11 @@ func TestRunJSONWithVerboseKeepsStdoutPure(t *testing.T) {
 	filePath := writeUploadFixture(t, "archive.zip", []byte("verbose"))
 
 	exitCode, stdout, stderr := captureRunOutput(t, []string{"--json", "--verbose", "--server", server.URL, filePath})
-	if exitCode != 0 {
-		t.Fatalf("Run exitCode=%d, want 0", exitCode)
-	}
-	if stderr == "" {
-		t.Fatal("expected verbose diagnostics on stderr")
-	}
+	failIf(t, exitCode != 0, "Run exitCode=%d, want 0", exitCode)
+	fatalIf(t, stderr == "", "expected verbose diagnostics on stderr")
 
-	var payload jsonEnvelope
-	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
-		t.Fatalf("stdout is not valid JSON: %v", err)
-	}
-	if !payload.OK || payload.Type != "result" {
-		t.Fatalf("payload=%+v, want success result", payload)
-	}
+	payload := decodeJSONEnvelope(t, stdout)
+	failIf(t, !payload.OK || payload.Type != "result", "payload=%+v, want success result", payload)
 }
 
 type forbiddenPublicBoundaryTerm struct {
@@ -581,13 +419,10 @@ func captureRunOutput(t *testing.T, args []string) (int, string, string) {
 	oldStderr := os.Stderr
 
 	stdoutR, stdoutW, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("stdout pipe: %v", err)
-	}
+	requireNoError(t, err, "stdout pipe: %v")
+
 	stderrR, stderrW, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("stderr pipe: %v", err)
-	}
+	requireNoError(t, err, "stderr pipe: %v")
 
 	os.Stdout = stdoutW
 	os.Stderr = stderrW

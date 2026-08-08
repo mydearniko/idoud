@@ -529,7 +529,6 @@ func (d *downloader) prepareDownloadRoutes(ctx context.Context, plan protocol.Do
 	}
 	var wg sync.WaitGroup
 	for origin := range seen {
-		origin := origin
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

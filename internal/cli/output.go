@@ -127,10 +127,8 @@ func detectRequestedOutputMode(args []string) outputMode {
 func (o primaryOutput) printHelp(text string) {
 	if o.mode == outputModeJSON {
 		o.writeJSON(jsonEnvelope{
-			SchemaVersion: outputJSONSchemaVersion,
-			OK:            true,
-			Type:          "help",
-			ExitCode:      0,
+			OK:   true,
+			Type: "help",
 			Help: &jsonHelp{
 				Text: text,
 			},
@@ -146,11 +144,9 @@ func (o primaryOutput) printSuccess(src *sourceFile, finalURL string) {
 		return
 	case outputModeJSON:
 		o.writeJSON(jsonEnvelope{
-			SchemaVersion: outputJSONSchemaVersion,
-			OK:            true,
-			Type:          "result",
-			ExitCode:      0,
-			Result:        jsonResultFromSource(src, finalURL),
+			OK:     true,
+			Type:   "result",
+			Result: jsonResultFromSource(src, finalURL),
 		})
 	default:
 		fmt.Fprintln(os.Stdout, finalURL)
@@ -163,10 +159,8 @@ func (o primaryOutput) printDownloadSuccess(path string) {
 		return
 	case outputModeJSON:
 		o.writeJSON(jsonEnvelope{
-			SchemaVersion: outputJSONSchemaVersion,
-			OK:            true,
-			Type:          "result",
-			ExitCode:      0,
+			OK:   true,
+			Type: "result",
 			Result: &jsonResult{
 				Path:      path,
 				Source:    "download",
@@ -180,18 +174,7 @@ func (o primaryOutput) printDownloadSuccess(path string) {
 
 func (o primaryOutput) printUsageError(err error) {
 	hint := usageHint(err)
-	if o.mode == outputModeJSON {
-		o.writeJSON(jsonEnvelope{
-			SchemaVersion: outputJSONSchemaVersion,
-			OK:            false,
-			Type:          "error",
-			ExitCode:      2,
-			Error: &jsonError{
-				Code:   "usage_error",
-				Detail: err.Error(),
-				Hint:   hint,
-			},
-		})
+	if o.printJSONError(2, "usage_error", err.Error(), hint) {
 		return
 	}
 	stderrWritef("error: %v", err)
@@ -201,51 +184,21 @@ func (o primaryOutput) printUsageError(err error) {
 }
 
 func (o primaryOutput) printInputError(err error) {
-	if o.mode == outputModeJSON {
-		o.writeJSON(jsonEnvelope{
-			SchemaVersion: outputJSONSchemaVersion,
-			OK:            false,
-			Type:          "error",
-			ExitCode:      1,
-			Error: &jsonError{
-				Code:   "input_error",
-				Detail: err.Error(),
-			},
-		})
+	if o.printJSONError(1, "input_error", err.Error(), "") {
 		return
 	}
 	stderrLogf("error: %v", err)
 }
 
 func (o primaryOutput) printDownloadError(err error) {
-	if o.mode == outputModeJSON {
-		o.writeJSON(jsonEnvelope{
-			SchemaVersion: outputJSONSchemaVersion,
-			OK:            false,
-			Type:          "error",
-			ExitCode:      1,
-			Error: &jsonError{
-				Code:   "download_failed",
-				Detail: err.Error(),
-			},
-		})
+	if o.printJSONError(1, "download_failed", err.Error(), "") {
 		return
 	}
 	stderrLogf("download failed: %v", err)
 }
 
 func (o primaryOutput) printUploadError(err error) {
-	if o.mode == outputModeJSON {
-		o.writeJSON(jsonEnvelope{
-			SchemaVersion: outputJSONSchemaVersion,
-			OK:            false,
-			Type:          "error",
-			ExitCode:      1,
-			Error: &jsonError{
-				Code:   "upload_failed",
-				Detail: err.Error(),
-			},
-		})
+	if o.printJSONError(1, "upload_failed", err.Error(), "") {
 		return
 	}
 	stderrLogf("upload failed: %v", err)
@@ -256,23 +209,26 @@ func (o primaryOutput) printTransferCanceled(operation string) {
 	if operation == "" {
 		operation = "transfer"
 	}
-	if o.mode == outputModeJSON {
-		o.writeJSON(jsonEnvelope{
-			SchemaVersion: outputJSONSchemaVersion,
-			OK:            false,
-			Type:          "error",
-			ExitCode:      interruptExitCode,
-			Error: &jsonError{
-				Code:   "transfer_canceled",
-				Detail: operation + " canceled by interrupt",
-			},
-		})
+	if o.printJSONError(interruptExitCode, "transfer_canceled", operation+" canceled by interrupt", "") {
 		return
 	}
 	stderrLogf("%s canceled", operation)
 }
 
+func (o primaryOutput) printJSONError(exitCode int, code, detail, hint string) bool {
+	if o.mode != outputModeJSON {
+		return false
+	}
+	o.writeJSON(jsonEnvelope{
+		Type:     "error",
+		ExitCode: exitCode,
+		Error:    &jsonError{Code: code, Detail: detail, Hint: hint},
+	})
+	return true
+}
+
 func (o primaryOutput) writeJSON(payload jsonEnvelope) {
+	payload.SchemaVersion = outputJSONSchemaVersion
 	if err := encodeJSON(os.Stdout, payload); err != nil {
 		stderrWritef("error: failed to encode JSON output: %v", err)
 	}

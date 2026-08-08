@@ -184,12 +184,16 @@ func (u *uploader) waitUploadCooldown(ctx context.Context, target uploadRouteTar
 	started := time.Now()
 	if u != nil && u.cooldowns != nil {
 		if err := u.cooldowns.wait(ctx, target); err != nil {
-			u.debugCooldownWait(time.Since(started))
+			if d, dbg := time.Since(started), u.dbg; dbg != nil {
+				debugRecordDuration(&dbg.cooldownWaitNanos, &dbg.cooldownWaitCount, &dbg.cooldownWaitMaxNanos, d)
+			}
 			return err
 		}
 	}
 	if u != nil {
-		u.debugCooldownWait(time.Since(started))
+		if d, dbg := time.Since(started), u.dbg; dbg != nil {
+			debugRecordDuration(&dbg.cooldownWaitNanos, &dbg.cooldownWaitCount, &dbg.cooldownWaitMaxNanos, d)
+		}
 	}
 	return nil
 }

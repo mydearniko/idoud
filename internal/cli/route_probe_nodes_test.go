@@ -8,6 +8,22 @@ import (
 	"time"
 )
 
+func newJoiningRouteProbeUploader() (*uploader, chan struct{}, chan struct{}) {
+	releaseJoining := make(chan struct{})
+	joiningDone := make(chan struct{})
+	u := &uploader{
+		opts: options{parallel: 2, chunkSize: 10},
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Host == "joining.example" {
+				<-releaseJoining
+				close(joiningDone)
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+		})},
+	}
+	return u, releaseJoining, joiningDone
+}
+
 func TestRouteProbeRequiresHealthyAliasPerScheduledPhysicalNode(t *testing.T) {
 	target := func(raw, nodeID string) uploadRouteTarget {
 		parsed := mustParseURL(t, raw)
@@ -84,18 +100,7 @@ func TestRouteProbeBrieflyJoinsAliasesOnlyWhenReadyCapacityIsTooSmall(t *testing
 	}
 
 	t.Run("large enough transfer waits for immediately joining capacity", func(t *testing.T) {
-		releaseJoining := make(chan struct{})
-		joiningDone := make(chan struct{})
-		u := &uploader{
-			opts: options{parallel: 2, chunkSize: 10},
-			client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-				if req.URL.Host == "joining.example" {
-					<-releaseJoining
-					close(joiningDone)
-				}
-				return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
-			})},
-		}
+		u, releaseJoining, joiningDone := newJoiningRouteProbeUploader()
 		src := &sourceFile{
 			knownSize:          true,
 			size:               20,
@@ -120,18 +125,7 @@ func TestRouteProbeBrieflyJoinsAliasesOnlyWhenReadyCapacityIsTooSmall(t *testing
 	})
 
 	t.Run("small transfer starts on first sufficient route", func(t *testing.T) {
-		releaseJoining := make(chan struct{})
-		joiningDone := make(chan struct{})
-		u := &uploader{
-			opts: options{parallel: 2, chunkSize: 10},
-			client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-				if req.URL.Host == "joining.example" {
-					<-releaseJoining
-					close(joiningDone)
-				}
-				return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
-			})},
-		}
+		u, releaseJoining, joiningDone := newJoiningRouteProbeUploader()
 		src := &sourceFile{
 			knownSize:          true,
 			size:               10,
@@ -160,18 +154,7 @@ func TestRouteProbeBrieflyJoinsAliasesOnlyWhenReadyCapacityIsTooSmall(t *testing
 	})
 
 	t.Run("missing extra capacity never extends beyond join grace", func(t *testing.T) {
-		releaseJoining := make(chan struct{})
-		joiningDone := make(chan struct{})
-		u := &uploader{
-			opts: options{parallel: 2, chunkSize: 10},
-			client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-				if req.URL.Host == "joining.example" {
-					<-releaseJoining
-					close(joiningDone)
-				}
-				return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
-			})},
-		}
+		u, releaseJoining, joiningDone := newJoiningRouteProbeUploader()
 		src := &sourceFile{
 			knownSize:          true,
 			size:               20,

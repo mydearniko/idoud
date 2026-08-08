@@ -37,16 +37,13 @@ func TestArchiveUploadInterruptExitsPromptly(t *testing.T) {
 
 	sourceDir := t.TempDir()
 	payload, err := os.Create(filepath.Join(sourceDir, "payload.bin"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	if err := payload.Truncate(32 * 1024 * 1024); err != nil {
 		_ = payload.Close()
 		t.Fatal(err)
 	}
-	if err := payload.Close(); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, payload.Close(), "")
 
 	requestStarted := make(chan struct{})
 	releaseRequest := make(chan struct{})
@@ -88,9 +85,7 @@ func TestArchiveUploadInterruptExitsPromptly(t *testing.T) {
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, cmd.Start(), "")
 
 	select {
 	case <-requestStarted:

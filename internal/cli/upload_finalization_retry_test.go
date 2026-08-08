@@ -26,12 +26,9 @@ func TestRequestFinalizeUploadObservesHTTPDateSharedCooldown(t *testing.T) {
 	})
 
 	result, err := u.requestFinalizeUpload(context.Background(), "AbC123", 30*time.Millisecond)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.ready || result.failed || !result.retryAfterSet || result.retryAfter < time.Second {
-		t.Fatalf("finalize result=%+v, want retryable HTTP-date delay", result)
-	}
+	requireNoError(t, err, "")
+
+	failIf(t, result.ready || result.failed || !result.retryAfterSet || result.retryAfter < time.Second, "finalize result=%+v, want retryable HTTP-date delay", result)
 	target := uploadRouteTarget{rawURL: "https://idoud.cc/v1/uploads/AbC123/finalize"}
 	if remaining := u.cooldowns.remaining(target, time.Now()); remaining < time.Second {
 		t.Fatalf("shared finalize cooldown=%s, want HTTP-date deadline", remaining)
@@ -77,18 +74,14 @@ func TestWaitForReadyAttemptHonorsRetryAfterBeforeNextPoll(t *testing.T) {
 	u.opts.finalizePollInterval = time.Millisecond
 
 	ready, err := u.waitForReadyAttempt(context.Background(), "https://idoud.cc/AbC123/file.bin", time.Second)
-	if err != nil || !ready {
-		t.Fatalf("waitForReadyAttempt ready=%t err=%v", ready, err)
-	}
+	failIf(t, err != nil || !ready, "waitForReadyAttempt ready=%t err=%v", ready, err)
 	if got := calls.Load(); got != 2 {
 		t.Fatalf("finalize transport calls=%d, want exactly one delayed retry", got)
 	}
 	mu.Lock()
 	gap := secondAt.Sub(firstAt)
 	mu.Unlock()
-	if gap < 50*time.Millisecond {
-		t.Fatalf("finalize retry gap=%s, want Retry-After delay before the next poll", gap)
-	}
+	failIf(t, gap < 50*time.Millisecond, "finalize retry gap=%s, want Retry-After delay before the next poll", gap)
 }
 
 func TestRequestFinalizeUploadHeaderless429UsesConservativeCooldown(t *testing.T) {
@@ -98,9 +91,8 @@ func TestRequestFinalizeUploadHeaderless429UsesConservativeCooldown(t *testing.T
 	u.opts.finalizePollInterval = time.Millisecond
 
 	result, err := u.requestFinalizeUpload(context.Background(), "AbC123", 30*time.Millisecond)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	if !result.retryAfterSet || result.retryAfter < time.Second {
 		t.Fatalf("headerless 429 retry delay=%s set=%t, want at least 1s", result.retryAfter, result.retryAfterSet)
 	}

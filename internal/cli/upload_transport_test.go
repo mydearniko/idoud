@@ -23,9 +23,8 @@ func TestBuildHTTP2TransportNegotiatesHTTP2(t *testing.T) {
 
 	client := &http.Client{Transport: buildHTTP2Transport(true, false, 32, "", bindConfig{})}
 	resp, err := client.Get(srv.URL)
-	if err != nil {
-		t.Fatalf("HTTP/2 request failed: %v", err)
-	}
+	requireNoError(t, err, "HTTP/2 request failed: %v")
+
 	_ = resp.Body.Close()
 	if got := <-proto; got != 2 {
 		t.Fatalf("protocol major=%d, want 2", got)
@@ -50,9 +49,7 @@ func TestBuildChunkClientsCreatesHTTP2Pool(t *testing.T) {
 func TestUploadBodyGateSeparatesBodyWritesFromRequestLifetime(t *testing.T) {
 	u := &uploader{uploadBodies: make(chan struct{}, 1)}
 	firstLease, err := u.acquireUploadBody(context.Background(), 0)
-	if err != nil {
-		t.Fatalf("acquire first body: %v", err)
-	}
+	requireNoError(t, err, "acquire first body: %v")
 
 	secondAcquired := make(chan *uploadBodyLease, 1)
 	go func() {
@@ -86,13 +83,10 @@ func TestUploadBodyGateReusesHTTP2ConnectionAfterBodyWrite(t *testing.T) {
 		chunkBodyLanes: lanes,
 	}
 	firstLease, err := u.acquireUploadBody(context.Background(), 0)
-	if err != nil {
-		t.Fatalf("acquire first connection body: %v", err)
-	}
+	requireNoError(t, err, "acquire first connection body: %v")
+
 	secondLease, err := u.acquireUploadBody(context.Background(), 1)
-	if err != nil {
-		t.Fatalf("acquire second connection body: %v", err)
-	}
+	requireNoError(t, err, "acquire second connection body: %v")
 
 	thirdAcquired := make(chan *uploadBodyLease, 1)
 	go func() {
@@ -140,9 +134,8 @@ func TestEffectiveUploadBodyConcurrencyAutoCapsOnlyLargeWindows(t *testing.T) {
 
 func TestUploadNonFinalChunksPacesStartsAfterBurst(t *testing.T) {
 	target, err := url.Parse("https://node.example/file.bin")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	var mu sync.Mutex
 	starts := make([]time.Time, 0, 4)
 	firstStarted := make(chan struct{})
@@ -191,27 +184,21 @@ func TestUploadNonFinalChunksPacesStartsAfterBurst(t *testing.T) {
 	mu.Lock()
 	startedBeforeConfirmation := len(starts)
 	mu.Unlock()
-	if startedBeforeConfirmation != 1 {
-		t.Fatalf("requests before first confirmation=%d, want 1", startedBeforeConfirmation)
-	}
+	failIf(t, startedBeforeConfirmation != 1, "requests before first confirmation=%d, want 1", startedBeforeConfirmation)
 	close(releaseFirst)
-	if err := <-done; err != nil {
-		t.Fatalf("uploadNonFinalChunks: %v", err)
-	}
+	requireNoError(t, <-done, "uploadNonFinalChunks: %v")
+
 	elapsed := time.Since(started)
 	if len(starts) != 4 {
 		t.Fatalf("request starts=%d, want 4", len(starts))
 	}
-	if elapsed < 250*time.Millisecond {
-		t.Fatalf("elapsed=%s, want paced duration of at least 250ms", elapsed)
-	}
+	failIf(t, elapsed < 250*time.Millisecond, "elapsed=%s, want paced duration of at least 250ms", elapsed)
 }
 
 func TestUploadKnownFileStartsFinalChunkInsideInitialConcurrencyWindow(t *testing.T) {
 	target, err := url.Parse("https://node.example/file.bin")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	started := make(chan bool, 4)
 	release := make(chan struct{})
 	u := &uploader{
@@ -244,9 +231,8 @@ func TestUploadKnownFileStartsFinalChunkInsideInitialConcurrencyWindow(t *testin
 		t.Fatalf("initial requests final flags=%t/%t, want one final and one non-final", first, second)
 	}
 	close(release)
-	if err := <-done; err != nil {
-		t.Fatalf("uploadKnownFileChunks: %v", err)
-	}
+	requireNoError(t, <-done, "uploadKnownFileChunks: %v")
+
 	finalCount := 0
 	if first {
 		finalCount++
@@ -259,7 +245,5 @@ func TestUploadKnownFileStartsFinalChunkInsideInitialConcurrencyWindow(t *testin
 			finalCount++
 		}
 	}
-	if finalCount != 1 {
-		t.Fatalf("final request count=%d, want 1", finalCount)
-	}
+	failIf(t, finalCount != 1, "final request count=%d, want 1", finalCount)
 }

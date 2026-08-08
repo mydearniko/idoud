@@ -38,13 +38,9 @@ func TestKnownProgressUsesConfirmedBytesAndETA(t *testing.T) {
 	}
 	line := ui.formatProgress(snapshot)
 	for _, want := range []string{"50.0%", "512.00MiB/1.00GiB", "100.00MiB/s", "eta ~5s", "50/100 parts", "12 active"} {
-		if !strings.Contains(line, want) {
-			t.Fatalf("progress line %q does not contain %q", line, want)
-		}
+		failIf(t, !strings.Contains(line, want), "progress line %q does not contain %q", line, want)
 	}
-	if strings.Contains(line, "100.0%") {
-		t.Fatalf("progress line falsely reached 100%%: %q", line)
-	}
+	failIf(t, strings.Contains(line, "100.0%"), "progress line falsely reached 100%%: %q", line)
 }
 
 func TestKnownProgressShowsSmoothSentAndStoredTruth(t *testing.T) {
@@ -72,13 +68,9 @@ func TestKnownProgressShowsSmoothSentAndStoredTruth(t *testing.T) {
 		"1/10 parts",
 		"9 active",
 	} {
-		if !strings.Contains(line, want) {
-			t.Fatalf("smooth progress line %q does not contain %q", line, want)
-		}
+		failIf(t, !strings.Contains(line, want), "smooth progress line %q does not contain %q", line, want)
 	}
-	if strings.Contains(line, "sent 10.0%") {
-		t.Fatalf("smooth progress used stored bytes for the sent bar: %q", line)
-	}
+	failIf(t, strings.Contains(line, "sent 10.0%"), "smooth progress used stored bytes for the sent bar: %q", line)
 }
 
 func TestUnknownStreamProgressNeverInventsPercentOrETA(t *testing.T) {
@@ -95,13 +87,9 @@ func TestUnknownStreamProgressNeverInventsPercentOrETA(t *testing.T) {
 	}
 	line := ui.formatProgress(snapshot)
 	for _, want := range []string{"streaming", "stored 80.00MiB", "read 120.00MiB", "40.00MiB/s"} {
-		if !strings.Contains(line, want) {
-			t.Fatalf("stream line %q does not contain %q", line, want)
-		}
+		failIf(t, !strings.Contains(line, want), "stream line %q does not contain %q", line, want)
 	}
-	if strings.Contains(line, "%") || strings.Contains(strings.ToLower(line), "eta") {
-		t.Fatalf("unknown stream line invented percent or ETA: %q", line)
-	}
+	failIf(t, strings.Contains(line, "%") || strings.Contains(strings.ToLower(line), "eta"), "unknown stream line invented percent or ETA: %q", line)
 }
 
 func TestClosedStreamShowsProviderConfirmationInsteadOfDecayingInputRate(t *testing.T) {
@@ -117,9 +105,7 @@ func TestClosedStreamShowsProviderConfirmationInsteadOfDecayingInputRate(t *test
 		inFlight:     1,
 		inputClosed:  true,
 	})
-	if !strings.Contains(line, "awaiting confirmation") || strings.Contains(line, "input 100B/s") {
-		t.Fatalf("closed stream progress=%q", line)
-	}
+	failIf(t, !strings.Contains(line, "awaiting confirmation") || strings.Contains(line, "input 100B/s"), "closed stream progress=%q", line)
 }
 
 func TestClosedStreamShowsStorageWaitAfterEveryBodyByteWasSent(t *testing.T) {
@@ -138,9 +124,7 @@ func TestClosedStreamShowsStorageWaitAfterEveryBodyByteWasSent(t *testing.T) {
 		inFlight:      1,
 		inputClosed:   true,
 	})
-	if !strings.Contains(line, "awaiting storage") || strings.Contains(line, "sending 18.35KiB/s") {
-		t.Fatalf("closed stream progress=%q, want durable storage wait", line)
-	}
+	failIf(t, !strings.Contains(line, "awaiting storage") || strings.Contains(line, "sending 18.35KiB/s"), "closed stream progress=%q, want durable storage wait", line)
 }
 
 func TestClosedStreamStillShowsRequestBodyWritingBeforeConfirmation(t *testing.T) {
@@ -155,9 +139,7 @@ func TestClosedStreamStillShowsRequestBodyWritingBeforeConfirmation(t *testing.T
 		inFlight:      1,
 		inputClosed:   true,
 	})
-	if !strings.Contains(line, "sending request bodies") || strings.Contains(line, "awaiting confirmation") {
-		t.Fatalf("closed stream progress=%q, want active body-write state", line)
-	}
+	failIf(t, !strings.Contains(line, "sending request bodies") || strings.Contains(line, "awaiting confirmation"), "closed stream progress=%q, want active body-write state", line)
 	if got := plainProgressState(transferProgressSnapshot{
 		phase:         transferPhaseTransferring,
 		bodyReadBytes: 512,
@@ -179,9 +161,7 @@ func TestArchiveStreamLabelsCompressedOutput(t *testing.T) {
 		readBytes:   12 * 1024 * 1024,
 	}
 	line := ui.formatProgress(snapshot)
-	if !strings.Contains(line, "packed 12.00MiB") {
-		t.Fatalf("archive progress=%q, want packed byte label", line)
-	}
+	failIf(t, !strings.Contains(line, "packed 12.00MiB"), "archive progress=%q, want packed byte label", line)
 }
 
 func TestActivityBarStaysWithinTrackAtEveryFrame(t *testing.T) {
@@ -202,9 +182,7 @@ func TestFinalizationIsAnExplicitPhase(t *testing.T) {
 		transferred:  6 * 1024 * 1024 * 1024,
 		phaseElapsed: 2300 * time.Millisecond,
 	})
-	if !strings.Contains(line, "committing provider data") || !strings.Contains(line, "2.3s") {
-		t.Fatalf("finalization progress=%q", line)
-	}
+	failIf(t, !strings.Contains(line, "committing provider data") || !strings.Contains(line, "2.3s"), "finalization progress=%q", line)
 }
 
 func TestPlanningProgressSurfacesRetries(t *testing.T) {
@@ -215,9 +193,7 @@ func TestPlanningProgressSurfacesRetries(t *testing.T) {
 		retries:      2,
 		phaseElapsed: 5 * time.Second,
 	})
-	if !strings.Contains(line, "retry 2") {
-		t.Fatalf("planning progress=%q, want retry count", line)
-	}
+	failIf(t, !strings.Contains(line, "retry 2"), "planning progress=%q, want retry count", line)
 }
 
 func TestProgressETAIncludesSlowKnownInput(t *testing.T) {
@@ -272,17 +248,11 @@ func TestProgressRateEstimatorSmoothsAndDetectsStall(t *testing.T) {
 	estimator := progressRateEstimator{}
 	estimator.reset(start, 0)
 	rate, stalled := estimator.observe(start.Add(time.Second), 100*1024*1024)
-	if stalled || rate < 99*1024*1024 || rate > 101*1024*1024 {
-		t.Fatalf("rate=%f stalled=%t, want about 100 MiB/s", rate, stalled)
-	}
+	failIf(t, stalled || rate < 99*1024*1024 || rate > 101*1024*1024, "rate=%f stalled=%t, want about 100 MiB/s", rate, stalled)
 	rate, stalled = estimator.observe(start.Add(2*time.Second), 200*1024*1024)
-	if stalled || rate < 99*1024*1024 || rate > 101*1024*1024 {
-		t.Fatalf("second-window rate=%f stalled=%t, want about 100 MiB/s", rate, stalled)
-	}
+	failIf(t, stalled || rate < 99*1024*1024 || rate > 101*1024*1024, "second-window rate=%f stalled=%t, want about 100 MiB/s", rate, stalled)
 	_, stalled = estimator.observe(start.Add(5*time.Second), 200*1024*1024)
-	if !stalled {
-		t.Fatal("estimator did not report a confirmation stall")
-	}
+	fatalIf(t, !stalled, "estimator did not report a confirmation stall")
 }
 
 func TestTransferUIWritesStyledInformationAndCompletion(t *testing.T) {
@@ -312,16 +282,10 @@ func TestTransferUIWritesStyledInformationAndCompletion(t *testing.T) {
 
 	got := output.String()
 	for _, want := range []string{"idoud · upload · stdin stream.bin · 1.00KiB · 2 routes", "save  /tmp/stream.bin", "complete", "1.00KiB stored"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("UI output %q does not contain %q", got, want)
-		}
+		failIf(t, !strings.Contains(got, want), "UI output %q does not contain %q", got, want)
 	}
-	if strings.Contains(got, "\nstdin  ") || strings.Contains(got, "\nplan  ") {
-		t.Fatalf("UI emitted separate source or plan headings: %q", got)
-	}
-	if strings.Contains(got, "\x1b[") {
-		t.Fatalf("color-disabled UI emitted ANSI styling: %q", got)
-	}
+	failIf(t, strings.Contains(got, "\nstdin  ") || strings.Contains(got, "\nplan  "), "UI emitted separate source or plan headings: %q", got)
+	failIf(t, strings.Contains(got, "\x1b["), "color-disabled UI emitted ANSI styling: %q", got)
 }
 
 func TestTransferSummaryGainsPlanOnTheSameLine(t *testing.T) {
@@ -339,15 +303,9 @@ func TestTransferSummaryGainsPlanOnTheSameLine(t *testing.T) {
 	ui.setPlan("1 route · up to 10 parallel · 10 × 10.00MiB")
 	after := ui.formatTransferSummary(140)
 
-	if before != "idoud · upload · fixture.bin · 100.00MiB" {
-		t.Fatalf("initial summary=%q", before)
-	}
-	if !strings.HasPrefix(after, before+" · ") || !strings.Contains(after, "1 route · up to 10 parallel") {
-		t.Fatalf("expanded summary=%q does not extend %q", after, before)
-	}
-	if strings.Contains(after, "\n") {
-		t.Fatalf("expanded summary contains a newline: %q", after)
-	}
+	failIf(t, before != "idoud · upload · fixture.bin · 100.00MiB", "initial summary=%q", before)
+	failIf(t, !strings.HasPrefix(after, before+" · ") || !strings.Contains(after, "1 route · up to 10 parallel"), "expanded summary=%q does not extend %q", after, before)
+	failIf(t, strings.Contains(after, "\n"), "expanded summary contains a newline: %q", after)
 }
 
 func TestLineProgressKeepsInteractiveLayoutWithTimestampedNewlines(t *testing.T) {
@@ -384,13 +342,9 @@ func TestLineProgressKeepsInteractiveLayoutWithTimestampedNewlines(t *testing.T)
 		"1/1 parts",
 		"✓ complete",
 	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("line progress output %q does not contain %q", got, want)
-		}
+		failIf(t, !strings.Contains(got, want), "line progress output %q does not contain %q", got, want)
 	}
-	if strings.Contains(got, "\r") || strings.Contains(got, "event=progress") || strings.Contains(got, "\x1b[") {
-		t.Fatalf("line progress used dynamic, diagnostic, or ANSI output: %q", got)
-	}
+	failIf(t, strings.Contains(got, "\r") || strings.Contains(got, "event=progress") || strings.Contains(got, "\x1b["), "line progress used dynamic, diagnostic, or ANSI output: %q", got)
 	lines := strings.Split(strings.TrimSpace(got), "\n")
 	if len(lines) < 3 {
 		t.Fatalf("line progress emitted only %d lines: %q", len(lines), got)
@@ -474,13 +428,9 @@ func TestPlainProgressIsANSIFreeLineOrientedAndDiagnostic(t *testing.T) {
 		"confirmation_average_ms=2000",
 		"event=complete result=success",
 	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("plain progress output %q does not contain %q", got, want)
-		}
+		failIf(t, !strings.Contains(got, want), "plain progress output %q does not contain %q", got, want)
 	}
-	if strings.Contains(got, "\r") || strings.Contains(got, "\x1b[") {
-		t.Fatalf("plain progress emitted terminal control sequences: %q", got)
-	}
+	failIf(t, strings.Contains(got, "\r") || strings.Contains(got, "\x1b["), "plain progress emitted terminal control sequences: %q", got)
 	for _, line := range strings.Split(strings.TrimSpace(got), "\n") {
 		firstField := strings.Fields(line)[0]
 		if _, err := time.Parse(time.RFC3339Nano, firstField); err != nil {
@@ -513,9 +463,7 @@ func TestPlainProgressReportsArchivePackingAndResumeBaseline(t *testing.T) {
 		"packed_bytes=25165824",
 		"event=complete result=failure",
 	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("plain archive progress %q does not contain %q", got, want)
-		}
+		failIf(t, !strings.Contains(got, want), "plain archive progress %q does not contain %q", got, want)
 	}
 }
 
@@ -526,9 +474,7 @@ func TestPlainDownloadStateUsesDiskSemantics(t *testing.T) {
 		inFlight: 4,
 		rate:     10 * 1024 * 1024,
 	})
-	if state != "downloading" {
-		t.Fatalf("download state=%q, want downloading", state)
-	}
+	failIf(t, state != "downloading", "download state=%q, want downloading", state)
 }
 
 func TestCompletionUsesEndToEndAverageNotLastConfirmationBurst(t *testing.T) {
@@ -548,12 +494,8 @@ func TestCompletionUsesEndToEndAverageNotLastConfirmationBurst(t *testing.T) {
 	ui.finishLine(true, 1024, now)
 
 	got := output.String()
-	if !strings.Contains(got, "10.00MiB/s avg") {
-		t.Fatalf("completion=%q, want end-to-end 10 MiB/s average", got)
-	}
-	if strings.Contains(got, "1.00KiB/s") {
-		t.Fatalf("completion used final burst rate: %q", got)
-	}
+	failIf(t, !strings.Contains(got, "10.00MiB/s avg"), "completion=%q, want end-to-end 10 MiB/s average", got)
+	failIf(t, strings.Contains(got, "1.00KiB/s"), "completion used final burst rate: %q", got)
 }
 
 func TestVisibleTerminalWidthIgnoresANSI(t *testing.T) {
@@ -565,21 +507,11 @@ func TestVisibleTerminalWidthIgnoresANSI(t *testing.T) {
 }
 
 func TestNoProgressOptionDisablesRendererBeforeTTYProbe(t *testing.T) {
-	if transferProgressEnabled(options{noProgress: true}) {
-		t.Fatal("--no-progress did not disable progress")
-	}
-	if transferProgressEnabled(options{debug: true}) {
-		t.Fatal("debug mode did not disable interactive progress")
-	}
-	if transferProgressEnabled(options{verbose: true}) {
-		t.Fatal("verbose mode did not disable interactive progress")
-	}
-	if !transferProgressEnabled(options{debug: true, progressMode: progressModePlain}) {
-		t.Fatal("plain progress should remain enabled with debug logs")
-	}
-	if !transferProgressEnabled(options{debug: true, progressMode: progressModeLines}) {
-		t.Fatal("line progress should remain enabled with debug logs")
-	}
+	fatalIf(t, transferProgressEnabled(options{noProgress: true}), "--no-progress did not disable progress")
+	fatalIf(t, transferProgressEnabled(options{debug: true}), "debug mode did not disable interactive progress")
+	fatalIf(t, transferProgressEnabled(options{verbose: true}), "verbose mode did not disable interactive progress")
+	fatalIf(t, !transferProgressEnabled(options{debug: true, progressMode: progressModePlain}), "plain progress should remain enabled with debug logs")
+	fatalIf(t, !transferProgressEnabled(options{debug: true, progressMode: progressModeLines}), "line progress should remain enabled with debug logs")
 }
 
 func TestUploadProgressParallelReportsUsefulWindow(t *testing.T) {
@@ -590,9 +522,7 @@ func TestUploadProgressParallelReportsUsefulWindow(t *testing.T) {
 	}
 	stream := &sourceFile{knownSize: false, stream: strings.NewReader("stream")}
 	got := uploadProgressParallel(uploader, stream, -1)
-	if got != 24 {
-		t.Fatalf("unknown-stream parallel=%d, want bounded useful window", got)
-	}
+	failIf(t, got != 24, "unknown-stream parallel=%d, want bounded useful window", got)
 }
 
 func TestCommittedUploadProgressSeedsResumeTruthfully(t *testing.T) {
@@ -602,7 +532,5 @@ func TestCommittedUploadProgressSeedsResumeTruthfully(t *testing.T) {
 		committedChunks: map[int64]struct{}{0: {}, 2: {}, 99: {}},
 	}
 	bytes, chunks := src.committedUploadProgress(10)
-	if bytes != 15 || chunks != 2 {
-		t.Fatalf("resume baseline bytes=%d chunks=%d, want 15 and 2", bytes, chunks)
-	}
+	failIf(t, bytes != 15 || chunks != 2, "resume baseline bytes=%d chunks=%d, want 15 and 2", bytes, chunks)
 }

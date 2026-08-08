@@ -21,43 +21,25 @@ import (
 func TestIsUpdateCommand(t *testing.T) {
 	t.Chdir(t.TempDir())
 	for _, args := range [][]string{{"update"}, {"UPDATE"}, {" update "}, {"--update"}, {shortUpdateFlag}} {
-		if !isUpdateCommand(args) {
-			t.Fatalf("isUpdateCommand(%q)=false, want true", args)
-		}
+		failIf(t, !isUpdateCommand(args), "isUpdateCommand(%q)=false, want true", args)
 	}
 	for _, args := range [][]string{nil, {"./update"}, {"--", "update"}, {"update", "--force"}} {
-		if isUpdateCommand(args) {
-			t.Fatalf("isUpdateCommand(%q)=true, want false", args)
-		}
+		failIf(t, isUpdateCommand(args), "isUpdateCommand(%q)=true, want false", args)
 	}
+	requireNoError(t, os.WriteFile("update", []byte("payload"), 0o600), "")
 
-	if err := os.WriteFile("update", []byte("payload"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if isUpdateCommand([]string{"update"}) {
-		t.Fatal("positional update command stole an existing local file")
-	}
+	fatalIf(t, isUpdateCommand([]string{"update"}), "positional update command stole an existing local file")
 	for _, args := range [][]string{{"--update"}, {shortUpdateFlag}} {
-		if !isUpdateCommand(args) {
-			t.Fatalf("explicit update command %q was shadowed by a local file", args)
-		}
+		failIf(t, !isUpdateCommand(args), "explicit update command %q was shadowed by a local file", args)
 	}
 	opts, filePath, err := parseFlags([]string{"update"})
-	if err != nil {
-		t.Fatalf("parse existing update file: %v", err)
-	}
-	if filePath != "update" || opts.stdin || opts.download {
-		t.Fatalf("existing update parsed as filePath=%q opts=%+v", filePath, opts)
-	}
-	if err := os.Remove("update"); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir("update", 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if !isUpdateCommand([]string{"update"}) {
-		t.Fatal("a directory named update incorrectly shadowed the update command")
-	}
+	requireNoError(t, err, "parse existing update file: %v")
+
+	failIf(t, filePath != "update" || opts.stdin || opts.download, "existing update parsed as filePath=%q opts=%+v", filePath, opts)
+	requireNoError(t, os.Remove("update"), "")
+	requireNoError(t, os.Mkdir("update", 0o700), "")
+
+	fatalIf(t, !isUpdateCommand([]string{"update"}), "a directory named update incorrectly shadowed the update command")
 }
 
 func TestUpdateAssetName(t *testing.T) {
@@ -90,16 +72,12 @@ func TestUpdateAssetName(t *testing.T) {
 
 func TestUpdateTagFromRedirect(t *testing.T) {
 	parsed, err := url.Parse("https://github.com/mydearniko/idoud/releases/download/v1.3.0/checksums.txt")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	got, err := updateTagFromRedirect(parsed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "v1.3.0" {
-		t.Fatalf("tag=%q, want v1.3.0", got)
-	}
+	requireNoError(t, err, "")
+
+	failIf(t, got != "v1.3.0", "tag=%q, want v1.3.0", got)
 	latest, _ := url.Parse("https://github.com/mydearniko/idoud/releases/latest/download/checksums.txt")
 	if _, err := updateTagFromRedirect(latest); err == nil {
 		t.Fatal("latest URL produced a release tag without a redirect")
@@ -110,12 +88,9 @@ func TestChecksumForUpdateAsset(t *testing.T) {
 	want := sha256.Sum256([]byte("binary"))
 	payload := fmt.Sprintf("%x  idoud_linux_arm64\n%x  idoud_linux_amd64\n", sha256.Sum256([]byte("other")), want)
 	got, err := checksumForUpdateAsset([]byte(payload), "idoud_linux_amd64")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, want[:]) {
-		t.Fatalf("checksum=%x, want %x", got, want)
-	}
+	requireNoError(t, err, "")
+
+	failIf(t, !bytes.Equal(got, want[:]), "checksum=%x, want %x", got, want)
 	if _, err := checksumForUpdateAsset([]byte(payload), "missing"); err == nil {
 		t.Fatal("missing asset checksum succeeded")
 	}
@@ -148,22 +123,23 @@ func TestReleaseVersionAtLeast(t *testing.T) {
 	}
 }
 
+func newTestReleaseUpdater(fixture *updateServerFixture, target string, validate func(context.Context, string, string) error) releaseUpdater {
+	return releaseUpdater{
+		baseURL: fixture.server.URL, client: fixture.server.Client(),
+		goos: "linux", goarch: "amd64", currentTarget: target, validate: validate,
+	}
+}
+
 func TestReleaseUpdaterReplacesVerifiedExecutable(t *testing.T) {
 	replacement := []byte("new idoud executable")
 	fixture := newUpdateServer(t, "v9.8.7", replacement, nil)
 	defer fixture.server.Close()
 
 	target := filepath.Join(t.TempDir(), "idoud")
-	if err := os.WriteFile(target, []byte("old idoud executable"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	updater := releaseUpdater{
-		baseURL:       fixture.server.URL,
-		client:        fixture.server.Client(),
-		goos:          "linux",
-		goarch:        "amd64",
-		currentTarget: target,
-		validate: func(_ context.Context, path, version string) error {
+	requireNoError(t, os.WriteFile(target, []byte("old idoud executable"), 0o755), "")
+
+	updater := newTestReleaseUpdater(fixture, target,
+		func(_ context.Context, path, version string) error {
 			if version != "9.8.7" {
 				return fmt.Errorf("version=%q", version)
 			}
@@ -176,21 +152,15 @@ func TestReleaseUpdaterReplacesVerifiedExecutable(t *testing.T) {
 			}
 			return nil
 		},
-	}
+	)
 	result, err := updater.update(context.Background(), "1.2.0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.updated || result.current != "1.2.0" || result.latest != "9.8.7" {
-		t.Fatalf("result=%+v", result)
-	}
+	requireNoError(t, err, "")
+
+	failIf(t, !result.updated || result.current != "1.2.0" || result.latest != "9.8.7", "result=%+v", result)
 	got, err := os.ReadFile(target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, replacement) {
-		t.Fatalf("installed bytes=%q, want %q", got, replacement)
-	}
+	requireNoError(t, err, "")
+
+	failIf(t, !bytes.Equal(got, replacement), "installed bytes=%q, want %q", got, replacement)
 	if fixture.assetRequests.Load() != 1 {
 		t.Fatalf("asset requests=%d, want 1", fixture.assetRequests.Load())
 	}
@@ -201,34 +171,23 @@ func TestReleaseUpdaterAlreadyCurrentDoesNotDownload(t *testing.T) {
 	defer fixture.server.Close()
 	target := filepath.Join(t.TempDir(), "idoud")
 	original := []byte("current executable")
-	if err := os.WriteFile(target, original, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	updater := releaseUpdater{
-		baseURL:       fixture.server.URL,
-		client:        fixture.server.Client(),
-		goos:          "linux",
-		goarch:        "amd64",
-		currentTarget: target,
-		validate: func(context.Context, string, string) error {
+	requireNoError(t, os.WriteFile(target, original, 0o755), "")
+
+	updater := newTestReleaseUpdater(fixture, target,
+		func(context.Context, string, string) error {
 			t.Fatal("validator called for current release")
 			return nil
 		},
-	}
+	)
 	result, err := updater.update(context.Background(), "1.3.0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.updated {
-		t.Fatalf("result=%+v, want no update", result)
-	}
+	requireNoError(t, err, "")
+
+	failIf(t, result.updated, "result=%+v, want no update", result)
 	if fixture.assetRequests.Load() != 0 {
 		t.Fatalf("asset requests=%d, want 0", fixture.assetRequests.Load())
 	}
 	got, _ := os.ReadFile(target)
-	if !bytes.Equal(got, original) {
-		t.Fatalf("target changed while already current: %q", got)
-	}
+	failIf(t, !bytes.Equal(got, original), "target changed while already current: %q", got)
 }
 
 func TestReleaseUpdaterChecksumFailurePreservesExecutable(t *testing.T) {
@@ -237,27 +196,19 @@ func TestReleaseUpdaterChecksumFailurePreservesExecutable(t *testing.T) {
 	defer fixture.server.Close()
 	target := filepath.Join(t.TempDir(), "idoud")
 	original := []byte("current executable")
-	if err := os.WriteFile(target, original, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	updater := releaseUpdater{
-		baseURL:       fixture.server.URL,
-		client:        fixture.server.Client(),
-		goos:          "linux",
-		goarch:        "amd64",
-		currentTarget: target,
-		validate: func(context.Context, string, string) error {
+	requireNoError(t, os.WriteFile(target, original, 0o755), "")
+
+	updater := newTestReleaseUpdater(fixture, target,
+		func(context.Context, string, string) error {
 			t.Fatal("validator called after checksum failure")
 			return nil
 		},
-	}
+	)
 	if _, err := updater.update(context.Background(), "1.2.0"); err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
 		t.Fatalf("update error=%v, want checksum mismatch", err)
 	}
 	got, _ := os.ReadFile(target)
-	if !bytes.Equal(got, original) {
-		t.Fatalf("target changed after checksum failure: %q", got)
-	}
+	failIf(t, !bytes.Equal(got, original), "target changed after checksum failure: %q", got)
 	assertNoUpdateTemps(t, filepath.Dir(target))
 }
 
@@ -267,31 +218,18 @@ func TestReleaseUpdaterRetriesCorruptedDownload(t *testing.T) {
 	fixture.firstAsset = []byte("corrupted first response")
 	defer fixture.server.Close()
 	target := filepath.Join(t.TempDir(), "idoud")
-	if err := os.WriteFile(target, []byte("current executable"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	updater := releaseUpdater{
-		baseURL:       fixture.server.URL,
-		client:        fixture.server.Client(),
-		goos:          "linux",
-		goarch:        "amd64",
-		currentTarget: target,
-		validate:      func(context.Context, string, string) error { return nil },
-	}
+	requireNoError(t, os.WriteFile(target, []byte("current executable"), 0o755), "")
+
+	updater := newTestReleaseUpdater(fixture, target, func(context.Context, string, string) error { return nil })
 	result, err := updater.update(context.Background(), "1.2.0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.updated {
-		t.Fatalf("result=%+v, want updated", result)
-	}
+	requireNoError(t, err, "")
+
+	failIf(t, !result.updated, "result=%+v, want updated", result)
 	if fixture.assetRequests.Load() != 2 {
 		t.Fatalf("asset requests=%d, want 2", fixture.assetRequests.Load())
 	}
 	got, _ := os.ReadFile(target)
-	if !bytes.Equal(got, replacement) {
-		t.Fatalf("installed bytes=%q, want %q", got, replacement)
-	}
+	failIf(t, !bytes.Equal(got, replacement), "installed bytes=%q, want %q", got, replacement)
 }
 
 func TestReleaseUpdaterValidationFailurePreservesExecutable(t *testing.T) {
@@ -299,26 +237,18 @@ func TestReleaseUpdaterValidationFailurePreservesExecutable(t *testing.T) {
 	defer fixture.server.Close()
 	target := filepath.Join(t.TempDir(), "idoud")
 	original := []byte("current executable")
-	if err := os.WriteFile(target, original, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	updater := releaseUpdater{
-		baseURL:       fixture.server.URL,
-		client:        fixture.server.Client(),
-		goos:          "linux",
-		goarch:        "amd64",
-		currentTarget: target,
-		validate: func(context.Context, string, string) error {
+	requireNoError(t, os.WriteFile(target, original, 0o755), "")
+
+	updater := newTestReleaseUpdater(fixture, target,
+		func(context.Context, string, string) error {
 			return errors.New("not a valid idoud binary")
 		},
-	}
+	)
 	if _, err := updater.update(context.Background(), "1.2.0"); err == nil || !strings.Contains(err.Error(), "not a valid idoud binary") {
 		t.Fatalf("update error=%v, want validation error", err)
 	}
 	got, _ := os.ReadFile(target)
-	if !bytes.Equal(got, original) {
-		t.Fatalf("target changed after validation failure: %q", got)
-	}
+	failIf(t, !bytes.Equal(got, original), "target changed after validation failure: %q", got)
 	assertNoUpdateTemps(t, filepath.Dir(target))
 }
 
@@ -364,10 +294,7 @@ func newUpdateServer(t *testing.T, tag string, replacement, checksumOverride []b
 func assertNoUpdateTemps(t *testing.T, directory string) {
 	t.Helper()
 	matches, err := filepath.Glob(filepath.Join(directory, ".idoud-update-*"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(matches) != 0 {
-		t.Fatalf("temporary update files remain: %v", matches)
-	}
+	requireNoError(t, err, "")
+
+	failIf(t, len(matches) != 0, "temporary update files remain: %v", matches)
 }

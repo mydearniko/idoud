@@ -15,32 +15,24 @@ import (
 
 func TestChunkRetryFallsBackToMasterAfterNodeOutage(t *testing.T) {
 	masterBase, err := url.Parse("https://master.example")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	nodeTarget, err := url.Parse("https://node.example/Resume1/file.bin")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	var nodeRequests int
 	var masterRequests int
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		body, _ := io.ReadAll(req.Body)
-		if string(body) != "data" {
-			t.Fatalf("request body=%q", body)
-		}
+		failIf(t, string(body) != "data", "request body=%q", body)
 		switch req.URL.Host {
 		case "node.example":
 			nodeRequests++
 			return &http.Response{StatusCode: http.StatusBadGateway, Body: io.NopCloser(strings.NewReader("node unavailable"))}, nil
 		case "master.example":
 			masterRequests++
-			if req.Header.Get("X-Upload-Fallback") != "1" {
-				t.Fatal("master fallback header missing")
-			}
-			if req.Header.Get(headerUploadWaitStored) != "1" {
-				t.Fatal("durable storage acknowledgement header missing")
-			}
+			fatalIf(t, req.Header.Get("X-Upload-Fallback") != "1", "master fallback header missing")
+			fatalIf(t, req.Header.Get(headerUploadWaitStored) != "1", "durable storage acknowledgement header missing")
 			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("https://master.example/Resume1/file.bin"))}, nil
 		default:
 			t.Fatalf("unexpected host %q", req.URL.Host)
@@ -67,36 +59,26 @@ func TestChunkRetryFallsBackToMasterAfterNodeOutage(t *testing.T) {
 		uploadURLs:              []string{nodeTarget.String()},
 		uploadURLParsedByServer: []*url.URL{nodeTarget},
 	}
-	if err := u.uploadChunkWithRetry(context.Background(), src, 0, false, newURLCapture(src)); err != nil {
-		t.Fatalf("uploadChunkWithRetry: %v", err)
-	}
-	if nodeRequests != 1 || masterRequests != 1 {
-		t.Fatalf("node requests=%d master requests=%d", nodeRequests, masterRequests)
-	}
+	requireNoError(t, u.uploadChunkWithRetry(context.Background(), src, 0, false, newURLCapture(src)), "uploadChunkWithRetry: %v")
+
+	failIf(t, nodeRequests != 1 || masterRequests != 1, "node requests=%d master requests=%d", nodeRequests, masterRequests)
 }
 
 func TestChunkRetryUsesAlternateRouteThenDirectStandby(t *testing.T) {
 	masterBase, err := url.Parse("https://master.example")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	requests := make([]string, 0, 3)
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		body, _ := io.ReadAll(req.Body)
-		if string(body) != "data" {
-			t.Fatalf("request body=%q", body)
-		}
+		failIf(t, string(body) != "data", "request body=%q", body)
 		requests = append(requests, req.URL.Host)
 		switch req.URL.Host {
 		case "primary-a.example", "primary-b.example":
-			if req.Header.Get("X-Upload-Fallback") != "" {
-				t.Fatal("primary request carried fallback marker")
-			}
+			fatalIf(t, req.Header.Get("X-Upload-Fallback") != "", "primary request carried fallback marker")
 			return &http.Response{StatusCode: http.StatusBadGateway, Body: io.NopCloser(strings.NewReader("route unavailable"))}, nil
 		case "standby.example":
-			if req.Header.Get("X-Upload-Fallback") != "1" {
-				t.Fatal("direct standby request missing fallback marker")
-			}
+			fatalIf(t, req.Header.Get("X-Upload-Fallback") != "1", "direct standby request missing fallback marker")
 			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, ContentLength: 0}, nil
 		case "master.example":
 			t.Fatal("master relay used despite a healthy direct standby")
@@ -129,21 +111,17 @@ func TestChunkRetryUsesAlternateRouteThenDirectStandby(t *testing.T) {
 			{rawURL: "https://standby.example/Route1/file.bin", parsedURL: mustParseURL(t, "https://standby.example/Route1/file.bin"), nodeID: "standby", fallback: true},
 		},
 	}
-	if err := u.uploadChunkWithRetry(context.Background(), src, 0, false, newURLCapture(src)); err != nil {
-		t.Fatalf("uploadChunkWithRetry: %v", err)
-	}
+	requireNoError(t, u.uploadChunkWithRetry(context.Background(), src, 0, false, newURLCapture(src)), "uploadChunkWithRetry: %v")
+
 	want := []string{"primary-a.example", "primary-b.example", "standby.example"}
-	if strings.Join(requests, ",") != strings.Join(want, ",") {
-		t.Fatalf("requests=%v want=%v", requests, want)
-	}
+	failIf(t, strings.Join(requests, ",") != strings.Join(want, ","), "requests=%v want=%v", requests, want)
 }
 
 func mustParseURL(t *testing.T, raw string) *url.URL {
 	t.Helper()
 	parsed, err := url.Parse(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	return parsed
 }
 
@@ -173,15 +151,10 @@ func TestRequestFinalizeUploadIgnoresTransientProbeTimeout(t *testing.T) {
 	})
 
 	result, err := u.requestFinalizeUpload(context.Background(), "AbC123", 30*time.Millisecond)
-	if err != nil {
-		t.Fatalf("requestFinalizeUpload error = %v, want nil", err)
-	}
-	if result.ready {
-		t.Fatal("requestFinalizeUpload ready=true, want false")
-	}
-	if result.failed {
-		t.Fatal("requestFinalizeUpload failed=true, want false")
-	}
+	requireNoError(t, err, "requestFinalizeUpload error = %v, want nil")
+
+	fatalIf(t, result.ready, "requestFinalizeUpload ready=true, want false")
+	fatalIf(t, result.failed, "requestFinalizeUpload failed=true, want false")
 	if result.finalURL != "" {
 		t.Fatalf("requestFinalizeUpload finalURL=%q, want empty", result.finalURL)
 	}
@@ -193,15 +166,10 @@ func TestProbeMetadataIgnoresTransientProbeTimeout(t *testing.T) {
 	})
 
 	ready, failed, err := u.probeMetadata(context.Background(), "AbC123", 30*time.Millisecond)
-	if err != nil {
-		t.Fatalf("probeMetadata error = %v, want nil", err)
-	}
-	if ready {
-		t.Fatal("probeMetadata ready=true, want false")
-	}
-	if failed {
-		t.Fatal("probeMetadata failed=true, want false")
-	}
+	requireNoError(t, err, "probeMetadata error = %v, want nil")
+
+	fatalIf(t, ready, "probeMetadata ready=true, want false")
+	fatalIf(t, failed, "probeMetadata failed=true, want false")
 }
 
 func TestRequestFinalizeUploadPropagatesCallerCancel(t *testing.T) {
@@ -213,9 +181,7 @@ func TestRequestFinalizeUploadPropagatesCallerCancel(t *testing.T) {
 	cancel()
 
 	_, err := u.requestFinalizeUpload(ctx, "AbC123", 30*time.Millisecond)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("requestFinalizeUpload err = %v, want context.Canceled", err)
-	}
+	failIf(t, !errors.Is(err, context.Canceled), "requestFinalizeUpload err = %v, want context.Canceled", err)
 }
 
 func TestFinalChunkRecoversFromCompletedTargetReplayResponse(t *testing.T) {
@@ -242,12 +208,9 @@ func TestFinalChunkRecoversFromCompletedTargetReplayResponse(t *testing.T) {
 		requestErr := &requestError{status: http.StatusBadRequest, body: uploadPrepareTargetAlreadyExists}
 		return "", http.StatusBadRequest, requestErr
 	})
-	if err != nil {
-		t.Fatalf("retryChunkUpload returned error: %v", err)
-	}
-	if uploadAttempts != 1 || finalizeRequests != 1 {
-		t.Fatalf("uploadAttempts=%d finalizeRequests=%d, want one upload and one recovery probe", uploadAttempts, finalizeRequests)
-	}
+	requireNoError(t, err, "retryChunkUpload returned error: %v")
+
+	failIf(t, uploadAttempts != 1 || finalizeRequests != 1, "uploadAttempts=%d finalizeRequests=%d, want one upload and one recovery probe", uploadAttempts, finalizeRequests)
 }
 
 func TestWaitForReadyAttemptTreatsProbeTimeoutAsTransient(t *testing.T) {
@@ -256,19 +219,15 @@ func TestWaitForReadyAttemptTreatsProbeTimeoutAsTransient(t *testing.T) {
 	})
 
 	ready, err := u.waitForReadyAttempt(context.Background(), "https://idoud.cc/AbC123", 25*time.Millisecond)
-	if err != nil {
-		t.Fatalf("waitForReadyAttempt error = %v, want nil", err)
-	}
-	if ready {
-		t.Fatal("waitForReadyAttempt ready=true, want false (timed out)")
-	}
+	requireNoError(t, err, "waitForReadyAttempt error = %v, want nil")
+
+	fatalIf(t, ready, "waitForReadyAttempt ready=true, want false (timed out)")
 }
 
 func TestUploadPUTMarksFinalChunkWaitStored(t *testing.T) {
 	target, err := url.Parse("https://node.example/upload.bin")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	var gotFinal, gotWaitStored string
 	u := &uploader{
 		opts: options{uploadKey: "key"},
@@ -285,18 +244,13 @@ func TestUploadPUTMarksFinalChunkWaitStored(t *testing.T) {
 	src := &sourceFile{uploadURL: target.String(), uploadURLParsed: target}
 
 	_, status, err := u.uploadPUT(context.Background(), src, http.NoBody, 0, "bytes 0-0/*", 0, true, true, 0)
-	if err != nil {
-		t.Fatalf("uploadPUT error = %v", err)
-	}
+	requireNoError(t, err, "uploadPUT error = %v")
+
 	if status != http.StatusOK {
 		t.Fatalf("status=%d, want %d", status, http.StatusOK)
 	}
-	if gotFinal != "1" {
-		t.Fatalf("%s=%q, want 1", headerUploadFinalChunk, gotFinal)
-	}
-	if gotWaitStored != "1" {
-		t.Fatalf("%s=%q, want 1", headerUploadWaitStored, gotWaitStored)
-	}
+	failIf(t, gotFinal != "1", "%s=%q, want 1", headerUploadFinalChunk, gotFinal)
+	failIf(t, gotWaitStored != "1", "%s=%q, want 1", headerUploadWaitStored, gotWaitStored)
 }
 
 func TestWarmConnectionsUsesPreparedUploadTargets(t *testing.T) {
@@ -307,9 +261,8 @@ func TestWarmConnectionsUsesPreparedUploadTargets(t *testing.T) {
 	parsed := make([]*url.URL, 0, len(targets))
 	for _, target := range targets {
 		u, err := url.Parse(target)
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err, "")
+
 		parsed = append(parsed, u)
 	}
 
@@ -349,12 +302,8 @@ func TestWarmConnectionsUsesPreparedUploadTargets(t *testing.T) {
 	for _, requestURL := range got {
 		counts[requestURL]++
 	}
-	if counts["https://first.example/v1/health"] < 1 || counts["https://second.example/v1/health"] < 1 {
-		t.Fatalf("prepared route probes=%v, want both routes probed", counts)
-	}
-	if len(counts) != 2 {
-		t.Fatalf("warm request targets=%v, want only prepared routes", counts)
-	}
+	failIf(t, counts["https://first.example/v1/health"] < 1 || counts["https://second.example/v1/health"] < 1, "prepared route probes=%v, want both routes probed", counts)
+	failIf(t, len(counts) != 2, "warm request targets=%v, want only prepared routes", counts)
 	select {
 	case requestURL := <-requests:
 		t.Fatalf("unexpected redundant direct-route warm request %q", requestURL)
@@ -430,9 +379,7 @@ func TestWarmConnectionsSkipsRouteProbeForCompleteResume(t *testing.T) {
 	}
 
 	u.warmConnections(context.Background(), src, 0)
-	if requests != 0 {
-		t.Fatalf("complete resume route probes=%d, want 0", requests)
-	}
+	failIf(t, requests != 0, "complete resume route probes=%d, want 0", requests)
 }
 
 func TestWarmConnectionsRewindsLegacySubdomainsToWarmedLanes(t *testing.T) {
@@ -476,9 +423,7 @@ func TestWarmConnectionsRewindsLegacySubdomainsToWarmedLanes(t *testing.T) {
 			warmed[req.lane] = req.host
 		}
 	}
-	if warmed[0] != "1.idoud.cc" || warmed[1] != "2.idoud.cc" {
-		t.Fatalf("warmed lane hosts=%v, want lane 0/1 on 1/2.idoud.cc", warmed)
-	}
+	failIf(t, warmed[0] != "1.idoud.cc" || warmed[1] != "2.idoud.cc", "warmed lane hosts=%v, want lane 0/1 on 1/2.idoud.cc", warmed)
 	if got := u.routeUploadURL(target.String()); !strings.HasPrefix(got, "https://1.idoud.cc/") {
 		t.Fatalf("first payload URL after warmup=%q, want rewound 1.idoud.cc", got)
 	}
@@ -553,9 +498,8 @@ func TestWarmConnectionsContinuesAfterFirstHealthyRoute(t *testing.T) {
 		t.Fatal("slow active route was not probed in the background")
 	}
 	selected, err := u.selectUploadRoute(src, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	if selected.rawURL != fast.String() {
 		t.Fatalf("selected route=%q, want first healthy route %q", selected.rawURL, fast.String())
 	}
@@ -591,9 +535,7 @@ func TestWarmConnectionsRoutesPayloadDirectlyToHealthyStandby(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusBadGateway, Body: http.NoBody}, nil
 		case "standby.example":
 			standbyPayload++
-			if req.Header.Get("X-Upload-Fallback") != "1" {
-				t.Fatal("standby payload missing failover marker")
-			}
+			fatalIf(t, req.Header.Get("X-Upload-Fallback") != "1", "standby payload missing failover marker")
 			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
 		case "master.example":
 			t.Fatal("master received payload while direct standby was healthy")
@@ -610,14 +552,11 @@ func TestWarmConnectionsRoutesPayloadDirectlyToHealthyStandby(t *testing.T) {
 		uploadFallbackTargets: []uploadRouteTarget{{rawURL: standby.String(), parsedURL: standby, nodeID: "standby", maxParallel: 4, fallback: true}},
 	}
 	u.warmConnections(context.Background(), src, 4)
-	if err := u.uploadChunkWithRetry(context.Background(), src, 0, false, newURLCapture(src)); err != nil {
-		t.Fatalf("uploadChunkWithRetry: %v", err)
-	}
+	requireNoError(t, u.uploadChunkWithRetry(context.Background(), src, 0, false, newURLCapture(src)), "uploadChunkWithRetry: %v")
+
 	mu.Lock()
 	defer mu.Unlock()
-	if primaryHealth != 1 || primaryPayload != 0 || standbyPayload != 1 {
-		t.Fatalf("primary health=%d primary payload=%d standby payload=%d", primaryHealth, primaryPayload, standbyPayload)
-	}
+	failIf(t, primaryHealth != 1 || primaryPayload != 0 || standbyPayload != 1, "primary health=%d primary payload=%d standby payload=%d", primaryHealth, primaryPayload, standbyPayload)
 }
 
 func TestTransferBodyProgressReaderReportsAttemptOffsets(t *testing.T) {
@@ -644,9 +583,8 @@ func TestTransferBodyProgressReaderReportsAttemptOffsets(t *testing.T) {
 		if errors.Is(err, io.EOF) {
 			break
 		}
-		if err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, err, "")
+
 	}
 	if got := ui.bodySentBytes.Load(); got != 8 {
 		t.Fatalf("unique sent bytes=%d, want 8", got)
@@ -655,9 +593,7 @@ func TestTransferBodyProgressReaderReportsAttemptOffsets(t *testing.T) {
 		t.Fatalf("raw body bytes=%d, want 8", got)
 	}
 	for index, want := range []string{"sent 25.0%", "sent 50.0%", "sent 75.0%", "sent 100.0%"} {
-		if index >= len(rendered) || !strings.Contains(rendered[index], want) {
-			t.Fatalf("rendered progress=%q, want step %d containing %q", rendered, index, want)
-		}
+		failIf(t, index >= len(rendered) || !strings.Contains(rendered[index], want), "rendered progress=%q, want step %d containing %q", rendered, index, want)
 	}
 }
 

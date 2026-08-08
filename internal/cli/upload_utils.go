@@ -534,14 +534,32 @@ func uploadWarmChunkIndexes(u *uploader, src *sourceFile, parallel int) []int64 
 	return indexes
 }
 
-func buildUploadURL(base *url.URL, filename string) string {
+func buildServerURL(base *url.URL, path string) url.URL {
 	u := *base
 	u.RawQuery = ""
 	u.Fragment = ""
-	path := strings.TrimSuffix(u.Path, "/")
-	u.Path = path + "/" + url.PathEscape(filename)
+	u.Path = strings.TrimSuffix(u.Path, "/") + path
 	u.RawPath = ""
+	return u
+}
+
+func buildServerURLString(base *url.URL, path string) string {
+	u := buildServerURL(base, path)
 	return u.String()
+}
+
+func buildWaitURL(base *url.URL, path, queryKey string, wait time.Duration) string {
+	u := buildServerURL(base, path)
+	if waitValue := wait / time.Millisecond; waitValue > 0 {
+		q := u.Query()
+		q.Set(queryKey, strconv.FormatInt(int64(waitValue), 10))
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
+}
+
+func buildUploadURL(base *url.URL, filename string) string {
+	return buildServerURLString(base, "/"+url.PathEscape(filename))
 }
 
 func cloneURL(in *url.URL) *url.URL {
@@ -553,59 +571,19 @@ func cloneURL(in *url.URL) *url.URL {
 }
 
 func buildSpeedtestUploadURL(base *url.URL, filename string) string {
-	u := *base
-	u.RawQuery = ""
-	u.Fragment = ""
-	path := strings.TrimSuffix(u.Path, "/")
-	u.Path = path + "/v1/speedtest/" + url.PathEscape(filename)
-	u.RawPath = ""
-	return u.String()
+	return buildServerURLString(base, "/v1/speedtest/"+url.PathEscape(filename))
 }
 
 func buildUploadPrepareURL(base *url.URL) string {
-	u := *base
-	u.RawQuery = ""
-	u.Fragment = ""
-	path := strings.TrimSuffix(u.Path, "/")
-	u.Path = path + "/v1/uploads/prepare"
-	u.RawPath = ""
-	return u.String()
+	return buildServerURLString(base, "/v1/uploads/prepare")
 }
 
 func buildMetadataURLWithWait(base *url.URL, fileID string, wait time.Duration) string {
-	u := *base
-	u.RawQuery = ""
-	u.Fragment = ""
-	path := strings.TrimSuffix(u.Path, "/")
-	u.Path = path + "/v1/files/" + url.PathEscape(fileID)
-	if wait > 0 {
-		waitValue := wait / time.Millisecond
-		if waitValue > 0 {
-			q := u.Query()
-			q.Set("wait_ready_ms", strconv.FormatInt(int64(waitValue), 10))
-			u.RawQuery = q.Encode()
-		}
-	}
-	u.RawPath = ""
-	return u.String()
+	return buildWaitURL(base, "/v1/files/"+url.PathEscape(fileID), "wait_ready_ms", wait)
 }
 
 func buildFinalizeURLWithWait(base *url.URL, fileID string, wait time.Duration) string {
-	u := *base
-	u.RawQuery = ""
-	u.Fragment = ""
-	path := strings.TrimSuffix(u.Path, "/")
-	u.Path = path + "/v1/uploads/" + url.PathEscape(fileID) + "/finalize"
-	if wait > 0 {
-		waitValue := wait / time.Millisecond
-		if waitValue > 0 {
-			q := u.Query()
-			q.Set("wait_ms", strconv.FormatInt(int64(waitValue), 10))
-			u.RawQuery = q.Encode()
-		}
-	}
-	u.RawPath = ""
-	return u.String()
+	return buildWaitURL(base, "/v1/uploads/"+url.PathEscape(fileID)+"/finalize", "wait_ms", wait)
 }
 
 func normalizeServerURL(raw string) (*url.URL, error) {
@@ -739,8 +717,8 @@ func pushRate(window []float64, value float64, max int) []float64 {
 	return window
 }
 
-func avgRateWindow(values []float64, windowSize int) float64 {
-	if windowSize <= 0 || len(values) == 0 {
+func avgRateWindow(values []float64) float64 {
+	if len(values) == 0 {
 		return 0
 	}
 	sum := 0.0
@@ -752,7 +730,7 @@ func avgRateWindow(values []float64, windowSize int) float64 {
 	}
 	// Keep "avg7" semantics true even during startup by zero-filling
 	// missing samples until the rate window is full.
-	return sum / float64(windowSize)
+	return sum / 7
 }
 
 func formatByteSizeFloat(value float64) string {

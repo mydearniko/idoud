@@ -60,9 +60,8 @@ func TestUploadCooldownMergesConcurrentHedgeDeadlines(t *testing.T) {
 
 func TestUploadPUTWaitsForSharedCooldownBeforeTransport(t *testing.T) {
 	target, err := url.Parse("https://node.example/Resume1/file.bin")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	var calls atomic.Int64
 	u := &uploader{
 		opts:      options{uploadKey: "test-key"},
@@ -79,9 +78,7 @@ func TestUploadPUTWaitsForSharedCooldownBeforeTransport(t *testing.T) {
 	defer cancel()
 
 	_, _, uploadErr := u.uploadPUT(ctx, src, bytes.NewReader([]byte("data")), 4, "bytes 0-3/*", 0, false, true, 0)
-	if !errors.Is(uploadErr, context.DeadlineExceeded) {
-		t.Fatalf("upload error=%v, want cooldown context deadline", uploadErr)
-	}
+	failIf(t, !errors.Is(uploadErr, context.DeadlineExceeded), "upload error=%v, want cooldown context deadline", uploadErr)
 	if got := calls.Load(); got != 0 {
 		t.Fatalf("transport calls=%d, want 0 before cooldown expires", got)
 	}
@@ -89,9 +86,8 @@ func TestUploadPUTWaitsForSharedCooldownBeforeTransport(t *testing.T) {
 
 func TestRequestTimeoutStartsAfterSharedCooldown(t *testing.T) {
 	target, err := url.Parse("https://node.example/Resume1/file.bin")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	var calls atomic.Int64
 	u := &uploader{
 		opts: options{uploadKey: "test-key", chunkSize: 4, requestTimeout: 20 * time.Millisecond},
@@ -127,9 +123,7 @@ func TestUploadPUTRechecksCooldownAfterRouteGateBeforeDispatch(t *testing.T) {
 	limits := newRouteLimiterSet()
 	limits.configure([]uploadRouteTarget{route})
 	releaseGate, err := limits.acquire(context.Background(), route.rawURL)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
 
 	var calls atomic.Int64
 	u := &uploader{
@@ -154,9 +148,7 @@ func TestUploadPUTRechecksCooldownAfterRouteGateBeforeDispatch(t *testing.T) {
 	// request has completed its initial cooldown check but cannot dispatch yet.
 	select {
 	case call := <-ctx.observed:
-		if call != 1 {
-			t.Fatalf("first context Done call=%d, want route-gate wait", call)
-		}
+		failIf(t, call != 1, "first context Done call=%d, want route-gate wait", call)
 	case <-time.After(time.Second):
 		t.Fatal("upload did not reach the route gate")
 	}
@@ -167,9 +159,7 @@ func TestUploadPUTRechecksCooldownAfterRouteGateBeforeDispatch(t *testing.T) {
 	// there and prove the transport never observed the queued request.
 	select {
 	case call := <-ctx.observed:
-		if call != 2 {
-			t.Fatalf("second context Done call=%d, want dispatch cooldown wait", call)
-		}
+		failIf(t, call != 2, "second context Done call=%d, want dispatch cooldown wait", call)
 		cancel()
 	case <-time.After(time.Second):
 		cancel()
@@ -189,9 +179,7 @@ func TestQueuedCooldownDoesNotConsumeRequestTimeoutOrHoldPermits(t *testing.T) {
 	limits := newRouteLimiterSet()
 	limits.configure([]uploadRouteTarget{route})
 	releaseInitialGate, err := limits.acquire(context.Background(), route.rawURL)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
 
 	type uploadResult struct {
 		status int
@@ -238,9 +226,7 @@ func TestQueuedCooldownDoesNotConsumeRequestTimeoutOrHoldPermits(t *testing.T) {
 
 	select {
 	case call := <-ctx.observed:
-		if call != 1 {
-			t.Fatalf("first context Done call=%d, want route-gate wait", call)
-		}
+		failIf(t, call != 1, "first context Done call=%d, want route-gate wait", call)
 	case <-time.After(time.Second):
 		t.Fatal("upload did not queue at the route gate")
 	}
@@ -262,9 +248,8 @@ func TestQueuedCooldownDoesNotConsumeRequestTimeoutOrHoldPermits(t *testing.T) {
 	permitCtx, permitCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	releaseProbe, err := limits.acquire(permitCtx, route.rawURL)
 	permitCancel()
-	if err != nil {
-		t.Fatalf("route permit remained held during cooldown: %v", err)
-	}
+	requireNoError(t, err, "route permit remained held during cooldown: %v")
+
 	releaseProbe()
 
 	select {
@@ -278,9 +263,7 @@ func TestQueuedCooldownDoesNotConsumeRequestTimeoutOrHoldPermits(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("transport did not dispatch after cooldown expiry")
 	}
-	if dispatchTime.Before(cooldownDeadline.Add(-10 * time.Millisecond)) {
-		t.Fatalf("transport dispatched at %s before cooldown deadline %s", dispatchTime, cooldownDeadline)
-	}
+	failIf(t, dispatchTime.Before(cooldownDeadline.Add(-10*time.Millisecond)), "transport dispatched at %s before cooldown deadline %s", dispatchTime, cooldownDeadline)
 	if remaining := <-deadlineRemaining; remaining < 40*time.Millisecond {
 		t.Fatalf("network timeout remaining at dispatch=%s, want nearly full %s", remaining, requestTimeout)
 	}
@@ -299,9 +282,8 @@ func TestQueuedCooldownDoesNotConsumeRequestTimeoutOrHoldPermits(t *testing.T) {
 
 func TestConcurrent429ResponsesMergeLongestRetryAfter(t *testing.T) {
 	target, err := url.Parse("https://node.example/Resume1/file.bin")
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	ready := make(chan struct{})
 	var calls atomic.Int32
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -342,9 +324,7 @@ func TestConcurrent429ResponsesMergeLongestRetryAfter(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if u.cooldowns == nil {
-		t.Fatal("shared cooldown set was not initialized")
-	}
+	fatalIf(t, u.cooldowns == nil, "shared cooldown set was not initialized")
 	if got := u.cooldowns.remaining(route, time.Now()); got < 200*time.Millisecond {
 		t.Fatalf("merged cooldown=%s, want longest concurrent Retry-After", got)
 	}

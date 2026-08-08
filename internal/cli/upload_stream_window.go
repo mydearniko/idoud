@@ -92,9 +92,9 @@ func (p *streamBufferPool) release(buf []byte) {
 	}
 }
 
-func (p *streamBufferPool) setTarget(target int) int {
+func (p *streamBufferPool) setTarget(target int) {
 	if p == nil {
-		return 0
+		return
 	}
 	if target < 1 {
 		target = 1
@@ -105,7 +105,6 @@ func (p *streamBufferPool) setTarget(target int) int {
 	p.mu.Lock()
 	p.target = target
 	p.mu.Unlock()
-	return target
 }
 
 func (p *streamBufferPool) stats() (target, allocated int) {

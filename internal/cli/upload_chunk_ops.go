@@ -323,7 +323,7 @@ func (u *uploader) retryChunkUpload(
 	defer func() { u.debugChunkDone(chunkSize, finalChunk, success) }()
 
 	var lastErr error
-	lastStatus := 0
+	var lastStatus int
 
 	// Connection-level errors (status == 0: TLS timeout, dial failure, etc.)
 	// get extended retries with longer backoff to survive transient network
@@ -377,7 +377,9 @@ func (u *uploader) retryChunkUpload(
 		u.logf("chunk(%s) retry idx=%d final=%t attempt=%d status=%d delay=%s retry_after=%s backpressure=%t route=%s master_fallback=%t err=%v", mode, chunkIndex, finalChunk, attempt+1, status, delay, retryAfter, backpressure, route, u.masterFallback.Load(), err)
 		sleepStarted := time.Now()
 		sleepErr := sleepContext(ctx, delay)
-		u.debugRetrySleep(time.Since(sleepStarted))
+		if d, dbg := time.Since(sleepStarted), u.dbg; dbg != nil {
+			debugRecordDuration(&dbg.retrySleepNanos, &dbg.retrySleepCount, &dbg.retrySleepMaxNanos, d)
+		}
 		if sleepErr != nil {
 			return sleepErr
 		}
@@ -458,9 +460,13 @@ func (u *uploader) uploadPUTWithTimeout(
 				if startedAt := getConnAt.Swap(0); startedAt > 0 {
 					duration := now.Sub(time.Unix(0, startedAt))
 					if info.Reused {
-						u.debugConnectionPoolWait(duration)
+						if d, dbg := duration, u.dbg; dbg != nil {
+							debugRecordDuration(&dbg.connPoolNanos, &dbg.connPoolCount, &dbg.connPoolMaxNanos, d)
+						}
 					} else {
-						u.debugConnectionAcquire(duration)
+						if d, dbg := duration, u.dbg; dbg != nil {
+							debugRecordDuration(&dbg.connAcquireNanos, &dbg.connAcquireCount, &dbg.connAcquireMaxNanos, d)
+						}
 					}
 				}
 				u.debugConnection(info.Reused)
@@ -473,7 +479,9 @@ func (u *uploader) uploadPUTWithTimeout(
 			},
 			DNSDone: func(_ httptrace.DNSDoneInfo) {
 				if startedAt := dnsStartedAt.Swap(0); startedAt > 0 {
-					u.debugDNS(time.Since(time.Unix(0, startedAt)))
+					if d, dbg := time.Since(time.Unix(0, startedAt)), u.dbg; dbg != nil {
+						debugRecordDuration(&dbg.dnsNanos, &dbg.dnsCount, &dbg.dnsMaxNanos, d)
+					}
 				}
 			},
 			ConnectStart: func(network, address string) {
@@ -481,7 +489,9 @@ func (u *uploader) uploadPUTWithTimeout(
 			},
 			ConnectDone: func(network, address string, _ error) {
 				if started, ok := connectStarted.LoadAndDelete(network + "\x00" + address); ok {
-					u.debugConnect(time.Since(started.(time.Time)))
+					if d, dbg := time.Since(started.(time.Time)), u.dbg; dbg != nil {
+						debugRecordDuration(&dbg.connectNanos, &dbg.connectCount, &dbg.connectMaxNanos, d)
+					}
 				}
 			},
 			TLSHandshakeStart: func() {
@@ -489,7 +499,9 @@ func (u *uploader) uploadPUTWithTimeout(
 			},
 			TLSHandshakeDone: func(_ tls.ConnectionState, _ error) {
 				if startedAt := tlsStartedAt.Swap(0); startedAt > 0 {
-					u.debugTLS(time.Since(time.Unix(0, startedAt)))
+					if d, dbg := time.Since(time.Unix(0, startedAt)), u.dbg; dbg != nil {
+						debugRecordDuration(&dbg.tlsNanos, &dbg.tlsCount, &dbg.tlsMaxNanos, d)
+					}
 				}
 			},
 			WroteHeaders: func() {
@@ -500,7 +512,9 @@ func (u *uploader) uploadPUTWithTimeout(
 					now := time.Now()
 					if wroteRequestAt.CompareAndSwap(0, now.UnixNano()) {
 						if startedAt := wroteHeadersAt.Load(); startedAt > 0 && contentLength > 0 {
-							u.debugBodySend(now.Sub(time.Unix(0, startedAt)))
+							if d, dbg := now.Sub(time.Unix(0, startedAt)), u.dbg; dbg != nil {
+								debugRecordDuration(&dbg.bodySendNanos, &dbg.bodySendCount, &dbg.bodySendMaxNanos, d)
+							}
 						}
 						if u.ui != nil {
 							u.ui.bodyRequestWritten(contentLength)
@@ -518,13 +532,17 @@ func (u *uploader) uploadPUTWithTimeout(
 		}
 		routeWaitStarted := time.Now()
 		releaseRoute, err = u.routeLimits.acquire(ctx, target.rawURL)
-		u.debugRouteWait(time.Since(routeWaitStarted))
+		if d, dbg := time.Since(routeWaitStarted), u.dbg; dbg != nil {
+			debugRecordDuration(&dbg.routeWaitNanos, &dbg.routeWaitCount, &dbg.routeWaitMaxNanos, d)
+		}
 		if err != nil {
 			return "", 0, &requestError{cause: err, route: target.rawURL, fallback: target.fallback, master: target.master}
 		}
 		bodyGateStarted := time.Now()
 		uploadBodyLease, err = u.acquireUploadBody(ctx, chunkIndex)
-		u.debugBodyGateWait(time.Since(bodyGateStarted))
+		if d, dbg := time.Since(bodyGateStarted), u.dbg; dbg != nil {
+			debugRecordDuration(&dbg.bodyGateNanos, &dbg.bodyGateCount, &dbg.bodyGateMaxNanos, d)
+		}
 		if err != nil {
 			releaseRoute()
 			return "", 0, &requestError{cause: err, route: target.rawURL, fallback: target.fallback, master: target.master}
@@ -536,7 +554,6 @@ func (u *uploader) uploadPUTWithTimeout(
 			uploadBodyLease.releaseRequest()
 			releaseRoute()
 			uploadBodyLease = nil
-			releaseRoute = nil
 			continue
 		}
 		break
@@ -557,7 +574,9 @@ func (u *uploader) uploadPUTWithTimeout(
 	buildStarted := time.Now()
 	req, err := u.newUploadPUTRequest(ctx, body, target)
 	if err != nil {
-		u.debugRequestBuild(time.Since(buildStarted))
+		if d, dbg := time.Since(buildStarted), u.dbg; dbg != nil {
+			debugRecordDuration(&dbg.reqBuildNanos, &dbg.reqBuildCount, &dbg.reqBuildMaxNanos, d)
+		}
 		return "", 0, err
 	}
 	req.ContentLength = contentLength
@@ -584,12 +603,16 @@ func (u *uploader) uploadPUTWithTimeout(
 	if u.opts.downloadLimit > 0 {
 		req.Header.Set(headerUploadDownloadLimit, strconv.FormatInt(u.opts.downloadLimit, 10))
 	}
-	u.debugRequestBuild(time.Since(buildStarted))
+	if d, dbg := time.Since(buildStarted), u.dbg; dbg != nil {
+		debugRecordDuration(&dbg.reqBuildNanos, &dbg.reqBuildCount, &dbg.reqBuildMaxNanos, d)
+	}
 
 	httpStarted := time.Now()
 	resp, err := client.Do(req)
 	responseAt := time.Now()
-	u.debugHTTPRoundTrip(responseAt.Sub(httpStarted))
+	if d, dbg := responseAt.Sub(httpStarted), u.dbg; dbg != nil {
+		debugRecordDuration(&dbg.httpNanos, &dbg.httpCount, &dbg.httpMaxNanos, d)
+	}
 	if err != nil {
 		requestErr := &requestError{cause: err, route: target.rawURL, fallback: target.fallback, master: target.master}
 		u.debugRouteOutcome(target.rawURL, 0, requestErr)
@@ -621,7 +644,9 @@ func (u *uploader) uploadPUTWithTimeout(
 	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		if confirmation := uploadConfirmationDuration(wroteRequestAt.Load(), responseAt); confirmation > 0 {
-			u.debugProviderWait(confirmation)
+			if d, dbg := confirmation, u.dbg; dbg != nil {
+				debugRecordDuration(&dbg.providerWaitNanos, &dbg.providerWaitCount, &dbg.providerWaitMaxNanos, d)
+			}
 		}
 		u.debugRouteOutcome(target.rawURL, resp.StatusCode, nil)
 		if u.ui != nil {
@@ -639,7 +664,9 @@ func (u *uploader) uploadPUTWithTimeout(
 		}
 		respReadStarted := time.Now()
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
-		u.debugResponseRead(time.Since(respReadStarted))
+		if d, dbg := time.Since(respReadStarted), u.dbg; dbg != nil {
+			debugRecordDuration(&dbg.respReadNanos, &dbg.respReadCount, &dbg.respReadMaxNanos, d)
+		}
 		if len(bodyBytes) == 0 {
 			return "", resp.StatusCode, nil
 		}
@@ -648,7 +675,9 @@ func (u *uploader) uploadPUTWithTimeout(
 
 	respReadStarted := time.Now()
 	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
-	u.debugResponseRead(time.Since(respReadStarted))
+	if d, dbg := time.Since(respReadStarted), u.dbg; dbg != nil {
+		debugRecordDuration(&dbg.respReadNanos, &dbg.respReadCount, &dbg.respReadMaxNanos, d)
+	}
 	respBody := strings.TrimSpace(string(bodyBytes))
 	requestErr := &requestError{
 		status:        resp.StatusCode,
@@ -878,6 +907,23 @@ type finalizationProbeResult struct {
 	retryAfterSet bool
 }
 
+func (u *uploader) finalizationRetryAfter(target uploadRouteTarget, resp *http.Response, responseAt time.Time) (time.Duration, bool) {
+	retryAfter, retryAfterSet := retryAfterFromResponse(resp, responseAt)
+	if resp.StatusCode == http.StatusTooManyRequests && (!retryAfterSet || retryAfter <= 0) {
+		retryAfter, retryAfterSet = u.finalizationRateLimitDelay(), true
+	}
+	if retryAfterSet && retryAfter > 0 {
+		u.observeUploadCooldown(target, &requestError{
+			status:        resp.StatusCode,
+			retryAfter:    retryAfter,
+			retryAfterSet: true,
+			rateBucket:    uploadCooldownHeaderValue(resp.Header, "X-RateLimit-Bucket"),
+			rateScope:     uploadCooldownHeaderValue(resp.Header, "X-RateLimit-Scope"),
+		}, responseAt)
+	}
+	return retryAfter, retryAfterSet
+}
+
 func (u *uploader) waitForReadyAttempt(ctx context.Context, publicURL string, timeout time.Duration) (bool, error) {
 	publicURL = strings.TrimSpace(publicURL)
 	if publicURL == "" || timeout <= 0 {
@@ -1004,20 +1050,7 @@ func (u *uploader) requestFinalizeUpload(ctx context.Context, fileID string, wai
 	defer resp.Body.Close()
 	responseAt := time.Now()
 	if statusMayStillFinalize(resp.StatusCode) {
-		result.retryAfter, result.retryAfterSet = retryAfterFromResponse(resp, responseAt)
-		if resp.StatusCode == http.StatusTooManyRequests && (!result.retryAfterSet || result.retryAfter <= 0) {
-			result.retryAfter = u.finalizationRateLimitDelay()
-			result.retryAfterSet = true
-		}
-		if result.retryAfterSet && result.retryAfter > 0 {
-			u.observeUploadCooldown(target, &requestError{
-				status:        resp.StatusCode,
-				retryAfter:    result.retryAfter,
-				retryAfterSet: true,
-				rateBucket:    uploadCooldownHeaderValue(resp.Header, "X-RateLimit-Bucket"),
-				rateScope:     uploadCooldownHeaderValue(resp.Header, "X-RateLimit-Scope"),
-			}, responseAt)
-		}
+		result.retryAfter, result.retryAfterSet = u.finalizationRetryAfter(target, resp, responseAt)
 	}
 	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 	bodyText := strings.TrimSpace(string(bodyBytes))
@@ -1132,20 +1165,7 @@ func (u *uploader) probeHead(ctx context.Context, publicURL string) (finalizatio
 	defer resp.Body.Close()
 	responseAt := time.Now()
 	if statusMayStillFinalize(resp.StatusCode) {
-		result.retryAfter, result.retryAfterSet = retryAfterFromResponse(resp, responseAt)
-		if resp.StatusCode == http.StatusTooManyRequests && (!result.retryAfterSet || result.retryAfter <= 0) {
-			result.retryAfter = u.finalizationRateLimitDelay()
-			result.retryAfterSet = true
-		}
-		if result.retryAfterSet && result.retryAfter > 0 {
-			u.observeUploadCooldown(target, &requestError{
-				status:        resp.StatusCode,
-				retryAfter:    result.retryAfter,
-				retryAfterSet: true,
-				rateBucket:    uploadCooldownHeaderValue(resp.Header, "X-RateLimit-Bucket"),
-				rateScope:     uploadCooldownHeaderValue(resp.Header, "X-RateLimit-Scope"),
-			}, responseAt)
-		}
+		result.retryAfter, result.retryAfterSet = u.finalizationRetryAfter(target, resp, responseAt)
 	}
 
 	switch {

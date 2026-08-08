@@ -48,15 +48,12 @@ func TestDirectRouteProbesUseRouteLanesWithoutRedundantWarmup(t *testing.T) {
 		uploadTargetSchedule: []int{0, 1},
 	}
 	indexes := uploadWarmChunkIndexes(u, src, 2)
-	if len(indexes) != 1 || indexes[0] != 3 {
-		t.Fatalf("warm chunk indexes=%v, want missing final chunk 3", indexes)
-	}
+	failIf(t, len(indexes) != 1 || indexes[0] != 3, "warm chunk indexes=%v, want missing final chunk 3", indexes)
 
 	u.warmConnections(context.Background(), src, 1)
 	lease, err := u.acquireUploadBody(context.Background(), 3)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err, "")
+
 	if lease.connectionLane != 0 || u.clientForUpload(3, lease) != clients[0] {
 		lease.releaseRequest()
 		t.Fatalf("payload lane/client=(%d,%p), want warmed lane/client=(0,%p)", lease.connectionLane, u.clientForUpload(3, lease), clients[0])
@@ -82,7 +79,5 @@ func TestKnownStreamProgressAndWarmWindowIncludesConcurrentFinalPart(t *testing.
 		t.Fatalf("known stream parallel=%d, want non-final + concurrent final", got)
 	}
 	indexes := uploadWarmChunkIndexes(u, src, 8)
-	if len(indexes) != 2 || indexes[0] != 0 || indexes[1] != 1 {
-		t.Fatalf("known stream warm indexes=%v, want both concurrent parts", indexes)
-	}
+	failIf(t, len(indexes) != 2 || indexes[0] != 0 || indexes[1] != 1, "known stream warm indexes=%v, want both concurrent parts", indexes)
 }
